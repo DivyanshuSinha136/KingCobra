@@ -11,19 +11,20 @@
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-success)
 ![Architectures](https://img.shields.io/badge/arch-x86--64%20%7C%20ARM64%20%7C%20ARMhf%20%7C%20RISC--V-orange)
 
-**[Quick start](#-quick-start)** ·
-**[Language tour](#-language-tour)** ·
+**[Quick start](#quick-start)** ·
+**[Language tour](#language-tour)** ·
 **[Tutorial](index.html#tutorial)** ·
-**[Toolchain](#-the-toolchain)** ·
-**[Standard library](#-standard-library)** ·
-**[Documentation](#-documentation)** ·
-**[Contributing](#-contributing)**
+**[Toolchain](#the-toolchain)** ·
+**[Standard library](#standard-library)** ·
+**[Documentation](#documentation)** ·
+**[Contributing](#contributing)**
 
 </div>
 
 ---
 
-## ✨ What is KingCobra?
+<a id="what"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/what-dark.svg"><img src="assets/headings/what-light.svg" alt="What is KingCobra?" height="48"></picture></h2>
 
 KingCobra is a **native, general-purpose systems programming language** that feels like a scripting language and
 behaves like a systems language. It has a small, readable syntax and a REPL, but it also gives you explicit memory,
@@ -58,20 +59,22 @@ fn main() {
 
 > This is [`examples/language_tour.kc`](examples/language_tour.kc), which the test suite runs on every build.
 
-## 🎯 Why KingCobra
+<a id="why"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/why-dark.svg"><img src="assets/headings/why-light.svg" alt="Why KingCobra" height="48"></picture></h2>
 
 | | |
 |---|---|
-| 🐍 **Easy like a script** | `let`/`var`, f-strings, slicing, destructuring, `match`, `try`/`catch`, a REPL, and `help()` with `///` doc comments. |
-| ⚙️ **Native underneath** | Exact 64-bit integers, a closure **JIT to x86-64 machine code**, a real `extern` FFI, and `rhex` + `unsafe` for raw machine code. |
-| 🧠 **Explicit memory, no GC** | `free` works on every heap value; use-after-free and double free are *errors*; `defer` runs even while an error unwinds; `--leaks` finds what you forgot. |
-| 🛡️ **Checked pointers** | C-style pointers and buffers with bounds- and lifetime-checking. |
-| 🔋 **Batteries included** | 21 native standard-library modules — networking, HTTP/TLS, JSON, regex, neural networks, a game engine, TTS, a software MMU, and more. |
-| 🧰 **Real tooling** | Built-in `test`, `check`, a static type checker, errors with source excerpts and *“did you mean”*, a terminal IDE and debugger. |
-| 🔩 **Down to bare metal** | `kcc` compiles KingCobra to standalone executables — and to a freestanding kernel. **KCOS**, an OS written in KingCobra, boots in QEMU. |
-| 🌍 **Portable** | Linux and Windows (macOS builds with `make`). x86-64, ARM64, ARMhf and RISC-V. |
+| <img src="assets/ui/terminal.svg" width="18" height="18" align="top" alt=""> **Easy like a script** | `let`/`var`, f-strings, slicing, destructuring, `match`, `try`/`catch`, a REPL, and `help()` with `///` doc comments. |
+| <img src="assets/ui/cog.svg" width="18" height="18" align="top" alt=""> **Native underneath** | Exact 64-bit integers, a closure **JIT to x86-64 machine code**, a real `extern` FFI, and `rhex` + `unsafe` for raw machine code. |
+| <img src="assets/ui/brain.svg" width="18" height="18" align="top" alt=""> **Explicit memory, no GC** | `free` works on every heap value; use-after-free and double free are *errors*; `defer` runs even while an error unwinds; `--leaks` finds what you forgot. |
+| <img src="assets/ui/shield.svg" width="18" height="18" align="top" alt=""> **Checked pointers** | C-style pointers and buffers with bounds- and lifetime-checking. |
+| <img src="assets/ui/battery.svg" width="18" height="18" align="top" alt=""> **Batteries included** | 21 native standard-library modules — networking, HTTP/TLS, JSON, regex, neural networks, a game engine, TTS, a software MMU, and more. |
+| <img src="assets/ui/wrench.svg" width="18" height="18" align="top" alt=""> **Real tooling** | Built-in `test`, `check`, a static type checker, errors with source excerpts and *“did you mean”*, a terminal IDE and debugger. |
+| <img src="assets/ui/cpu.svg" width="18" height="18" align="top" alt=""> **Down to bare metal** | `kcc` compiles KingCobra to standalone executables — and to a freestanding kernel. **KCOS**, an OS written in KingCobra, boots in QEMU. |
+| <img src="assets/ui/globe.svg" width="18" height="18" align="top" alt=""> **Portable** | Linux and Windows (macOS builds with `make`). x86-64, ARM64, ARMhf and RISC-V. |
 
-## 🚀 Quick start
+<a id="quick-start"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/quick-start-dark.svg"><img src="assets/headings/quick-start-light.svg" alt="Quick start" height="48"></picture></h2>
 
 **Requirements:** a C11 compiler and `make`.
 
@@ -188,7 +191,8 @@ $ kingcobra repl
 Definitions persist, unclosed brackets continue on the next line, errors never end the session, and `_` is the last
 result. With GNU readline you also get line editing, history and Tab completion. → [docs/REPL.md](docs/REPL.md)
 
-## 📖 Language tour
+<a id="language-tour"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/language-tour-dark.svg"><img src="assets/headings/language-tour-light.svg" alt="Language tour" height="48"></picture></h2>
 
 | Feature | Example |
 |---|---|
@@ -210,10 +214,11 @@ result. With GNU readline you also get line editing, history and Tab completion.
 KingCobra runs a **static type checker** before your program does (`let`/`var` annotations, call signatures, return
 types, struct field types). It is deliberately permissive rather than exhaustive; skip it with `--no-typecheck`.
 
-📚 Full specification: [LANGUAGE.md](docs/LANGUAGE.md) · [GRAMMAR.md](docs/GRAMMAR.md) · [C_AND_B.md](docs/C_AND_B.md) ·
+<img src="assets/ui/book.svg" width="18" height="18" align="top" alt=""> Full specification: [LANGUAGE.md](docs/LANGUAGE.md) · [GRAMMAR.md](docs/GRAMMAR.md) · [C_AND_B.md](docs/C_AND_B.md) ·
 [POINTERS.md](docs/POINTERS.md) · [MEMORY.md](docs/MEMORY.md)
 
-## 🧰 The toolchain
+<a id="the-toolchain"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/the-toolchain-dark.svg"><img src="assets/headings/the-toolchain-light.svg" alt="The toolchain" height="48"></picture></h2>
 
 ```text
 kingcobra run <file.kc>      run a program                  kingcobra -e 'print(6 * 7)'    run a snippet
@@ -248,7 +253,8 @@ kasm/kasm prog.kasm -f elf -o prog                  # assemble to a Linux ELF
 make -C kcos run                                    # boot KCOS in QEMU
 ```
 
-## 📦 Standard library
+<a id="standard-library"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/standard-library-dark.svg"><img src="assets/headings/standard-library-light.svg" alt="Standard library" height="48"></picture></h2>
 
 21 native modules, no external dependencies. Load one with `import std.<name>;`.
 
@@ -316,7 +322,8 @@ Run `kingcobra modules` to list them, and see [`examples/`](examples) for a runn
 proves they all work. Seven real-world programs (log analyzer, REST API, physics lab, binary protocol, …) live in
 [`examples/showcase`](examples/showcase/README.md).
 
-## 🧠 Memory model
+<a id="memory-model"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/memory-model-dark.svg"><img src="assets/headings/memory-model-light.svg" alt="Memory model" height="48"></picture></h2>
 
 There is deliberately **no garbage collector**.
 
@@ -327,7 +334,8 @@ There is deliberately **no garbage collector**.
 
 → [docs/MEMORY.md](docs/MEMORY.md) · [docs/POINTERS.md](docs/POINTERS.md)
 
-## ⚡ Execution model
+<a id="execution-model"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/execution-model-dark.svg"><img src="assets/headings/execution-model-light.svg" alt="Execution model" height="48"></picture></h2>
 
 KingCobra is a **tree-walking interpreter with a tiered closure JIT**.
 
@@ -341,7 +349,8 @@ KingCobra is a **tree-walking interpreter with a tiered closure JIT**.
 
 → [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
 
-## 🌍 Platforms
+<a id="platforms"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/platforms-dark.svg"><img src="assets/headings/platforms-light.svg" alt="Platforms" height="48"></picture></h2>
 
 | Platform | Status |
 |---|---|
@@ -353,7 +362,8 @@ KingCobra is a **tree-walking interpreter with a tiered closure JIT**.
 
 Only x86-64 has the JIT; other CPUs run the interpreter with identical results. → [docs/PLATFORMS.md](docs/PLATFORMS.md)
 
-## 🗂️ Project layout
+<a id="project-layout"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/project-layout-dark.svg"><img src="assets/headings/project-layout-light.svg" alt="Project layout" height="48"></picture></h2>
 
 ```text
 kingcobra/
@@ -371,7 +381,8 @@ kingcobra/
 └── Makefile
 ```
 
-## 📚 Documentation
+<a id="documentation"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/documentation-dark.svg"><img src="assets/headings/documentation-light.svg" alt="Documentation" height="48"></picture></h2>
 
 | Start here | Reference | Project |
 |---|---|---|
@@ -380,14 +391,15 @@ kingcobra/
 | [C and B features](docs/C_AND_B.md) | [Memory](docs/MEMORY.md) · [Pointers](docs/POINTERS.md) | [Stability policy](docs/STABILITY.md) |
 | [Examples](examples) | [Performance](docs/PERFORMANCE.md) | [Packaging](docs/PACKAGING.md) |
 
-## 🧭 Status & honesty
+<a id="status-and-honesty"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/status-and-honesty-dark.svg"><img src="assets/headings/status-and-honesty-light.svg" alt="Status & honesty" height="48"></picture></h2>
 
 KingCobra is **v1.0.0** — a real, working language. The project documents its limits openly rather than
-hiding them: the JIT covers a specific int-only shape on purpose, the static type checker is permissive, Win32 GUI is
-written but less tested than X11, and KCOS has been booted and checked in QEMU but not tried on real hardware.
+hiding them: the JIT covers a specific int-only shape on purpose, the static type checker is permissive, and KCOS has been booted and checked in QEMU but not tried on real hardware.
 [docs/STABILITY.md](docs/STABILITY.md) says what you can rely on; [docs/ROADMAP.md](docs/ROADMAP.md) says what's next.
 
-## 🤝 Contributing
+<a id="contributing"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/contributing-dark.svg"><img src="assets/headings/contributing-light.svg" alt="Contributing" height="48"></picture></h2>
 
 Bug reports, ideas and pull requests are welcome.
 
@@ -395,7 +407,8 @@ Bug reports, ideas and pull requests are welcome.
 2. Fork, branch, and make your change.
 3. Run `make test` (and `./kingcobra test`) before opening a pull request.
 
-## 📄 License
+<a id="license"></a>
+<h2><picture><source media="(prefers-color-scheme: dark)" srcset="assets/headings/license-dark.svg"><img src="assets/headings/license-light.svg" alt="License" height="48"></picture></h2>
 
 Released under the [MIT License](LICENSE).
 
@@ -406,6 +419,6 @@ Released under the [MIT License](LICENSE).
 **KingCobra** is created and maintained by **[Divyanshu Sinha](https://github.com/DivyanshuSinha136)**
 · [divyanshu.sinha631@gmail.com](mailto:divyanshu.sinha631@gmail.com)
 
-<sub>If KingCobra is useful to you, consider giving it a ⭐</sub>
+<sub>If KingCobra is useful to you, consider giving it a star <img src="assets/ui/star.svg" width="14" height="14" align="top" alt=""></sub>
 
 </div>
