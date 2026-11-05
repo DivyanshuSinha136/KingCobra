@@ -336,7 +336,7 @@ jobs:
           fi
           packaging/debian/make-apt-repo.sh site dist/kingcobra_*.deb
           cp install.sh install.ps1 site/
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
