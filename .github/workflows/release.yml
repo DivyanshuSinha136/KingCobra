@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Version, changelog, banner and placeholder checks
-        run: tools/check-release.sh "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}"
+        run: bash tools/check-release.sh "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}"
 
   linux:
     name: linux ${{ matrix.name }}
