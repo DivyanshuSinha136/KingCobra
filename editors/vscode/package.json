@@ -1,0 +1,27 @@
+{
+  "name": "kingcobra",
+  "displayName": "KingCobra Language Support",
+  "description": "Syntax highlighting for the KingCobra programming language (.kc)",
+  "version": "0.1.0",
+  "publisher": "kingcobra",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "kingcobra",
+        "aliases": ["KingCobra", "kingcobra"],
+        "extensions": [".kc"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "kingcobra",
+        "scopeName": "source.kingcobra",
+        "path": "./syntaxes/kingcobra.tmLanguage.json",
+        "embeddedLanguages": { "meta.embedded.expression.kingcobra": "kingcobra" }
+      }
+    ]
+  }
+}
