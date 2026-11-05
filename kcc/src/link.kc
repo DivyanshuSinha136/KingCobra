@@ -1,0 +1,22 @@
+// link.kc -- turn a kcc module into a file: object, shared library or executable.  Shared by `kcc` and `kasm`.
+// Author: Divyanshu Sinha (MIT License)
+import "elf_obj.kc" as elf_obj;
+import "elf_so.kc" as elf_so;
+import "coff_obj.kc" as coff_obj;
+import "pe_dll.kc" as pe_dll;
+import "macho.kc" as macho;
+
+/// kind: "object" | "shared" | "exe".  Returns an fbin stream, or null when there is no writer for the module's format.
+fn write(mod, kind: string, output_name: string, subsystem: string) {
+    if (kind == "object") {
+        if (mod.fmt == "elf") { return elf_obj.build(mod); }
+        if (mod.fmt == "coff") { return coff_obj.build(mod); }
+        if (mod.fmt == "macho") { return macho.build_obj(mod); }
+        return null;
+    }
+    let exe = (kind == "exe");
+    if (mod.fmt == "elf") { return elf_so.build(mod, output_name, exe); }
+    if (mod.fmt == "coff") { return pe_dll.build(mod, output_name, exe, subsystem == "windows" ? 2 : 3); }
+    if (mod.fmt == "macho") { return macho.build_image(mod, "@rpath/" + output_name, exe); }
+    return null;
+}

@@ -1,0 +1,271 @@
+// objin.kc -- read object code produced elsewhere (KASM, GNU as, gcc) and turn it into a kcc module, so the
+// native linkers (elf_so / pe_dll / macho / flat) can build the final executable or library from it.
+//   * ELF64 x86-64 relocatable object (.o)   -> load_elf_obj()
+//   * raw machine code (.bin)                -> load_bin()
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.io;
+import "util.kc" as util;
+
+const SHF_WRITE = 1;
+const SHF_ALLOC = 2;
+const SHF_EXEC = 4;
+const SHT_PROGBITS = 1;
+const SHT_SYMTAB = 2;
+const SHT_RELA = 4;
+const SHT_NOBITS = 8;
+const SHT_INIT_ARRAY = 14;
+const SHT_FINI_ARRAY = 15;
+
+const R_X86_64_64 = 1;
+const R_X86_64_PC32 = 2;
+const R_X86_64_PLT32 = 4;
+const R_X86_64_GOTPCREL = 9;
+const R_X86_64_32 = 10;
+const R_X86_64_32S = 11;
+const R_X86_64_GOTPCRELX = 41;
+const R_X86_64_REX_GOTPCRELX = 42;
+
+fn fail(file: string, msg: string) {
+    throw { message: file + ": " + msg, line: 0, col: 0, kind: "compile" };
+}
+
+fn new_module(target: string) {
+    return { target: target, abi: target == "windows" ? "win64" : "sysv",
+             fmt: target == "windows" ? "coff" : (target == "macos" ? "macho" : (target == "kcos" ? "flat" : "elf")),
+             text: fbin.buffer(), rodata: fbin.buffer(), data: fbin.buffer(), bss: 0,
+             syms: [], relocs: [], calls: [], undef: [], libs: [], strs: {}, nstr: 0, import_lib: {}, entry_sym: null };
+}
+
+/// Section names that carry no code or data the linkers could use (unwind tables, notes, debug info, comments).
+fn ignored_section(name: string) -> bool {
+    return util.starts_with(name, ".eh_frame") || util.starts_with(name, ".note") || util.starts_with(name, ".comment")
+        || util.starts_with(name, ".debug") || util.starts_with(name, ".gnu") || util.starts_with(name, ".stab")
+        || util.starts_with(name, ".llvm") || name == ".group";
+}
+
+fn cstr_at(s, off: int) -> string {
+    fbin.seek(s, off);
+    return fbin.read_cstring(s, 4096);
+}
+
+/// Load an ELF64 x86-64 relocatable object from the stream `f` (`file` is only used in messages).
+fn load_elf_obj(f, file: string, target: string) {
+    let size = fbin.size(f);
+    if (size < 64) { fail(file, "not an object file (too short to be ELF)"); }
+    fbin.seek(f, 0);
+    let magic = fbin.read_bytes(f, 6);
+    if (magic[0] != 0x7F || magic[1] != 0x45 || magic[2] != 0x4C || magic[3] != 0x46) { fail(file, "not an ELF object (bad magic); KASM writes one with `-f obj` / a .o name"); }
+    if (magic[4] != 2) { fail(file, "32-bit ELF objects are not supported (assemble with `bits 64`)"); }
+    if (magic[5] != 1) { fail(file, "big-endian ELF objects are not supported"); }
+    fbin.seek(f, 16);
+    let etype = fbin.read_u16(f);
+    let machine = fbin.read_u16(f);
+    if (etype != 1) { fail(file, "not a relocatable object (ELF type " + str(etype) + "); executables and shared libraries cannot be linked again"); }
+    if (machine != 62) { fail(file, "not an x86-64 object (machine " + str(machine) + ")"); }
+    fbin.seek(f, 0x28);
+    let shoff = fbin.read_u64(f);
+    fbin.seek(f, 0x3A);
+    let shentsize = fbin.read_u16(f);
+    let shnum = fbin.read_u16(f);
+    let shstrndx = fbin.read_u16(f);
+    if (shoff == 0 || shnum == 0 || shentsize < 64) { fail(file, "object has no section headers"); }
+    if (shoff + shnum * shentsize > size) { fail(file, "truncated object (section headers lie beyond the end of the file)"); }
+
+    // ---- section headers
+    let sh = [];
+    for (i in 0..shnum) {
+        fbin.seek(f, shoff + i * shentsize);
+        let name = fbin.read_u32(f);
+        let type = fbin.read_u32(f);
+        let flags = fbin.read_u64(f);
+        fbin.read_u64(f);                                   // addr
+        let off = fbin.read_u64(f);
+        let sz = fbin.read_u64(f);
+        let link = fbin.read_u32(f);
+        let info = fbin.read_u32(f);
+        let align = fbin.read_u64(f);
+        let entsize = fbin.read_u64(f);
+        sh.push({ name_off: name, name: "", type: type, flags: flags, off: off, size: sz, link: link, info: info, align: align, entsize: entsize,
+                  kind: "", base: 0 });
+    }
+    if (shstrndx >= shnum) { fail(file, "bad section-name table index"); }
+    let shstr = sh[shstrndx];
+    for (s in sh) { s.name = cstr_at(f, shstr.off + s.name_off); }
+
+    // ---- merge the allocatable sections into text / rodata / data / bss
+    let mod = new_module(target);
+    var nsec = 0;
+    for (s in sh) {
+        let loadable = s.type == SHT_PROGBITS || s.type == SHT_NOBITS || s.type == SHT_INIT_ARRAY || s.type == SHT_FINI_ARRAY;
+        if (!loadable || (s.flags & SHF_ALLOC) == 0 || ignored_section(s.name)) { continue; }
+        if (s.off + (s.type == SHT_NOBITS ? 0 : s.size) > size) { fail(file, "truncated object (section '" + s.name + "' lies beyond the end of the file)"); }
+        let al = s.align > 1 ? s.align : 1;
+        if ((al & (al - 1)) != 0) { fail(file, "section '" + s.name + "' has an alignment that is not a power of two"); }
+        if (s.type == SHT_NOBITS) {
+            s.kind = "bss";
+            mod.bss = util.align_up(mod.bss, al);
+            s.base = mod.bss;
+            mod.bss = mod.bss + s.size;
+        } else {
+            var buf = mod.rodata;
+            s.kind = "rodata";
+            if ((s.flags & SHF_EXEC) != 0) { buf = mod.text; s.kind = "text"; }
+            else if ((s.flags & SHF_WRITE) != 0) { buf = mod.data; s.kind = "data"; }
+            util.pad_to(buf, al, s.kind == "text" ? 0xCC : 0);
+            s.base = fbin.size(buf);
+            if (s.size > 0) {
+                fbin.seek(f, s.off);
+                fbin.seek(buf, 0, "end");
+                fbin.copy(f, buf, s.size);
+            }
+        }
+        nsec = nsec + 1;
+    }
+    if (nsec == 0) { fail(file, "object has no code or data"); }
+
+    // ---- symbols
+    var symtab = null;
+    for (s in sh) { if (s.type == SHT_SYMTAB) { symtab = s; } }
+    if (symtab == null) { fail(file, "object has no symbol table (was it stripped?)"); }
+    let strtab = sh[symtab.link];
+    let nsyms = idiv(symtab.size, 24);
+    let syms = [];
+    for (i in 0..nsyms) {
+        fbin.seek(f, symtab.off + i * 24);
+        let nm = fbin.read_u32(f);
+        let info = fbin.read_u8(f);
+        fbin.read_u8(f);
+        let shndx = fbin.read_u16(f);
+        let value = fbin.read_u64(f);
+        let sz = fbin.read_u64(f);
+        syms.push({ name: nm == 0 ? "" : cstr_at(f, strtab.off + nm), bind: info >> 4, type: info & 15, shndx: shndx, value: value, size: sz,
+                    uname: "", defined: false, skip: false });
+    }
+    // names of the global symbols first, so a local that happens to share a name can be renamed
+    let taken = {};
+    for (s in syms) { if (s.bind != 0 && s.name != "" && s.shndx != 0) { taken[s.name] = true; } }
+    var i = 0;
+    for (s in syms) {
+        if (i == 0 || s.type == 4) { s.skip = true; i = i + 1; continue; }           // null symbol, STT_FILE
+        if (s.type == 3) {                                                          // STT_SECTION: reachable as a synthetic local symbol
+            if (s.shndx < shnum && sh[s.shndx].kind != "") {
+                s.uname = "__kcc_sec" + str(s.shndx);
+                s.defined = true;
+                mod.syms.push({ name: s.uname, sec: sh[s.shndx].kind, off: sh[s.shndx].base, size: sh[s.shndx].size, global: false, kind: "object" });
+            } else { s.skip = true; }
+            i = i + 1;
+            continue;
+        }
+        if (s.shndx == 0) {                                                         // undefined
+            if (s.name == "") { s.skip = true; } else { s.uname = s.name; }
+            i = i + 1;
+            continue;
+        }
+        if (s.shndx == 0xFFF1) { s.skip = true; i = i + 1; continue; }              // absolute: only an error if something uses it
+        var sec = "";
+        var off = 0;
+        if (s.shndx == 0xFFF2) {                                                    // COMMON: allocate in bss
+            let al = s.value > 1 ? s.value : 1;
+            mod.bss = util.align_up(mod.bss, al);
+            sec = "bss"; off = mod.bss;
+            mod.bss = mod.bss + s.size;
+        } else if (s.shndx < shnum && sh[s.shndx].kind != "") {
+            sec = sh[s.shndx].kind; off = sh[s.shndx].base + s.value;
+        } else { s.skip = true; i = i + 1; continue; }                              // lives in a dropped section (debug info, notes)
+        var un = s.name;
+        if (un == "" || (s.bind == 0 && taken.has(un))) { un = (un == "" ? "__kcc_l" : un + "@") + str(i); }
+        else if (s.bind == 0) { taken[un] = true; }
+        s.uname = un;
+        s.defined = true;
+        mod.syms.push({ name: un, sec: sec, off: off, size: s.size, global: s.bind != 0, kind: (sec == "text") ? "func" : "object" });
+        i = i + 1;
+    }
+
+    // ---- relocations
+    let undef_seen = {};
+    for (rs in sh) {
+        if (rs.type != SHT_RELA) { continue; }
+        if (rs.info >= shnum) { fail(file, "relocation section '" + rs.name + "' points at a missing section"); }
+        let tgt = sh[rs.info];
+        if (tgt.kind == "") { continue; }                                           // relocations of a dropped section (.eh_frame, debug)
+        let n = idiv(rs.size, 24);
+        for (k in 0..n) {
+            fbin.seek(f, rs.off + k * 24);
+            let r_off = fbin.read_u64(f);
+            let r_info = fbin.read_u64(f);
+            let r_add = fbin.read_i64(f);
+            let si = r_info >>> 32;
+            let rt = r_info & 0xFFFFFFFF;
+            if (si == 0 || si >= nsyms) { fail(file, "relocation in '" + tgt.name + "' at offset " + str(r_off) + " has no symbol"); }
+            let sy = syms[si];
+            if (sy.skip) { fail(file, "relocation in '" + tgt.name + "' refers to " + (sy.shndx == 0xFFF1 ? "an absolute symbol ('" + sy.name + "'), which cannot be placed in a relocatable image" : "a symbol in a discarded section ('" + sy.name + "')")); }
+            let at = tgt.base + r_off;
+            var kind = "";
+            if (rt == R_X86_64_64) {
+                if (tgt.kind != "data") { fail(file, "absolute 64-bit address in '" + tgt.name + "' (" + tgt.kind + "): only writable data can hold relocated pointers; use a rip-relative `lea` in code and put pointer tables in .data"); }
+                kind = "abs64";
+            } else if (rt == R_X86_64_PC32 || rt == R_X86_64_PLT32) {
+                if (tgt.kind != "text") { fail(file, "pc-relative relocation outside code ('" + tgt.name + "') is not supported"); }
+                if (sy.defined) { kind = "rip_local"; }
+                else {
+                    var is_call = rt == R_X86_64_PLT32;
+                    if (!is_call && r_off >= 1) {                                   // older gcc: `call foo` as PC32 on an undefined symbol
+                        fbin.seek(f, tgt.off + r_off - 1);
+                        let op = fbin.read_u8(f);
+                        is_call = (op == 0xE8 || op == 0xE9);
+                    }
+                    if (!is_call) { fail(file, "'" + sy.name + "' is an external data symbol read pc-relative; reach it through the GOT instead (`mov rax, [rel " + sy.name + " wrt ..got]`)"); }
+                    kind = "call_ext";
+                }
+            } else if (rt == R_X86_64_GOTPCREL || rt == R_X86_64_GOTPCRELX || rt == R_X86_64_REX_GOTPCRELX) {
+                if (tgt.kind != "text") { fail(file, "GOT relocation outside code ('" + tgt.name + "') is not supported"); }
+                kind = "rip_got";
+            } else if (rt == R_X86_64_32 || rt == R_X86_64_32S) {
+                fail(file, "absolute 32-bit address relocation against '" + sy.name + "': it needs a fixed load address. Assemble position-independent code (`default rel`, `[rel sym]`, `lea reg, [rel sym]`)");
+            } else { fail(file, "unsupported relocation type " + str(rt) + " against '" + sy.name + "'"); }
+            if (!sy.defined && !undef_seen.has(sy.uname)) { undef_seen[sy.uname] = true; mod.undef.push(sy.uname); }
+            mod.relocs.push({ sec: tgt.kind, off: at, sym: sy.uname, kind: kind, addend: r_add });
+        }
+    }
+    return mod;
+}
+
+/// Raw machine code: one `.text` image, one global function symbol `symbol` at byte `entry_off`.
+fn load_bin(f, file: string, target: string, symbol: string, entry_off: int) {
+    let size = fbin.size(f);
+    if (size == 0) { fail(file, "empty binary"); }
+    if (entry_off < 0 || entry_off >= size) { fail(file, "entry offset " + str(entry_off) + " is outside the " + str(size) + "-byte binary"); }
+    let mod = new_module(target);
+    fbin.seek(f, 0);
+    fbin.copy(f, mod.text, size);
+    mod.syms.push({ name: symbol, sec: "text", off: entry_off, size: size - entry_off, global: true, kind: "func" });
+    return mod;
+}
+
+/// Load `path` (or an in-memory stream) as an object module; decides by the leading bytes, not only the name.
+fn load_file(path: string, target: string, symbol: string, entry_off: int, force_raw: bool) {
+    if (!io.exists(path)) { throw { message: "cannot open '" + path + "'", line: 0, col: 0, kind: "compile" }; }
+    let f = fbin.load(path);
+    if (!force_raw && fbin.size(f) >= 4) {
+        fbin.seek(f, 0);
+        let m = fbin.read_bytes(f, 4);
+        if (m[0] == 0x7F && m[1] == 0x45 && m[2] == 0x4C && m[3] == 0x46) { return load_elf_obj(f, path, target); }
+    }
+    return load_bin(f, path, target, symbol, entry_off);
+}
+
+/// Choose how an executable is entered: `main` (through the start-up stub, C ABI) or a raw entry symbol such as `_start`.
+/// `want` is the symbol the user asked for with --entry ("" = automatic).
+fn pick_entry(mod, want: string, file: string) {
+    var has = {};
+    for (s in mod.syms) { if (s.sec == "text") { has[s.name] = s; } }
+    if (want != "") {
+        if (!has.has(want)) { fail(file, "entry symbol '" + want + "' is not defined in the code"); }
+        if (want != "main") { mod.entry_sym = want; }
+        return;
+    }
+    if (has.has("main")) { return; }
+    if (has.has("_start")) { mod.entry_sym = "_start"; return; }
+    fail(file, "an executable needs an entry point: define `main` (C ABI, called from the start-up stub) or `_start` (entered directly), or name one with --entry");
+}

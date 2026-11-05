@@ -236,6 +236,7 @@ fn build_image(mod, installname: string, exe: bool) {
     for (l in mod.libs) { libs.push(l); }
     if (len(libs) == 0 || exe && !libs.contains("/usr/lib/libSystem.B.dylib")) { libs.push("/usr/lib/libSystem.B.dylib"); }
     let exps = [];
+    if (mod["entry_sym"] != null) { util.fail("Mach-O executables from object code need a `main` (a raw entry symbol is not supported)", 0, 0); }
     var main_off = -1;
     if (exe) {
         for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { main_off = s.off; } }

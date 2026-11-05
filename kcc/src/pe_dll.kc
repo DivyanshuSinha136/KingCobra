@@ -127,7 +127,9 @@ fn build(mod, dllname: string, exe: bool, subsystem: int) {
     let ibase = exe ? EXE_BASE : IMAGE_BASE;
     let imports = [];
     for (u in mod.undef) { imports.push(u); }
-    if (exe) {
+    let own = exe && mod["entry_sym"] != null;       // object code with its own entry: no start-up stub
+    if (own) { /* entered directly */ }
+    else if (exe) {
         var has_main = false;
         for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { has_main = true; } }
         if (!has_main) { util.fail("an executable needs a `fn main` (define `fn main() -> int { ... }`)", 0, 0); }
@@ -147,7 +149,7 @@ fn build(mod, dllname: string, exe: bool, subsystem: int) {
     let text_rva = SECT_ALIGN;
     let stubs_rva = text_rva + util.align_up(text_len, 16);
     let entry_rva = util.align_up(stubs_rva + 8 * len(imports), 16);
-    let text_vsize = exe ? (entry_rva - text_rva) + entry.WIN64_LEN : (stubs_rva - text_rva) + 8 * len(imports);
+    let text_vsize = (exe && !own) ? (entry_rva - text_rva) + entry.WIN64_LEN : (stubs_rva - text_rva) + 8 * len(imports);
     let rdata_rva = rva_align(text_rva + text_vsize);
     util.trace("pe: measure .rdata");
     let probe = build_rdata(mod, dllname, rdata_rva, text_rva, 0, 0, groups, stubs_rva, exe);
@@ -239,7 +241,7 @@ fn build(mod, dllname: string, exe: bool, subsystem: int) {
     fbin.write_u32(out, text_raw);
     fbin.write_u32(out, rdata_raw + data_raw + rel_raw);
     fbin.write_u32(out, mod.bss);
-    fbin.write_u32(out, exe ? entry_rva : 0);        // entry point (a DLL has none: no DllMain)
+    fbin.write_u32(out, exe ? (own ? symrva[mod.entry_sym] : entry_rva) : 0);        // entry point (a DLL has none: no DllMain)
     fbin.write_u32(out, text_rva);
     fbin.write_u64(out, ibase);
     fbin.write_u32(out, SECT_ALIGN);
@@ -277,7 +279,7 @@ fn build(mod, dllname: string, exe: bool, subsystem: int) {
     fbin.write_bytes(out, fbin.to_bytes(text, 0, text_len));
     fbin.seek(out, text_fo + (stubs_rva - text_rva));
     fbin.write_bytes(out, fbin.to_bytes(stubs, 0, fbin.size(stubs)));
-    if (exe) {
+    if (exe && !own) {
         let code = entry.win64(entry_rva, rd.iat["__getmainargs"], symrva["main"], rd.iat["exit"]);
         fbin.seek(out, text_fo + (entry_rva - text_rva));
         fbin.write_bytes(out, fbin.to_bytes(code, 0, fbin.size(code)));

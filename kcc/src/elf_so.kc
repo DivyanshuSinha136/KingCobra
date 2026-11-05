@@ -36,7 +36,12 @@ fn build(mod, soname: string, exe: bool) {
     let imports = [];
     for (u in mod.undef) { imports.push(u); }
     let exports = [];
-    if (exe) {
+    let own = exe && mod["entry_sym"] != null;       // object code with its own entry (`_start`): no start-up stub
+    if (own) {
+        var found = false;
+        for (s in mod.syms) { if (s.name == mod.entry_sym) { found = true; } }
+        if (!found) { util.fail("entry symbol '" + mod.entry_sym + "' is not defined", 0, 0); }
+    } else if (exe) {
         for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { main_off = s.off; } }
         if (main_off < 0) { util.fail("an executable needs a `fn main` (define `fn main() -> int { ... }`)", 0, 0); }
         // with libraries: start through libc's __libc_start_main; without: raw syscalls, no libc at all
@@ -92,7 +97,7 @@ fn build(mod, soname: string, exe: bool) {
     off = stubs_off + 8 * len(imports);
     let entry_off = util.align_up(off, 16);
     var entry_len = 0;
-    if (exe) { entry_len = (len(imports) > 0) ? entry.LINUX_LIBC_LEN : entry.LINUX_RAW_LEN; off = entry_off + entry_len; }
+    if (exe && !own) { entry_len = (len(imports) > 0) ? entry.LINUX_LIBC_LEN : entry.LINUX_RAW_LEN; off = entry_off + entry_len; }
     let text_end = off;
     let ro_off = util.align_up(off, 16);         off = ro_off + ro_len;
     let seg1_end = off;
@@ -206,6 +211,8 @@ fn build(mod, soname: string, exe: bool) {
     if (exe) {
         fbin.seek(out, interp_off);
         util.write_cstr(out, INTERP);
+    }
+    if (exe && !own) {
         var code = null;
         if (len(imports) > 0) { code = entry.linux_libc(entry_off, symaddr["main"], got_off + 8 * got_of["__libc_start_main"]); }
         else { code = entry.linux_raw(entry_off, symaddr["main"]); }
@@ -257,7 +264,7 @@ fn build(mod, soname: string, exe: bool) {
     fbin.write_u16(out, 3);              // ET_DYN (a PIE for executables)
     fbin.write_u16(out, 62);
     fbin.write_u32(out, 1);
-    fbin.write_u64(out, exe ? entry_off : 0);              // entry
+    fbin.write_u64(out, exe ? (own ? symaddr[mod.entry_sym] : entry_off) : 0);              // entry
     fbin.write_u64(out, 64);             // phoff
     fbin.write_u64(out, shoff);
     fbin.write_u32(out, 0);

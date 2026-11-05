@@ -13,6 +13,8 @@ import "coff_obj.kc" as coff_obj;
 import "pe_dll.kc" as pe_dll;
 import "macho.kc" as macho;
 import "flat.kc" as flat;
+import "objin.kc" as objin;
+import "link.kc" as link;
 
 const USAGE = "kcc -- compile KingCobra into a native executable, shared library or object file\n\n" +
     "usage: kingcobra kcc/src/main.kc <input.kc> -o <output> [--target linux|windows|macos]\n\n" +
@@ -25,6 +27,12 @@ const USAGE = "kcc -- compile KingCobra into a native executable, shared library
     "  --target   OS/ABI to generate for (default: from the extension, or this machine for .o / executables)\n" +
     "  -DNAME[=value]   define a preprocessor macro (#define / #if / #include work as in the interpreter)\n" +
     "  --target kcos   freestanding flat binary (.bin) for bare metal / KCOS: --base ADDR (default 0x10000), --stack ADDR (default 0x80000), --entry NAME (default kmain), --map\n" +
+    "\nobject / binary input (from KASM, gcc -c, as):  kcc prog.o -o prog     kcc code.bin -o prog.exe --target windows\n" +
+    "  input ending in .o .obj .bin (or --raw) is linked, not compiled.  an ELF64 .o is read with its relocations;\n" +
+    "  a .bin is raw machine code with its entry at byte 0.   executables are entered at `main` (C ABI) or `_start`.\n" +
+    "  --entry SYM       entry symbol (default: main, else _start)     --entry-offset N   entry byte of a raw .bin (default 0)\n" +
+    "  --symbol NAME     exported name of a raw .bin's entry (default main for executables, code otherwise)   --raw   input is raw code\n" +
+    "  -l LIB            link against LIB (e.g. -l libm.so.6, -l user32.dll)\n" +
     "  -v, --verbose   print each stage as it starts (also: KCC_TRACE=1); shows where a crash happens\n";
 
 var TRACE = false;
@@ -32,6 +40,11 @@ var FLAT_BASE = 0x10000;      // kcos: physical load address of the image
 var FLAT_STACK = 0x80000;     // kcos: initial stack pointer (stack grows down from here)
 var WANT_MAP = false;         // kcos: also write <output>.map
 var FLAT_ENTRY = "kmain";     // kcos: entry function
+var USER_ENTRY = "";          // --entry given explicitly (object / binary input: the entry symbol)
+var RAW_SYMBOL = "";          // --symbol: name given to the entry of a raw .bin
+var RAW_OFFSET = 0;           // --entry-offset: byte offset of the entry inside a raw .bin
+var RAW_FORCE = false;        // --raw: treat the input as raw machine code whatever its name
+var EXTRA_LIBS = [];          // -l LIB: libraries to link against (object / binary input)
 
 fn parse_num(t: string) -> int {
     var s = t;
@@ -85,6 +98,31 @@ fn host_target() -> string {
     return "linux";
 }
 
+fn objin_ext(path: string) -> bool {
+    let e = system.extension(path).lower();
+    return e == ".o" || e == ".obj" || e == ".bin";
+}
+
+/// Link ready-made machine code (an ELF64 .o from KASM / as / gcc -c, or a raw .bin) into the requested output.
+fn link_object(input: string, output: string, target: string, kind: string, subsystem: string) {
+    if (kind == "object") { throw { message: "'" + input + "' is already object code; ask for an executable (no extension, .exe, .elf), .so, .dll or .dylib output", line: 0, col: 0, kind: "compile" }; }
+    if (kind == "flat") { throw { message: "a .bin output is the kcos kernel format and needs KingCobra source with `fn kmain` and `fn kc_interrupt`; object code can be linked as an executable or library", line: 0, col: 0, kind: "compile" }; }
+    trace("read " + input + " (target=" + target + ")");
+    let sym = RAW_SYMBOL != "" ? RAW_SYMBOL : (kind == "exe" ? "main" : "code");
+    let mod = objin.load_file(input, target, sym, RAW_OFFSET, RAW_FORCE);
+    for (l in EXTRA_LIBS) { if (!mod.libs.contains(l)) { mod.libs.push(l); } }
+    if (len(EXTRA_LIBS) > 0) { for (u in mod.undef) { mod.import_lib[u] = EXTRA_LIBS[0]; } }
+    if (mod.fmt == "coff") { for (r in mod.relocs) { if (r.kind == "rip_got") { throw { message: input + ": GOT-relative references are not supported when linking for Windows; call imports directly (`call name wrt ..plt`)", line: 0, col: 0, kind: "compile" }; } } }
+    if (kind == "exe") { objin.pick_entry(mod, USER_ENTRY, input); }
+    trace("write " + mod.fmt + " " + kind);
+    let out = link.write(mod, kind, system.basename(output), subsystem);
+    if (out == null) { throw { message: "internal error: no writer for format '" + mod.fmt + "' (" + kind + ")", line: 0, col: 0, kind: "compile" }; }
+    fbin.save(out, output);
+    if (!io.exists(output)) { throw { message: "internal error: '" + output + "' was not created (blocked by antivirus or a locked file?)", line: 0, col: 0, kind: "compile" }; }
+    if (kind == "exe" && target != "windows") { system.chmod(output, 493); }
+    return { module: mod, bytes: fbin.size(out), kind: kind, target: target };
+}
+
 fn compile_file(input: string, output: string, target_opt: string, force_exe: bool, subsystem: string) {
     let ext = system.extension(output);
     var kind = "object";
@@ -104,6 +142,8 @@ fn compile_file(input: string, output: string, target_opt: string, force_exe: bo
     if (want != "" && kind != "object" && want != target) { throw { message: "a '" + ext + "' file can only be built for target " + want, line: 0, col: 0, kind: "compile" }; }
     if (subsystem != "console" && subsystem != "windows") { throw { message: "unknown --subsystem '" + subsystem + "' (use console or windows)", line: 0, col: 0, kind: "compile" }; }
     if (target == "kcos" && kind != "flat") { throw { message: "--target kcos produces a flat binary: use an output name ending in .bin", line: 0, col: 0, kind: "compile" }; }
+    let is_objin = RAW_FORCE || objin_ext(input);
+    if (is_objin) { return link_object(input, output, target, kind, subsystem); }
     let items = [];
     trace("parse " + input + " (kind=" + kind + ", target=" + target + ")");
     parser.reset();
@@ -124,15 +164,8 @@ fn compile_file(input: string, output: string, target_opt: string, force_exe: bo
         let info = flat.build(mod, FLAT_BASE, FLAT_STACK, FLAT_ENTRY);
         out = info.stream;
         if (WANT_MAP) { io.write_file(output + ".map", flat.map_text(mod, info)); }
-    } else if (kind == "object") {
-        if (mod.fmt == "elf") { out = elf_obj.build(mod); }
-        else if (mod.fmt == "coff") { out = coff_obj.build(mod); }
-        else if (mod.fmt == "macho") { out = macho.build_obj(mod); }
     } else {
-        let exe = (kind == "exe");
-        if (mod.fmt == "elf") { out = elf_so.build(mod, system.basename(output), exe); }
-        else if (mod.fmt == "coff") { out = pe_dll.build(mod, system.basename(output), exe, subsystem == "windows" ? 2 : 3); }
-        else if (mod.fmt == "macho") { out = macho.build_image(mod, "@rpath/" + system.basename(output), exe); }
+        out = link.write(mod, kind, system.basename(output), subsystem);
     }
     if (out == null) { throw { message: "internal error: no writer for format '" + mod.fmt + "' (" + kind + ")", line: 0, col: 0, kind: "compile" }; }
     trace("save " + output);
@@ -158,7 +191,11 @@ fn main() {
         if (a == "--exe") { force_exe = true; i = i + 1; continue; }
         if (a == "--base" && i + 1 < len(args)) { FLAT_BASE = parse_num(args[i + 1]); i = i + 2; continue; }
         if (a == "--stack" && i + 1 < len(args)) { FLAT_STACK = parse_num(args[i + 1]); i = i + 2; continue; }
-        if (a == "--entry" && i + 1 < len(args)) { FLAT_ENTRY = args[i + 1]; i = i + 2; continue; }
+        if (a == "--entry" && i + 1 < len(args)) { FLAT_ENTRY = args[i + 1]; USER_ENTRY = args[i + 1]; i = i + 2; continue; }
+        if (a == "--entry-offset" && i + 1 < len(args)) { RAW_OFFSET = parse_num(args[i + 1]); i = i + 2; continue; }
+        if (a == "--symbol" && i + 1 < len(args)) { RAW_SYMBOL = args[i + 1]; i = i + 2; continue; }
+        if (a == "--raw") { RAW_FORCE = true; i = i + 1; continue; }
+        if (a == "-l" && i + 1 < len(args)) { EXTRA_LIBS.push(args[i + 1]); i = i + 2; continue; }
         if (a == "--map") { WANT_MAP = true; i = i + 1; continue; }
         if (util.starts_with(a, "-D") && len(a) > 2) { pp_define(a[2..len(a)]); i = i + 1; continue; }
         if (a == "-h" || a == "--help") { print(USAGE); system.exit(0); }
@@ -169,7 +206,8 @@ fn main() {
     }
     if (input == "") { print(USAGE); system.exit(2); }
     if (output == "") {
-        if (force_exe) { output = system.stem(input) + ((target == "windows" || (target == "" && host_target() == "windows")) ? ".exe" : ""); }
+        if (RAW_FORCE || objin_ext(input)) { output = system.stem(input) + ((target == "windows" || (target == "" && host_target() == "windows")) ? ".exe" : ""); }
+        else if (force_exe) { output = system.stem(input) + ((target == "windows" || (target == "" && host_target() == "windows")) ? ".exe" : ""); }
         else { output = system.stem(input) + ".so"; }
     }
     if (system.getenv("KCC_TRACE") != null && system.getenv("KCC_TRACE") != "") { TRACE = true; util.set_trace(true); }
