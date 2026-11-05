@@ -1,55 +1,43 @@
-# Prerequisites
-*.d
-
-# Object files
+# build output
+/build/
+/kingcobra
+/kingcobra.exe
+/kingcobra-arm64
+/kingcobra-armhf
+/kingcobra-riscv64
 *.o
-*.ko
+*.d
 *.obj
-*.elf
+*.gcda
+*.gcno
+*.kcnative.so
+*.kcnative.dll
+packaging/windows/kingcobra_res.o
 
-# Linker output
-*.ilk
-*.map
-*.exp
+# packaging / release output
+/dist/
+/site/
+/choco-out/
+/stage/
+/debian/kingcobra/
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper.log
+/*.deb
+/*.rpm
+/*.nupkg
+/*.tar.gz
 
-# Precompiled Headers
-*.gch
-*.pch
+# sub-projects
+/ide/build/
+/kcos/build/
+/kasm/build/
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# debug information files
-*.dwo
+# editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
