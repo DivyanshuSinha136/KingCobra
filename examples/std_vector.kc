@@ -1,0 +1,32 @@
+import std.vector;
+
+fn main() {
+    let a = vector.vec3(1, 2, 3);
+    let b = vector.vec3(4, 5, 6);
+    print("add:", vector.add(a, b));
+    print("dot:", vector.dot(a, b));
+    print("cross:", vector.cross(vector.vec3(1,0,0), vector.vec3(0,1,0)));
+    print("length:", vector.length(vector.vec2(3, 4)));
+    print("normalize:", vector.normalize(vector.vec2(3, 4)));
+    print("lerp:", vector.lerp(vector.vec2(0, 0), vector.vec2(10, 20), 0.25));
+    print("reflect:", vector.reflect(vector.vec2(1, -1), vector.vec2(0, 1)));
+    print("project:", vector.project(vector.vec2(3, 4), vector.vec2(1, 0)));
+    print("angle deg:", vector.rad2deg(vector.angle(vector.vec2(1, 0), vector.vec2(0, 1))));
+    print("4D dot:", vector.dot([1, 2, 3, 4], [4, 3, 2, 1]));
+
+    // quaternion: rotate +X by 90 degrees about +Z -> +Y
+    let q = vector.quat_from_axis_angle(vector.vec3(0, 0, 1), vector.deg2rad(90));
+    let r = vector.quat_rotate(q, vector.vec3(1, 0, 0));
+    print("quat rotate:", vector.round(vector.scale(r, 1000)));
+    print("slerp mid:", vector.quat_to_euler(vector.quat_slerp(vector.quat_identity(), q, 0.5)));
+
+    // matrices
+    let m = vector.mat4_mul(vector.mat4_translate(1, 2, 3), vector.mat4_scale(2, 2, 2));
+    print("transform point:", vector.mat4_transform_point(m, vector.vec3(1, 1, 1)));
+    let inv = vector.mat4_inverse(m);
+    print("inverse round-trip:", vector.mat4_transform_point(inv, vector.mat4_transform_point(m, vector.vec3(5, -1, 2))));
+    print("det:", vector.mat4_det(m));
+    let view = vector.mat4_look_at(vector.vec3(0, 0, 5), vector.vec3(0, 0, 0), vector.vec3(0, 1, 0));
+    print("view origin:", vector.mat4_transform_point(view, vector.vec3(0, 0, 0)));
+    print("ray_sphere:", vector.ray_sphere(vector.vec3(0,0,-5), vector.vec3(0,0,1), vector.vec3(0,0,0), 1));
+}

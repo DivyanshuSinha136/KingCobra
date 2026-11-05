@@ -1,0 +1,25 @@
+# Beethoven - "Ode to Joy" (theme), arranged for the std.music_note notation.
+# Run:  kingcobra run examples/std_music_note.kc
+title "Ode to Joy"
+composer Ludwig van Beethoven
+tempo 112
+time 4/4
+key D
+
+track melody piano vol=0.9 pan=-0.15 reverb=0.22
+F#4 F#4 G4 A4 | A4 G4 F#4 E4 | D4 D4 E4 F#4 | F#4:q. E4:e E4:h |
+F#4 F#4 G4 A4 | A4 G4 F#4 E4 | D4 D4 E4 F#4 | E4:q. D4:e D4:h |
+E4 E4 F#4 D4 | E4 F#4:e G4:e F#4 D4 | E4 F#4:e G4:e F#4 E4 | D4 E4 A3:h |
+F#4 F#4 G4 A4 | A4 G4 F#4 E4 | D4 D4 E4 F#4 | E4:q. D4:e D4:h
+
+track harmony strings vol=0.55 pan=0.25 reverb=0.35
+|: {D}:w {A}:w {D}:w {A}:h {D}:h :|
+{D}:w {A}:w {D}:w {G}:h {A}:h
+{A}:w {D}:h {G}:h {A}:w {D}:h {A}:h {D}:w
+
+track bass bass vol=0.8
+octave=2
+D2:h A2:h | D2:h A2:h | D2:h A2:h | A2:h D2:h |
+D2:h A2:h | D2:h A2:h | D2:h A2:h | A2:h D2:h |
+A2:h D2:h | A2:h D2:h | A2:h D2:h | G2:h A2:h |
+D2:h A2:h | D2:h A2:h | D2:h A2:h | A2:h D2:h

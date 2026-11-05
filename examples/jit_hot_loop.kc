@@ -1,0 +1,16 @@
+// Demonstrates the closure JIT: `square_add` is a hot integer helper
+// (single `return` of +,-,*,unary- over int params) so after
+// KC_JIT_THRESHOLD calls the VM compiles it straight to x86-64 and
+// starts calling native code instead of walking the AST.
+
+fn square_add(a: int, b: int) -> int {
+    return a * a + b;
+}
+
+fn main() {
+    var total: int = 0;
+    for (i in 0..200) {
+        total = square_add(i, total);
+    }
+    print("total after 200 hot calls =", total);
+}

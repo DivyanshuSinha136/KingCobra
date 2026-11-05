@@ -1,0 +1,110 @@
+// std.game — 3D explorer: streamed voxel world, fog/cloud horizon, HUD, mouse look,
+// block breaking / placing, a minimap fed by the streamed chunks, and default models.
+//
+//   WASD move · Space jump · Mouse look · Left click break · Right click place
+//   1-6 pick block · F3 debug · E dialog · Esc quit
+//
+import std.game;
+
+var px = 8.0;
+var py = 70.0;
+var pz = 8.0;
+var vy = 0.0;
+var yaw = 0.0;
+var pitch = -10.0;
+var grounded = false;
+var hotbar = 0;
+var hb_id = 0;
+var hp_id = 0;
+var info_id = 0;
+let blocks = ["grass", "dirt", "stone", "sand", "planks", "brick"];
+
+fn setup() {
+    game.window("KingCobra — std.game explorer", 800, 450);
+    game.world("", "gen", "nature", "seed", 2026, "radius", 8);   // "" = memory only; give a directory to persist edits
+    game.sky("#4a86d6");
+    game.fog("cloud");                 // fog end follows the streaming horizon (fog_auto is on by default)
+    game.light(-0.4, -0.8, -0.35, "#fffbe8", 0.5);
+    game.camera(px, py, pz, yaw, pitch);
+    game.capture_mouse(true);
+
+    hp_id = game.hud("bar", "bottom-left", 12, 12, 130, 12, 80, 100, "numbers", true, "label", "HP");
+    game.hud("bar", "bottom-left", 12, 30, 130, 8, 55, 100, "color", "#3a7bff", "trail", false);
+    hb_id = game.hud("hotbar", "bottom", 0, 8, 6, 26);
+    var i = 0;
+    while (i < 6) {
+        let t = game.texture_proc(["grass", "dirt", "stone", "sand", "planks", "brick"][i], 16, i);
+        game.hud_set(hb_id, "item", [i, t, 64]);
+        i += 1;
+    }
+    game.hud("crosshair", "plus");
+    game.hud("minimap", "top-right", 8, 8, 84, "scale", 1);
+    game.hud("compass", "top", 0, 8, 170);
+    info_id = game.hud("text", "top-left", 8, 8, "", "scale", 1);
+    game.hud_notify("Welcome! The world streams in as you walk.", "#66ff99", 6.0);
+
+    // default custom models placed in the world, snapped to the terrain once its chunk exists
+    game.spawn("house", 14.0, 60.0, 4.0, "collide", true, "gravity", true);
+    game.spawn("tree", 4.0, 60.0, 16.0, "gravity", true, "collide", true);
+    game.spawn("humanoid", 10.0, 60.0, 10.0, "gravity", true, "collide", true, "radius", 0.3, "height", 1.8);
+    game.spawn("campfire", 6.0, 60.0, 8.0, "gravity", true, "collide", true);
+}
+
+fn update(dt) {
+    if (game.key_pressed("escape")) { game.quit(); }
+    let md = game.mouse_delta();
+    yaw -= md[0] * 0.15;
+    pitch -= md[1] * 0.15;
+    if (pitch > 89.0) { pitch = 89.0; }
+    if (pitch < -89.0) { pitch = -89.0; }
+
+    let s = game.dsin(yaw);
+    let c = game.dcos(yaw);
+    var mx = 0.0;
+    var mz = 0.0;
+    if (game.key("w")) { mx -= s; mz -= c; }
+    if (game.key("s")) { mx += s; mz += c; }
+    if (game.key("a")) { mx -= c; mz += s; }
+    if (game.key("d")) { mx += c; mz -= s; }
+    var speed = 5.5;
+    if (game.key("shift")) { speed = 9.0; }
+
+    vy -= 26.0 * dt;
+    if (grounded && game.key_pressed("space")) { vy = 8.5; }
+    let r = game.collide_move(px, py, pz, 0.3, 1.75, mx * speed * dt, vy * dt, mz * speed * dt, 0.6);
+    px = r[0]; py = r[1]; pz = r[2];
+    grounded = r[3];
+    if (r[5]) { vy = 0.0; }          // hit floor or ceiling
+
+    game.camera(px, py + 1.6, pz, yaw, pitch);
+
+    let w = game.wheel();
+    if (w != 0) { hotbar = (hotbar + 6 - w) % 6; game.hud_set(hb_id, "selected", hotbar); }
+    var k = 1;
+    while (k <= 6) { if (game.key_pressed("" + k)) { hotbar = k - 1; game.hud_set(hb_id, "selected", hotbar); } k += 1; }
+
+    // break / place via the voxel raycast
+    let f = game.camera_forward();
+    let hit = game.raycast(px, py + 1.6, pz, f[0], f[1], f[2], 7.0);
+    if (hit != null) {
+        game.box3d(hit["x"], hit["y"], hit["z"], hit["x"] + 1.0, hit["y"] + 1.0, hit["z"] + 1.0, "#ffffff");
+        if (game.mouse_pressed(1)) {
+            game.set_block(hit["x"], hit["y"], hit["z"], "air");
+            game.emit(hit["x"] + 0.5, hit["y"] + 0.5, hit["z"] + 0.5, 14, "color", "#c8b078", "speed", 2.5, "life", 0.7);
+        }
+        if (game.mouse_pressed(3)) {
+            game.set_block(hit["x"] + hit["nx"], hit["y"] + hit["ny"], hit["z"] + hit["nz"], blocks[hotbar]);
+        }
+    }
+    if (game.key_pressed("f3")) { game.hud_debug(true); }
+    if (game.key_pressed("e") && !game.dialog_active()) {
+        game.hud_dialog("Villager", "The mist you see is the edge of what is loaded. Walk on and the land appears.", ["Interesting", "Goodbye"]);
+    }
+    let st = game.stats();
+    game.hud_set(info_id, "text", "chunks " + st["chunks_loaded"] + "  fog " + int(st["fog_end"]) + "m  " + int(game.fps()) + " fps");
+}
+
+fn main() {
+    setup();
+    game.run(update, null, 0);
+}

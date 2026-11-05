@@ -1,0 +1,86 @@
+// std.ascii_screen showcase 10/10 — a "system monitor" dashboard: live graphs, gauges, sparklines, a process table.
+// Everything is laid out from width()/height(), so resize the terminal and it reflows. q = quit.
+import std.ascii_screen;
+
+fn spark(values: array, n: int) -> string {
+    let g = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    var s = "";
+    var i = values.len - n;
+    if (i < 0) { i = 0; }
+    while (i < values.len) {
+        var k = ascii_screen.floor(values[i] * 7.99);
+        if (k < 0) { k = 0; }
+        if (k > 7) { k = 7; }
+        s = s + g[k];
+        i += 1;
+    }
+    return s;
+}
+
+fn gauge(x: int, y: int, w: int, label: string, v: float, color: string) {
+    ascii_screen.text(x, y, label, "fg", "gray");
+    let bw = w - 12;
+    let filled = ascii_screen.floor(v * bw);
+    var i = 0;
+    while (i < bw) {
+        if (i < filled) { ascii_screen.put(x + 5 + i, y, "█", "fg", ascii_screen.mix("#2ecc71", "#e74c3c", i / (bw + 0.0))); }
+        else { ascii_screen.put(x + 5 + i, y, "░", "fg", "#404040"); }
+        i += 1;
+    }
+    ascii_screen.text(x + 6 + bw, y, str(ascii_screen.floor(v * 100)) + "%", "fg", color, "bold", true);
+}
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: dashboard", "fps", 20);
+    var t = 0.0;
+    var cpu_hist = [0.5, 0.5];
+    var net_hist = [0.5, 0.5];
+    let names = ["kingcobra", "std.ascii_screen", "tiger.agent", "music_note", "tts", "kasm", "httpd", "indexer"];
+    let plot = ascii_screen.hires(40, 8, "braille");
+    while (ascii_screen.poll()) {
+        t += ascii_screen.dt();
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        let w = ascii_screen.width();
+        let h = ascii_screen.height();
+        let cpu = 0.5 + 0.35 * ascii_screen.sin(t * 0.9) + 0.1 * ascii_screen.noise(t * 3.0, 1.0);
+        let mem = 0.62 + 0.08 * ascii_screen.sin(t * 0.2);
+        let net = 0.5 + 0.45 * ascii_screen.sin(t * 2.3) * ascii_screen.sin(t * 0.7);
+        cpu_hist.push(ascii_screen.clamp(cpu, 0.0, 1.0));
+        net_hist.push(ascii_screen.clamp(net, 0.0, 1.0));
+        if (cpu_hist.len > 200) { cpu_hist.remove(0); net_hist.remove(0); }
+
+        ascii_screen.begin();
+        ascii_screen.fill(0, 0, w, 1, " ", "bg", "#1b2838");
+        ascii_screen.text(1, 0, " KINGCOBRA MONITOR ", "fg", "#ffffff", "bg", "#2a475e", "bold", true);
+        ascii_screen.text(w - 22, 0, "uptime " + str(ascii_screen.floor(t)) + "s   q quit", "fg", "gray", "bg", "#1b2838");
+
+        let half = w / 2;
+        ascii_screen.box(0, 1, half, 8, "style", "round", "title", "gauges", "fg", "cyan");
+        gauge(2, 3, half - 4, "CPU", cpu, "#ffd166");
+        gauge(2, 5, half - 4, "MEM", mem, "#4cc9f0");
+        gauge(2, 7, half - 4, "NET", net, "#06d6a0");
+
+        ascii_screen.box(half, 1, w - half, 8, "style", "round", "title", "sparklines", "fg", "magenta");
+        ascii_screen.text(half + 2, 3, "cpu " + spark(cpu_hist, w - half - 9), "fg", "#ffd166");
+        ascii_screen.text(half + 2, 5, "net " + spark(net_hist, w - half - 9), "fg", "#06d6a0");
+        ascii_screen.text(half + 2, 7, "t=" + str(ascii_screen.floor(t * 10) / 10.0), "fg", "gray");
+
+        ascii_screen.box(0, 9, half, 11, "style", "round", "title", "cpu history (braille)", "fg", "yellow");
+        ascii_screen.hires_clear(plot);
+        ascii_screen.plot(plot, cpu_hist, "color", "#ffd166", "min", 0.0, "max", 1.0);
+        ascii_screen.hires_draw(plot, 2, 11);
+
+        ascii_screen.box(half, 9, w - half, 11, "style", "round", "title", "processes", "fg", "green");
+        ascii_screen.text(half + 2, 10, "PID    NAME               CPU%", "fg", "gray", "underline", true);
+        var i = 0;
+        while (i < names.len && i < 8) {
+            let v = ascii_screen.clamp(0.5 + 0.5 * ascii_screen.sin(t * (0.5 + i * 0.37) + i), 0.0, 1.0);
+            ascii_screen.text(half + 2, 11 + i, str(1000 + i * 137) + "  " + names[i], "fg", "white");
+            ascii_screen.text(half + 26, 11 + i, str(ascii_screen.floor(v * 100)), "fg", ascii_screen.mix("#2ecc71", "#e74c3c", v));
+            i += 1;
+        }
+        ascii_screen.text(2, h - 1, "resize the terminal: the layout reflows", "fg", "gray");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

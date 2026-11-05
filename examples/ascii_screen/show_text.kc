@@ -1,0 +1,66 @@
+// std.ascii_screen showcase 2/10 — big fonts, gradients, box styles, colours, text attributes.
+// space / right = next page   left = previous   q = quit
+import std.ascii_screen;
+
+fn page_fonts(w: int) {
+    let fonts = ["block", "half", "quad", "braille", "ascii"];
+    var y = 1;
+    var i = 0;
+    while (i < fonts.len) {
+        ascii_screen.text(2, y, fonts[i], "fg", "gray");
+        let sz = ascii_screen.big_text(12, y, "KingCobra", "font", fonts[i], "gradient", ["#ff8a00", "#e52e71", "#7b2ff7"]);
+        y += sz[1] + 1;
+        i += 1;
+    }
+}
+
+fn page_boxes(w: int) {
+    let styles = ["single", "double", "round", "bold", "ascii", "block", "dashed", "dots"];
+    var i = 0;
+    while (i < styles.len) {
+        let x = 2 + (i % 4) * 18;
+        let y = 1 + (i / 4) * 7;
+        ascii_screen.box(x, y, 16, 6, "style", styles[i], "title", styles[i], "fg", ascii_screen.hsv(i / 8.0, 0.7, 1.0));
+        ascii_screen.text(x + 2, y + 2, "hello\nterminal", "fg", "white");
+        i += 1;
+    }
+}
+
+fn page_style(w: int) {
+    ascii_screen.big_text(w / 2, 1, "STYLE", "font", "half", "align", "center", "rainbow", true, "shadow", "#303030");
+    ascii_screen.text(2, 7, "bold", "bold", true);
+    ascii_screen.text(10, 7, "dim", "dim", true);
+    ascii_screen.text(16, 7, "italic", "italic", true);
+    ascii_screen.text(25, 7, "underline", "underline", true);
+    ascii_screen.text(37, 7, "reverse", "reverse", true);
+    ascii_screen.text(47, 7, "strike", "strike", true);
+    var i = 0;
+    while (i < 64) { ascii_screen.put(2 + i, 9, "█", "fg", ascii_screen.hsv(i / 64.0, 0.9, 1.0)); i += 1; }
+    i = 0;
+    while (i < 64) { ascii_screen.put(2 + i, 10, "█", "fg", ascii_screen.mix("#00c6ff", "#ff0080", i / 63.0)); i += 1; }
+    i = 0;
+    while (i < 64) { ascii_screen.put(2 + i, 11, "▒", "fg", "#ffffff", "bg", ascii_screen.shade("#3a7bd5", i / 32.0)); i += 1; }
+    ascii_screen.text(2, 13, "unicode: ╔═╗ ●◆★ ⣿⠿ λ π Ω · 日本語 한글", "fg", "cyan");
+    ascii_screen.text(2, 15, "wrapped text: " + "the quick brown fox jumps over the lazy dog. ", "width", 40, "fg", "#a0e0a0");
+}
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: text", "fps", 30);
+    let w = ascii_screen.width();
+    let h = ascii_screen.height();
+    var page = 0;
+    var timer = 0.0;
+    while (ascii_screen.poll()) {
+        timer += ascii_screen.dt();
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        if (ascii_screen.key_pressed("space") || ascii_screen.key_pressed("right") || timer > 6.0) { page = (page + 1) % 3; timer = 0.0; }
+        if (ascii_screen.key_pressed("left")) { page = (page + 2) % 3; timer = 0.0; }
+        ascii_screen.begin();
+        if (page == 0) { page_fonts(w); }
+        if (page == 1) { page_boxes(w); }
+        if (page == 2) { page_style(w); }
+        ascii_screen.text(2, h - 1, "page " + str(page + 1) + "/3   space next   left prev   q quit", "fg", "gray");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

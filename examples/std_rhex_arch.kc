@@ -1,0 +1,50 @@
+import std.rhex;
+import std.system;
+
+// std.rhex runs the HOST CPU's machine code, so the bytes have to match the
+// architecture this program is running on. rhex.arch() says which that is.
+// Every encoding below is a tiny leaf function that follows the platform's
+// integer calling convention (arguments in the first registers, result in
+// the first return register):
+//
+//   fn_const42()  ->  returns 42
+//   fn_add(a, b)  ->  returns a + b
+//
+// Where the OS changes the convention (Microsoft x64 vs System V on x86-64)
+// the example branches on it, exactly like std_rhex.kc.
+fn fn_const42(arch: string) -> any {
+    if (arch == "x86_64" || arch == "x86") { return [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]; }   // mov eax,42 ; ret
+    if (arch == "aarch64")  { return [0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6]; }       // mov w0,#42 ; ret
+    if (arch == "armhf" || arch == "arm") { return [0x2A, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1]; } // mov r0,#42 ; bx lr
+    if (arch == "riscv64" || arch == "riscv32") { return [0x13, 0x05, 0xA0, 0x02, 0x67, 0x80, 0x00, 0x00]; } // li a0,42 ; ret
+    return [];
+}
+
+fn fn_add(arch: string) -> any {
+    if (arch == "x86_64") {
+        if (system.platform() == "windows") { return [0x89, 0xC8, 0x01, 0xD0, 0xC3]; }        // mov eax,ecx ; add eax,edx ; ret
+        return [0x89, 0xF8, 0x01, 0xF0, 0xC3];                                                // mov eax,edi ; add eax,esi ; ret
+    }
+    if (arch == "aarch64")  { return [0x00, 0x00, 0x01, 0x0B, 0xC0, 0x03, 0x5F, 0xD6]; }       // add w0,w0,w1 ; ret
+    if (arch == "armhf" || arch == "arm") { return [0x01, 0x00, 0x80, 0xE0, 0x1E, 0xFF, 0x2F, 0xE1]; } // add r0,r0,r1 ; bx lr
+    if (arch == "riscv64" || arch == "riscv32") { return [0x33, 0x05, 0xB5, 0x00, 0x67, 0x80, 0x00, 0x00]; } // add a0,a0,a1 ; ret
+    return [];
+}
+
+fn main() {
+    let arch = rhex.arch();
+    print("host architecture:", arch);
+
+    let c42 = fn_const42(arch);
+    if (len(c42) == 0) {
+        print("no raw machine code known for", arch, "- nothing to run (the interpreter still runs everything else)");
+        return;
+    }
+    unsafe {
+        print("arch exec:", rhex.exec(c42));
+        let buf = rhex.from_bytes(fn_add(arch));
+        rhex.protect(buf, "rx");
+        print("arch call_args(19, 23) ->", rhex.call_args(buf, [19, 23]));
+        rhex.free(buf);
+    }
+}

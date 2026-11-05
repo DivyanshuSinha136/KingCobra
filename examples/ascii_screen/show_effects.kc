@@ -1,0 +1,31 @@
+// std.ascii_screen showcase 1/10 — all ten built-in effects.
+// space / right = next   left = previous   q = quit   (auto-advances every 5 s)
+import std.ascii_screen;
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: effects", "fps", 30);
+    let names = ["plasma", "fire", "matrix", "starfield", "rain", "snow", "waves", "tunnel", "life", "noise"];
+    let w = ascii_screen.width();
+    let h = ascii_screen.height();
+    let fx = [];
+    var i = 0;
+    while (i < names.len) { fx.push(ascii_screen.effect(names[i], w, h)); i += 1; }
+
+    var page = 0;
+    var timer = 0.0;
+    while (ascii_screen.poll()) {
+        timer += ascii_screen.dt();
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        if (ascii_screen.key_pressed("space") || ascii_screen.key_pressed("right") || timer > 5.0) { page = (page + 1) % names.len; timer = 0.0; }
+        if (ascii_screen.key_pressed("left")) { page = (page + names.len - 1) % names.len; timer = 0.0; }
+
+        ascii_screen.begin();
+        ascii_screen.effect_draw(fx[page], 0, 0);
+        ascii_screen.fill(0, 0, w, 3, " ", "bg", "#101018");
+        ascii_screen.text(2, 1, str(page + 1) + "/" + str(names.len) + "  " + names[page], "fg", "#ffd166", "bold", true, "bg", "#101018");
+        ascii_screen.fill(0, h - 1, w, 1, " ", "bg", "#101018");
+        ascii_screen.text(2, h - 1, "space/right next   left prev   q quit   fps " + str(ascii_screen.floor(ascii_screen.fps())), "fg", "gray", "bg", "#101018");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

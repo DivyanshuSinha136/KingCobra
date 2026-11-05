@@ -1,0 +1,29 @@
+// KingCobra v0.2 — built-in string and array methods.
+
+fn main() {
+    let s = "  Hello, KingCobra World  ";
+    print("trim:", s.trim());
+    print("upper:", s.trim().upper());
+    print("lower:", s.trim().lower());
+    print("contains 'Cobra':", s.contains("Cobra"));
+    print("index_of 'King':", s.index_of("King"));
+    print("starts_with '  He':", s.starts_with("  He"));
+    print("ends_with 'World  ':", s.ends_with("World  "));
+    print("replace:", s.trim().replace("World", "Language"));
+    print("slice(0,5):", s.trim().slice(0, 5));
+
+    let parts = "a,b,,c".split(",");
+    print("split:", parts, "len:", len(parts));
+
+    var arr = [3, 1, 4, 1, 5];
+    arr.push(9);
+    print("after push:", arr);
+    let popped = arr.pop();
+    print("popped:", popped, "remaining:", arr);
+    print("contains 4:", arr.contains(4));
+    print("index_of 1:", arr.index_of(1));
+    print("slice(1,3):", arr.slice(1, 3));
+    print("join '-':", arr.join("-"));
+    arr.reverse();
+    print("reversed:", arr);
+}

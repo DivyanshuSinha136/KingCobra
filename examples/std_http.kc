@@ -1,0 +1,63 @@
+// std.http tour: a client talking to a KingCobra server (started here as a child process).
+// For the internet, just call http.get("https://example.com/") — https:// is verified
+// and needs the OpenSSL library installed (loaded at run time; plain http:// never does).
+import std.http;
+import std.io;
+import std.system;
+
+fn main() {
+    // ---- start the example server as a child process and wait for its port ----
+    let dir = system.make_temp_dir("kc_http_");
+    let portfile = system.path_join(dir, "port");
+    system.setenv("KC_PORT_FILE", portfile);
+    let here = system.dirname(system.script_path());
+    let server = system.spawn([system.exe_path(), "run", system.path_join(here, "http", "server.kc")], false);
+    var waited = 0;
+    while (!system.exists(portfile) && waited < 100) { system.sleep(0.05); waited = waited + 1; }
+    let base = "http://127.0.0.1:" + io.read_file(portfile);
+
+    // ---- a plain GET: the response is a struct ----
+    let r = http.get(base + "/hello?name=KingCobra");
+    print("GET   ->", r.status, r.reason, "|", r.body);
+    print("        content-type:", http.header(r, "content-type"), "| body bytes:", r.length);
+
+    // ---- POST a form (http.form percent-encodes), with an extra header ----
+    let form = http.form([["lang", "KingCobra"], ["note", "a&b = c"]]);
+    let p = http.post(base + "/echo", form, ["Content-Type: application/x-www-form-urlencoded", "X-Demo: yes"]);
+    print("POST  ->", p.status, "|", p.body);
+
+    // ---- redirects are followed automatically ----
+    let d = http.get(base + "/old");
+    print("REDIR ->", d.status, d.body, "| hops:", d.redirects, "| final url ends with", system.basename(d.url));
+
+    // ---- an error status is a normal response, not a failure ----
+    let nf = http.get(base + "/missing");
+    print("404   ->", nf.status, nf.ok, "|", nf.body);
+
+    // ---- a reusable client: keep-alive connection + default headers + timeout ----
+    let c = http.client();
+    http.set_option(c, "timeout", 5);
+    http.set_option(c, "header", "X-Client: demo");
+    http.set_option(c, "bearer", "secret-token");
+    let a = http.get(c, base + "/hello?name=again");
+    print("CLIENT->", a.status, a.body);
+
+    // ---- download straight to disk (never held in memory) ----
+    let target = system.path_join(dir, "lines.txt");
+    let dl = http.download(base + "/file", target);
+    print("DOWNLOAD ->", dl.status, dl.length, "bytes, file size", system.stat(target).size);
+
+    // ---- failures return null and set http.last_error() ----
+    let bad = http.get("http://127.0.0.1:1/");
+    print("FAIL  ->", bad, "|", http.last_error());
+
+    // ---- URL helpers ----
+    let u = http.url_parse("https://user@example.com:8443/a/b?x=1");
+    print("URL   ->", u.host, u.port, u.path, u.query, "|", http.url_join("http://h/a/b/c", "../d"));
+
+    // ---- stop the server and clean up ----
+    http.get(base + "/quit");
+    print("server exit code:", system.wait(server, 5.0));
+    system.proc_free(server);
+    system.rmdir(dir, true);
+}

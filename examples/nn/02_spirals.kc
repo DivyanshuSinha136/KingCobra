@@ -1,0 +1,62 @@
+// std.nn example 2 — a classic non-linear classification problem: two interleaved spirals.
+// Shows: building data with tensor math, classification metrics, a confusion matrix,
+//        precision/recall/F1, and drawing the learned decision boundary as text.
+import std.nn;
+
+fn spiral(n: int, phase: float) -> any {
+    // radius grows with the angle; `phase` rotates the second arm by pi
+    let t = nn.linspace(0.3, 3.2, n);                       // angle in units of pi
+    let ang = nn.add(nn.mul(t, 3.14159265), phase);
+    let r = nn.mul(t, 1.0);
+    let px = nn.add(nn.mul(r, nn.cos(ang)), nn.randn([n], 0.06));
+    let py = nn.add(nn.mul(r, nn.sin(ang)), nn.randn([n], 0.06));
+    return nn.transpose(nn.concat([nn.reshape(px, [1, n]), nn.reshape(py, [1, n])], 0));   // [n, 2]
+}
+
+fn main() {
+    nn.seed(3);
+    let n = 150;
+    let X = nn.concat([spiral(n, 0.0), spiral(n, 3.14159265)], 0);       // [300, 2]
+    let Y = nn.concat([nn.zeros([n]), nn.ones([n])], 0);                  // class ids 0 / 1
+
+    let s = nn.train_test_split(X, Y, 0.25);
+    let model = nn.mlp([2, 48, 48, 2], "activation", "tanh");
+    let h = nn.fit(model, "ce", "adam", s[0], s[1], "epochs", 500, "batch_size", 32, "lr", 0.01,
+                   "schedule", "cosine", "verbose", 0);
+    print("final training accuracy:", h.metric[h.epochs - 1]);
+
+    let probs = nn.predict(model, s[2]);
+    let ev = nn.evaluate(model, "ce", s[2], s[3]);
+    print("held-out accuracy:", ev.metric, " loss:", ev.loss);
+    print("confusion matrix (rows = truth, columns = prediction):");
+    print(nn.confusion_matrix(probs, s[3], 2));
+    let r = nn.prf(probs, s[3], 2);
+    print("precision:", r.precision, " recall:", r.recall, " macro F1:", r.macro_f1);
+
+    // Decision boundary: classify a 40x20 grid over [-3.4, 3.4]^2 and draw it ('#' = class 1, '.' = class 0)
+    print("learned decision boundary:");
+    let rows = 20;
+    let cols = 40;
+    let pts = [];
+    var iy = 0;
+    while (iy < rows) {
+        var ix = 0;
+        while (ix < cols) {
+            pts.push([-3.4 + 6.8 * ix / (cols - 1), 3.4 - 6.8 * iy / (rows - 1)]);
+            ix = ix + 1;
+        }
+        iy = iy + 1;
+    }
+    let cls = nn.predict_class(model, pts);
+    iy = 0;
+    while (iy < rows) {
+        var line = "";
+        var ix = 0;
+        while (ix < cols) {
+            if (cls[iy * cols + ix] == 1) { line = line + "#"; } else { line = line + "."; }
+            ix = ix + 1;
+        }
+        print(line);
+        iy = iy + 1;
+    }
+}

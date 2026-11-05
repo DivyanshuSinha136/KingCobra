@@ -1,0 +1,52 @@
+// Explicit memory management — there is no garbage collector.
+// Run with:  kingcobra --leaks examples/memory.kc     (see docs/MEMORY.md)
+
+import std.json as json;
+
+// A "request handler" that allocates scratch memory and always cleans up,
+// on every exit path, with defer.
+fn handle(body: string) -> int {
+    let scratch = alloc(256);
+    defer free(scratch);                 // runs however we leave this function
+
+    let doc = json.parse(body);
+    defer free_deep(doc);                // frees the object, its array, its strings
+
+    if (doc.n < 0) { return -1; }        // early return: both defers still run
+    let out = buffer(16);
+    defer out.free();
+    out.put_u32(0, doc.n);
+    return out.get_u32(0) + len(doc.tags);
+}
+
+fn main() {
+    let before = mem_stats();
+
+    // 20,000 requests: memory is reused, so the heap does not grow.
+    var i = 0;
+    var total = 0;
+    while (i < 20000) {
+        total += handle("{\"n\": 3, \"tags\": [1, 2, 3]}");
+        i += 1;
+    }
+    print("handled 20000 requests, total =", total);
+    print("negative request:", handle("{\"n\": -5, \"tags\": []}"));
+
+    let after = mem_stats();
+    print("heap reserved grew by", after.heap_bytes_reserved - before.heap_bytes_reserved, "bytes");
+    print("live blocks left:", after.regions_live);
+
+    // Use after free is a precise error, not corruption. Aliases see the free too.
+    var names = ["ada", "grace"];
+    let alias = names;
+    free(names);
+    print("is_freed(alias) =", is_freed(alias));
+
+    // A string literal is static data and cannot be freed; copy it first.
+    let copy = "" + "literal";
+    free(copy);
+    print("freed a copy of a literal; the literal itself is untouched");
+
+    // alias[0];   // -> error: use after free (this array was freed)
+    // free(names);// -> error: double free (this array was already freed)
+}

@@ -1,0 +1,80 @@
+// std.nn example 6 — a character-level language model (a tiny GPT) that learns a short text and generates more.
+// (On a 123-character corpus the model memorises the text; on a larger corpus the same code generalises.)
+// Shows: embedding + positional encoding + causal transformer blocks, next-token training, and sampling
+//        from the model with temperature and top-k (nn.sample).
+import std.nlp;
+import std.nn;
+
+fn char_id(chars: array, c: string) -> int {
+    var k = 0;
+    while (k < len(chars)) { if (chars[k] == c) { return k; } k = k + 1; }
+    return 0;
+}
+
+// Generate `count` characters after `prompt`. The model only looks at its last `ctx` characters.
+fn generate(model, chars: array, prompt: string, count: int, ctx: int, temperature: float, top_k: int) -> string {
+    let ids = [];
+    for (c in nlp.char_ngrams(prompt, 1)) { ids.push(char_id(chars, c)); }
+    var text = prompt;
+    var n = 0;
+    while (n < count) {
+        var window = ids;
+        if (len(ids) > ctx) { window = nn.to_array(nn.slice(ids, len(ids) - ctx, len(ids))); }
+        let logits = nn.predict(model, [window])[0][len(window) - 1];       // scores for the next character
+        let nxt = nn.sample(logits, temperature, top_k);
+        ids.push(nxt);
+        text = text + chars[nxt];
+        n = n + 1;
+    }
+    return text;
+}
+
+fn main() {
+    nn.seed(21);
+    let corpus = "the quick brown fox jumps over the lazy dog. pack my box with five dozen liquor jugs. how vexingly quick daft zebras jump! ";
+
+    // vocabulary = the distinct characters, in order of first appearance
+    let all = nlp.char_ngrams(corpus, 1);
+    let chars = [];
+    for (c in all) {
+        var seen = false;
+        for (d in chars) { if (d == c) { seen = true; } }
+        if (!seen) { chars.push(c); }
+    }
+    let V = len(chars);
+    print("corpus:", len(all), "characters, vocabulary:", V);
+
+    // training pairs: input = ctx characters, target = the same characters shifted left by one
+    let ctx = 24;
+    let xs = [];
+    let ys = [];
+    var i = 0;
+    while (i + ctx < len(all)) {
+        let x = [];
+        let y = [];
+        var j = 0;
+        while (j < ctx) { x.push(char_id(chars, all[i + j])); y.push(char_id(chars, all[i + j + 1])); j = j + 1; }
+        xs.push(x);
+        ys.push(y);
+        i = i + 1;
+    }
+    print("training windows:", len(xs));
+
+    let d = 32;
+    let model = nn.sequential([
+        nn.embedding(V, d), nn.pos_encoding(),
+        nn.transformer_block(d, 4, 64, "causal", true),
+        nn.transformer_block(d, 4, 64, "causal", true),
+        nn.layernorm(d), nn.dense(d, V)
+    ]);
+    print("model parameters:", nn.count_params(model));
+
+    let h = nn.fit(model, "ce", "adamw", xs, ys, "epochs", 50, "batch_size", 16, "lr", 0.006,
+                   "schedule", "cosine", "warmup", 3, "clip_norm", 1.0, "verbose", 25);
+    print("next-character accuracy on the corpus:", h.metric[h.epochs - 1]);
+
+    print("greedy-ish (temperature 0.1):");
+    print("  " + generate(model, chars, "the quick", 70, ctx, 0.1, 0));
+    print("creative (temperature 1.0, top-k 4):");
+    print("  " + generate(model, chars, "pack my", 70, ctx, 1.0, 4));
+}

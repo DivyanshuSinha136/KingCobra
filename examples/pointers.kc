@@ -1,0 +1,102 @@
+// Pointers, buffers and offsets — C-style, but bounds-checked.
+// See docs/POINTERS.md for the full model.
+
+// ---- 1. A wire-format header, laid out exactly like C ----------------
+packed struct Header {          // no padding: fields are back to back
+    magic: u32,
+    version: u8,
+    length: u16,
+    flags: u8,
+    seq: u64,
+}
+struct Padded {                 // same fields, C alignment rules: padding inserted
+    magic: u32,
+    version: u8,
+    length: u16,
+    flags: u8,
+    seq: u64,
+}
+
+fn main() {
+    print("packed:", sizeof(Header), "bytes, length at", offsetof(Header, length), ", seq at", offsetof(Header, seq));
+    print("padded:", sizeof(Padded), "bytes, length at", offsetof(Padded, length), ", seq at", offsetof(Padded, seq));
+
+    // Build the bytes with a Buffer (explicit endianness, cursor-based)...
+    let pkt = buffer(sizeof(Header) + 5);
+    pkt.write_u32(0xC0BA17);
+    pkt.write_u8(2);
+    pkt.write_u16(5);
+    pkt.write_u8(0b1010);
+    pkt.write_u64(1000000007);
+    pkt.write_str("hello");
+
+    // ...and read it back through a typed struct pointer over the same memory.
+    let h = pkt.ptr as *Header;
+    print("magic   =", h->magic);
+    print("version =", h->version, " flags =", h->flags, " length =", h->length);
+    print("seq     =", h->seq);
+    if (h->flags & 0b1000 != 0) { print("flag bit 3 is set"); }
+
+    // The payload sits right after the header: pointer arithmetic in elements.
+    let payload = (h + 1) as *u8;          // h + 1 steps one whole Header
+    print("payload =", payload.read_str(h->length));
+
+    // Update a field through the pointer; the Buffer sees the change.
+    h->length += 100;
+    print("buffer now says length =", pkt.get_u16(offsetof(Header, length)));
+
+    // ---- 2. A linked list in raw memory ------------------------------
+    struct Node { value: i32, next: *Node }
+    var head: *Node = null;
+    for (i in 1..5) {
+        let n = alloc(sizeof(Node)) as *Node;
+        n->value = i * i;
+        n->next = head;
+        head = n;
+    }
+    var cur = head;
+    var vals = [];
+    while (cur != null) {
+        vals.push(cur->value);
+        let nxt = cur->next;
+        free(cur);
+        cur = nxt;
+    }
+    print("list (newest first):", vals);
+
+    // ---- 3. A bump allocator built on offsets ------------------------
+    let arena = buffer(64);
+    var top = 0;
+    fn bump(n: int, align: int) -> int {
+        let at = align_up(top, align);
+        top = at + n;
+        return at;
+    }
+    let a = bump(1, 1);      // 1 byte
+    let b = bump(4, 4);      // aligned to 4
+    let c = bump(8, 8);      // aligned to 8
+    print("offsets:", a, b, c, " top:", top);
+    arena.put_u32(b, 0xAABBCCDD);
+    arena.put_f64(c, 2.718281828);
+    print("arena[b] =", arena.get_u32(b), " arena[c] =", arena.get_f64(c));
+
+    // ---- 4. Pointers to variables ------------------------------------
+    var x = 10;
+    fn bump_it(p: *any) { *p += 1; }
+    bump_it(&x);
+    bump_it(&x);
+    print("x after two bumps through a pointer:", x);
+
+    var arr = [5, 6, 7];
+    var second = &arr[1];
+    *second = 60;
+    print("array:", arr, " via pointer arithmetic:", *(second + 1));
+
+    // ---- 5. Safety: every bad access is a clear error ----------------
+    let p = alloc(8) as *i32;
+    p[0] = 1; p[1] = 2;
+    print("p[1] =", p[1]);
+    free(p);
+    // p[0];   // -> error: use after free
+    // p[2];   // -> error: out of bounds
+}

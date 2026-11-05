@@ -1,0 +1,19 @@
+// KingCobra v0.3 — comptime blocks: run once, when execution reaches
+// them, with side-effecting natives (file/network/process I/O, raw
+// machine code) disallowed inside — see docs/LANGUAGE.md for the
+// exact scope. `let`/`fn` bindings made inside land in the enclosing
+// scope, so they're usable as ordinary values afterward.
+
+comptime {
+    fn fib(n: int) -> int {
+        if (n < 2) { return n; }
+        return fib(n - 1) + fib(n - 2);
+    }
+    let FIB10 = fib(10);
+    let GREETING = "computed at comptime";
+}
+
+fn main() {
+    print("FIB10 =", FIB10);
+    print(GREETING);
+}

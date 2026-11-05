@@ -1,0 +1,100 @@
+// std.nn example 8 — unsupervised pre-training and transfer learning.
+//   1. Train a denoising autoencoder on 400 UNLABELLED noisy 8x8 images (it never sees a label).
+//   2. Reuse its encoder, freeze it, and train only a small head with just 4 labelled images (one per class).
+//   3. Compare with the same network trained from scratch on the same 4 labels. Repeat over 5 random trials.
+// Shows: nn.get_params / nn.set_params to move weights between models, nn.freeze, trainable-parameter
+//        counts, nn.metric, and rendering images as text.
+import std.nn;
+
+// class 0: vertical bar, 1: horizontal bar, 2: diagonal, 3: cross
+fn pattern(cls: int) -> array {
+    let img = nn.to_array(nn.zeros([64]));
+    var k = 0;
+    while (k < 8) {
+        if (cls == 0) { img[k * 8 + 3] = 1.0; }
+        if (cls == 1) { img[3 * 8 + k] = 1.0; }
+        if (cls == 2) { img[k * 8 + k] = 1.0; }
+        if (cls == 3) { img[k * 8 + 3] = 1.0; img[3 * 8 + k] = 1.0; }
+        k = k + 1;
+    }
+    return img;
+}
+
+// n clean images cycling through the 4 classes, and their labels
+fn clean_set(n: int) -> array {
+    let xs = [];
+    let ys = [];
+    var i = 0;
+    while (i < n) { xs.push(pattern(i % 4)); ys.push(i % 4); i = i + 1; }
+    return [xs, ys];
+}
+
+fn show(v: array) {
+    var r = 0;
+    while (r < 8) {
+        var line = "  ";
+        var c = 0;
+        while (c < 8) {
+            let x = v[r * 8 + c];
+            if (x > 0.6) { line = line + "#"; } else { if (x > 0.3) { line = line + "+"; } else { line = line + "."; } }
+            c = c + 1;
+        }
+        print(line);
+        r = r + 1;
+    }
+}
+
+fn main() {
+    nn.seed(4);
+    let sigma = 0.8;                                     // heavy noise: individual images are hard to read
+
+    // ---------- 1. denoising autoencoder on unlabelled data ----------
+    let u = clean_set(400);
+    let clean = nn.tensor(u[0]);
+    let noisy = nn.add(clean, nn.randn([400, 64], sigma));
+    let ae = nn.sequential([nn.dense(64, 16), nn.relu(),           // encoder: layers 0-1
+                            nn.dense(16, 64), nn.sigmoid()]);      // decoder
+    nn.fit(ae, "mse", "adam", noisy, clean, "epochs", 80, "batch_size", 32, "lr", 0.005, "verbose", 0);
+    let demo_clean = pattern(3);
+    let demo_noisy = nn.to_array(nn.add(nn.tensor(demo_clean), nn.randn([64], sigma)));
+    print("a noisy cross, as the network sees it:");
+    show(demo_noisy);
+    print("what the autoencoder reconstructs from it:");
+    show(nn.predict(ae, [demo_noisy])[0]);
+
+    // ---------- 2. few-label classification: 1 labelled image per class ----------
+    let test = clean_set(400);
+    let test_x = nn.add(nn.tensor(test[0]), nn.randn([400, 64], sigma));   // fixed noisy test set
+    let few = clean_set(4);
+
+    var sum_scratch = 0.0;
+    var sum_transfer = 0.0;
+    let trials = 5;
+    var t = 0;
+    while (t < trials) {
+        let few_x = nn.add(nn.tensor(few[0]), nn.randn([4, 64], sigma));   // a fresh noisy draw of the 4 labelled images
+
+        // (a) transfer: copy the encoder's weights into a new classifier and freeze them
+        let tl = nn.sequential([nn.dense(64, 16), nn.relu(), nn.dense(16, 4)]);
+        let enc = nn.get_params(ae);                  // [W1, b1, W2, b2]
+        let own = nn.get_params(tl);                  // [W1, b1, Whead, bhead]
+        nn.set_params(tl, [enc[0], enc[1], own[2], own[3]]);
+        nn.freeze(tl, 0);                             // layer 0 (the pre-trained dense layer) is skipped by the optimizer
+        if (t == 0) { print("transfer model: trainable parameters", nn.count_params(tl, true), "of", nn.count_params(tl)); }
+        nn.fit(tl, "ce", "adam", few_x, few[1], "epochs", 100, "batch_size", 4, "lr", 0.02, "verbose", 0);
+        let acc_t = nn.evaluate(tl, "ce", test_x, test[1]).metric;
+
+        // (b) identical architecture, random initial weights, same 4 labelled images
+        let sc = nn.sequential([nn.dense(64, 16), nn.relu(), nn.dense(16, 4)]);
+        nn.fit(sc, "ce", "adam", few_x, few[1], "epochs", 100, "batch_size", 4, "lr", 0.02, "verbose", 0);
+        let acc_s = nn.evaluate(sc, "ce", test_x, test[1]).metric;
+
+        print("trial", t + 1, ":  from scratch", acc_s, "   frozen pre-trained encoder", acc_t);
+        sum_scratch = sum_scratch + acc_s;
+        sum_transfer = sum_transfer + acc_t;
+        t = t + 1;
+    }
+    print("mean accuracy on 400 unseen noisy images (chance = 0.25):");
+    print("   from scratch:                     ", sum_scratch / trials);
+    print("   frozen pre-trained encoder + head:", sum_transfer / trials);
+}

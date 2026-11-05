@@ -1,0 +1,13 @@
+import std.memory;
+
+fn main() {
+    let buf = memory.alloc(16);
+    memory.write_string(buf, 0, "KingCobra!");
+    print("size:", memory.size(buf));
+    print("read back:", memory.read_string(buf, 0, 10));
+
+    memory.set8(buf, 10, 33); // '!'
+    print("byte 10 =", memory.get8(buf, 10));
+
+    memory.free(buf);
+}

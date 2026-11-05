@@ -1,0 +1,76 @@
+// std.nn example 3 — a convolutional network that recognises line patterns in noisy 10x10 images.
+// Shows: conv2d / batchnorm / pooling, the model summary, a confusion matrix, and rendering an image as text.
+import std.nn;
+
+// class 0: vertical bar, 1: horizontal bar, 2: diagonal, 3: cross.  Returns a [1][10][10] image.
+fn make_image(cls: int, pos: int) -> array {
+    let img = nn.to_array(nn.randn([1, 10, 10], 0.25));
+    var k = 0;
+    while (k < 10) {
+        if (cls == 0) { img[0][k][pos] = img[0][k][pos] + 1.5; }
+        if (cls == 1) { img[0][pos][k] = img[0][pos][k] + 1.5; }
+        if (cls == 2) { let c = (k + pos) % 10; img[0][k][c] = img[0][k][c] + 1.5; }
+        if (cls == 3) { img[0][k][pos] = img[0][k][pos] + 1.5; img[0][pos][k] = img[0][pos][k] + 1.0; }
+        k = k + 1;
+    }
+    return img;
+}
+
+fn make_set(n: int) -> array {
+    let xs = [];
+    let ys = [];
+    var i = 0;
+    while (i < n) {
+        let cls = i % 4;
+        xs.push(make_image(cls, 1 + (i * 3) % 8));
+        ys.push(cls);
+        i = i + 1;
+    }
+    return [xs, ys];
+}
+
+fn show(img: array) {
+    // render one [1][10][10] image: '#' strong, '+' medium, '.' background
+    var r = 0;
+    while (r < 10) {
+        var line = "  ";
+        var c = 0;
+        while (c < 10) {
+            let v = img[0][r][c];
+            if (v > 1.0) { line = line + "#"; } else { if (v > 0.5) { line = line + "+"; } else { line = line + "."; } }
+            c = c + 1;
+        }
+        print(line);
+        r = r + 1;
+    }
+}
+
+fn main() {
+    nn.seed(5);
+    let train = make_set(240);
+    let test = make_set(80);
+
+    let cnn = nn.sequential([
+        nn.conv2d(1, 8, 3, "padding", 1), nn.batchnorm(8), nn.relu(), nn.maxpool2d(2),   // 10x10 -> 5x5
+        nn.conv2d(8, 16, 3, "padding", 1), nn.batchnorm(16), nn.relu(),
+        nn.global_avg_pool(),                                                            // [N,16]
+        nn.dropout(0.1), nn.dense(16, 4)
+    ]);
+    print(nn.summary(cnn, [1, 10, 10]));
+
+    let h = nn.fit(cnn, "ce", "adam", train[0], train[1], "epochs", 40, "batch_size", 24, "lr", 0.01,
+                   "val_split", 0.2, "verbose", 10);
+    let ev = nn.evaluate(cnn, "ce", test[0], test[1]);
+    print("test accuracy:", ev.metric, " loss:", ev.loss);
+
+    let pred = nn.predict(cnn, test[0]);
+    print("confusion matrix (rows = truth: vbar, hbar, diagonal, cross):");
+    print(nn.confusion_matrix(pred, test[1], 4));
+
+    let names = ["vertical bar", "horizontal bar", "diagonal", "cross"];
+    let sample = make_image(3, 4);
+    print("a fresh noisy image:");
+    show(sample);
+    let guess = nn.predict_class(cnn, [sample]);
+    print("the network says:", names[guess[0]]);
+}

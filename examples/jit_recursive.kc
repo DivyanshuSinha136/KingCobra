@@ -1,0 +1,65 @@
+// KingCobra — the extended closure JIT (v0.3): self-recursive calls,
+// if/else, while with break/continue, comparisons, &&/||/!, and local
+// variables all compile to real x86-64 once a closure passes
+// KC_JIT_THRESHOLD (50) calls. This file exercises every one of those
+// and is checked against independently-computed values in
+// tests/smoke_test.sh.
+//
+// See docs/ROADMAP.md for the exact boundary of what's compilable —
+// floats, calls to anything other than the function compiling itself,
+// arrays/strings, and division/modulo all fall back to the
+// interpreter safely and correctly rather than being guessed at.
+
+fn fib(n: int) -> int {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn sum_to(n: int) -> int {
+    var total: int = 0;
+    var i: int = 0;
+    while (i < n) {
+        i += 1;
+        if (i == 7) {
+            continue; // skip 7
+        }
+        if (i > 50) {
+            break;
+        }
+        total += i;
+    }
+    return total;
+}
+
+fn classify(n: int) -> int {
+    let is_small = n < 10;
+    let is_big = n > 100;
+    if (is_small && n > 0) {
+        return 1;
+    } else if (is_big || n == -1) {
+        return 2;
+    } else if (!is_small) {
+        return 3;
+    }
+    return 0;
+}
+
+fn main() {
+    var i: int = 0;
+    while (i < 20) {
+        print("fib(", i, ") =", fib(i));
+        i += 1;
+    }
+
+    i = 0;
+    while (i < 55) {
+        print("sum_to(", i, ") =", sum_to(i));
+        i += 1;
+    }
+
+    print("classify(5) =", classify(5));
+    print("classify(50) =", classify(50));
+    print("classify(150) =", classify(150));
+}

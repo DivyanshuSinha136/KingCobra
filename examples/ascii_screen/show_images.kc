@@ -1,0 +1,31 @@
+// std.ascii_screen showcase 4/10 — pictures as text: PNG/JPEG, an animated GIF and an SVG, in every render mode.
+// Run from the repository root (it loads tests/ascii_screen_assets/*).
+// space = next render mode   d = next dither   q = quit
+import std.ascii_screen;
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: images", "fps", 30);
+    let photo = ascii_screen.image("tests/ascii_screen_assets/photo.jpg");
+    let icon = ascii_screen.svg("tests/ascii_screen_assets/icon.svg");
+    let ball = ascii_screen.anim_load("tests/ascii_screen_assets/ball.gif", "width", 24, "mode", "half");
+    let modes = ["ramp", "blocks", "shape", "half", "quad", "braille", "edges"];
+    let dithers = ["none", "floyd", "bayer"];
+    var m = 0;
+    var d = 0;
+    let h = ascii_screen.height();
+    while (ascii_screen.poll()) {
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        if (ascii_screen.key_pressed("space")) { m = (m + 1) % modes.len; }
+        if (ascii_screen.key_pressed("d")) { d = (d + 1) % dithers.len; }
+        ascii_screen.begin();
+        ascii_screen.box(0, 0, 62, 26, "style", "round", "title", "photo.jpg  mode=" + modes[m] + "  dither=" + dithers[d], "fg", "cyan");
+        ascii_screen.draw_image(photo, 1, 1, "width", 60, "height", 24, "mode", modes[m], "dither", dithers[d], "color", true);
+        ascii_screen.box(63, 0, 28, 13, "style", "round", "title", "animated gif", "fg", "yellow");
+        ascii_screen.anim_draw(ball, 65, 1);
+        ascii_screen.box(63, 13, 28, 13, "style", "round", "title", "icon.svg", "fg", "magenta");
+        ascii_screen.draw_image(icon, 65, 14, "width", 24, "mode", "half");
+        ascii_screen.text(2, h - 1, "space: render mode   d: dither   q: quit", "fg", "gray");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

@@ -1,0 +1,42 @@
+// std.ascii_screen showcase 6/10 — HUD widgets: panel, animated bars, list, text input, live graph, spinner, toasts.
+// up/down + enter: use the list   type in the box (tab focuses it)   q (when not typing) = quit
+import std.ascii_screen;
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: HUD", "fps", 30);
+    ascii_screen.hud("panel", "anchor", "tl", "x", 1, "y", 1, "w", 40, "h", 7, "title", "Status", "border", "round", "border_fg", "cyan",
+                     "text", "HUD widgets: bars tween smoothly,\nthe graph is live, the list and\nthe input box take real input.");
+    let cpu = ascii_screen.hud("bar", "anchor", "tl", "x", 8, "y", 9, "w", 31, "value", 40, "max", 100, "fill", "#2ecc71", "empty", "#303030", "trail", true);
+    let mem = ascii_screen.hud("bar", "anchor", "tl", "x", 8, "y", 11, "w", 31, "value", 70, "max", 100, "fill", "#4cc9f0", "empty", "#303030");
+    let hp = ascii_screen.hud("bar", "anchor", "tl", "x", 8, "y", 13, "w", 31, "value", 100, "max", 100, "fill", "#e74c3c", "empty", "#303030", "trail", true, "trail_color", "#ffaa00");
+    let graph = ascii_screen.hud("graph", "anchor", "tl", "x", 43, "y", 1, "w", 44, "h", 9, "title", "live graph", "border", "round", "min", -1.0, "max_y", 1.0);
+    let items = ascii_screen.hud("list", "anchor", "tl", "x", 43, "y", 11, "w", 30, "h", 8, "title", "actions", "border", "round",
+                                 "items", ["heal", "damage", "toast", "randomise bars", "quit"]);
+    let box = ascii_screen.hud("input", "anchor", "tl", "x", 3, "y", 16, "w", 36, "h", 3, "title", "type here", "border", "round");
+    ascii_screen.hud("spinner", "anchor", "tr", "x", 2, "y", 1);
+    ascii_screen.hud("fps", "anchor", "br", "x", 1, "y", 0);
+    ascii_screen.hud_focus(items);
+
+    var t = 0.0;
+    var wave = 0.0;
+    while (ascii_screen.poll()) {
+        t += ascii_screen.dt();
+        let typing = ascii_screen.text_input_active();
+        if (!typing && (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape"))) { ascii_screen.quit(); }
+        ascii_screen.hud_push(graph, ascii_screen.sin(t * 3.0) * 0.7 + ascii_screen.sin(t * 8.1) * 0.25);
+        if (ascii_screen.key_pressed("enter") && ascii_screen.hud_get(items, "focused")) {
+            let s = ascii_screen.hud_get(items, "sel");
+            if (s == 0) { ascii_screen.hud_tween(hp, "value", 100, 0.8, "out"); ascii_screen.hud_notify("healed", "fg", "lime"); }
+            if (s == 1) { ascii_screen.hud_tween(hp, "value", ascii_screen.rand_int(5, 60), 0.6, "out"); ascii_screen.hud_notify("ouch!", "fg", "red"); ascii_screen.camera_shake(0.5, 0.2); }
+            if (s == 2) { ascii_screen.hud_notify("hello from a toast #" + str(ascii_screen.frame()), "fg", "cyan", "seconds", 3); }
+            if (s == 3) { ascii_screen.hud_tween(cpu, "value", ascii_screen.rand_int(5, 95), 0.7, "inout"); ascii_screen.hud_tween(mem, "value", ascii_screen.rand_int(20, 95), 0.7, "inout"); }
+            if (s == 4) { ascii_screen.quit(); }
+        }
+        ascii_screen.begin();
+        ascii_screen.text(3, 9, "CPU", "fg", "gray"); ascii_screen.text(3, 11, "MEM", "fg", "gray"); ascii_screen.text(3, 13, "HP", "fg", "gray");
+        ascii_screen.text(3, 18 + 3, "you typed: " + ascii_screen.hud_get(box, "text"), "fg", "#a0e0a0");
+        ascii_screen.text(3, 18 + 5, "tab cycles focus, enter runs the action", "fg", "gray");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

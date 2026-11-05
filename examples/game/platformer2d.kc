@@ -1,0 +1,134 @@
+// std.game — 2D platformer: streamed tilemap (32x32-tile chunks created on demand, optionally
+// saved to a directory), sprite sheet, animation, tile collision, camera follow, particles, HUD.
+//   A/D or arrows move · Space jump · Esc quit
+import std.game;
+
+var px = 40.0;
+var py = 0.0;
+var vx = 0.0;
+var vy = 0.0;
+var grounded = false;
+var coins = 0;
+var map = 0;
+var walk = 0;
+let idle = 0;
+var sheet = 0;
+var coin_hud = 0;
+var facing = 1;
+
+fn make_tiles() {
+    // 4 tiles drawn at runtime: grass, dirt, stone, coin
+    let t = game.texture_new(64, 16, 0);
+    let cols = [0xff5da13f, 0xff86603b, 0xff8d8d93, 0xfffdd835];
+    var k = 0;
+    while (k < 4) {
+        var y = 0;
+        while (y < 16) {
+            var x = 0;
+            while (x < 16) {
+                var c = cols[k] - ((x + y) % 2) * 0x0a0a0a;
+                if (k == 3) { let dx = x - 8; let dy = y - 8; if (dx * dx + dy * dy > 30) { c = -1; } }
+                game.texture_set(t, k * 16 + x, y, c);
+                x += 1;
+            }
+            y += 1;
+        }
+        k += 1;
+    }
+    return t;
+}
+fn make_hero() {
+    // 2 frames of a little hero, 12x16 each, on one texture
+    let t = game.texture_new(48, 16, 0);
+    var f = 0;
+    while (f < 3) {
+        var y = 0;
+        while (y < 16) {
+            var x = 0;
+            while (x < 16) {
+                var c = -1;
+                if (x >= 3 && x < 13 && y >= 3) { c = 0xff3a7bd5; }
+                if (y < 6 && x >= 4 && x < 12) { c = 0xfff2c6a0; }
+                if (y >= 12 && f == 1 && x < 8) { c = -1; }
+                if (y >= 12 && f == 2 && x >= 8) { c = -1; }
+                game.texture_set(t, f * 16 + x, y, c);
+                x += 1;
+            }
+            y += 1;
+        }
+        f += 1;
+    }
+    return t;
+}
+
+fn build_world() {
+    var x = 0;
+    while (x < 600) {
+        let h = 12 + int(game.noise2(x * 0.07, 3.0) * 7.0);
+        var y = h;
+        while (y < 40) {
+            var tile = 2;
+            if (y == h) { tile = 1; }
+            if (y > h + 3) { tile = 3 - 0; tile = 3; }
+            game.tile_set(map, x, y, tile);
+            y += 1;
+        }
+        if (x % 9 == 4) { game.tile_set(map, x, h - 2, 4); }     // coins float above the ground
+        x += 1;
+    }
+}
+
+fn update(dt) {
+    if (game.key_pressed("escape")) { game.quit(); }
+    var dir = 0.0;
+    if (game.key("a") || game.key("left")) { dir -= 1.0; }
+    if (game.key("d") || game.key("right")) { dir += 1.0; }
+    if (dir != 0.0) { facing = int(dir); }
+    vx = dir * 110.0;
+    vy += 900.0 * dt;
+    if (grounded && (game.key_pressed("space") || game.key_pressed("up"))) { vy = -330.0; }
+    let r = game.tile_move(map, px, py, 10.0, 14.0, vx * dt, vy * dt);
+    px = r[0]; py = r[1];
+    grounded = false;
+    if (r[3]) { if (vy > 0.0) { grounded = true; } vy = 0.0; }
+    if (py > 700.0) { px = 40.0; py = 0.0; vy = 0.0; }
+
+    // collect coins (tile 4 is not solid, just a pickup)
+    let tx = int((px + 5.0) / 16.0);
+    let ty = int((py + 7.0) / 16.0);
+    if (game.tile_get(map, tx, ty) == 4) {
+        game.tile_set(map, tx, ty, 0);
+        coins += 1;
+        game.hud_set(coin_hud, "text", "Coins: " + coins);
+        game.emit2d(tx * 16.0 + 8.0, ty * 16.0 + 8.0, 18, "color", "#ffe14d", "color_end", "#00ffe14d", "speed", 90.0, "life", 0.6);
+        game.hud_notify("Coin!", "#ffe14d", 1.0);
+    }
+    game.cam2d(px, py - 20.0, 3.0);
+    if (grounded && vx != 0.0) { game.anim_ctl(walk, "play"); } else { game.anim_ctl(walk, "stop"); }
+}
+
+fn draw() {
+    game.clear("#6aa7e8");
+    game.tilemap_draw(map);
+    var flip = false;
+    if (facing < 0) { flip = true; }
+    game.anim_draw(walk, px - 3.0, py - 2.0, "world", true, "flip_x", flip);
+}
+
+fn main() {
+    game.window("KingCobra 2D platformer", 640, 360, 1);
+    game.mode("2d");
+    let tiles = make_tiles();
+    let hero = make_hero();
+    sheet = game.sheet(tiles, 16, 16);
+    map = game.tilemap(16, 16, sheet);            // add a directory as 4th argument to stream chunks from disk
+    game.tile_solid(map, 1, true);
+    game.tile_solid(map, 2, true);
+    game.tile_solid(map, 3, true);
+    build_world();
+    let hs = game.sheet(hero, 16, 16);
+    walk = game.anim(hs, [1, 0, 2, 0], 8.0, true);
+    coin_hud = game.hud("text", "top-left", 8, 8, "Coins: 0", "scale", 2);
+    game.hud("text", "bottom", 0, 6, "A/D move   Space jump", "scale", 1);
+    game.run(update, draw, 0);
+}

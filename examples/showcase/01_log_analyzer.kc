@@ -1,0 +1,186 @@
+// SHOWCASE 1 — Web-server log analyzer
+//
+// A job every ops team has: take an access log, parse it, and answer "what is
+// happening on my site?" — traffic, errors, latency percentiles, suspicious clients —
+// then export the result as JSON (for a dashboard) and CSV (for a spreadsheet).
+//
+// Uses: std.regx (named-group parsing), std.json, std.csv, std.io, std.system,
+//       structs + impl, enums, match, f-strings, closures, try/catch, defer.
+//
+// Run:  kingcobra examples/showcase/01_log_analyzer.kc
+import std.regx;
+import std.json;
+import std.csv;
+import std.io;
+import std.system;
+
+// ---------- deterministic synthetic traffic (so the output is reproducible) ----------
+var seed = 20261028;
+fn rnd(n: int) -> int {
+    seed = (seed * 6364136223846793005 + 1442695040888963407);   // 64-bit LCG, wraps like C
+    return ((seed >>> 33) % n);
+}
+
+fn make_log(count: int) -> string[] {
+    let paths = ["/", "/", "/", "/products", "/products", "/products/42", "/cart", "/checkout",
+                 "/api/search", "/api/search", "/api/users", "/login", "/static/app.js", "/admin"];
+    let methods = ["GET", "GET", "GET", "GET", "POST"];
+    let lines = [];
+    for (i in 0..count) {
+        var ip = f"10.0.{rnd(4)}.{1 + rnd(30)}";
+        var path = paths[rnd(len(paths))];
+        var method = methods[rnd(len(methods))];
+        var status = 200;
+        var ms = 20 + rnd(180);
+        let roll = rnd(100);
+        if (roll < 6) { status = 404; }
+        else if (roll < 9) { status = 500; ms = ms + 400; }
+        else if (roll < 12) { status = 302; }
+        if (path == "/checkout") { method = "POST"; ms = ms + 150; }
+        if (path == "/admin") { status = 401; }
+        // one misbehaving client hammering the login form
+        if (i % 9 == 0) { ip = "203.0.113.66"; path = "/login"; method = "POST"; status = 401; }
+        let hour = 8 + rnd(12);
+        let bytes = 300 + rnd(9000);
+        let stamp = f"{two(hour)}:{two(rnd(60))}:{two(rnd(60))}";
+        lines.push(f"{ip} - - [28/Oct/2026:{stamp} +0000] \"{method} {path} HTTP/1.1\" {status} {bytes} {ms}");
+    }
+    // plus a few garbage lines, as real logs always have
+    lines.push("-- logrotate: rotated at 03:00 --");
+    lines.push("");
+    lines.push("10.0.0.1 broken line without quotes 200");
+    return lines;
+}
+
+// one-decimal formatting (no printf in the language; this is exact for display purposes)
+fn fmt1(x: float) -> string {
+    let t = int(x * 10 + 0.5);
+    return f"{idiv(t, 10)}.{t % 10}";
+}
+
+fn two(n: int) -> string { return str(n).pad_left(2, "0"); }
+
+// ---------- the model ----------
+enum Class { Ok, Redirect, ClientError, ServerError }
+
+struct Entry { ip: string, hour: int, method: string, path: string, status: int, bytes: int, ms: int }
+
+impl Entry {
+    fn class(self) -> int {
+        return match (idiv(self.status, 100)) {
+            2 => Class.Ok,
+            3 => Class.Redirect,
+            4 => Class.ClientError,
+            _ => Class.ServerError,
+        };
+    }
+}
+
+let LINE = regx.compile("^(?<ip>\\S+) \\S+ \\S+ \\[\\d+/\\w+/\\d+:(?<hour>\\d\\d):\\d\\d:\\d\\d [+-]\\d{4}\\] \"(?<method>[A-Z]+) (?<path>\\S+) HTTP/\\d\\.\\d\" (?<status>\\d{3}) (?<bytes>\\d+) (?<ms>\\d+)$");
+
+fn parse_line(line: string) -> Entry {
+    let g = regx.groups(LINE, line);
+    if (g == null) { return null; }
+    return Entry { ip: g[1], hour: int(g[2]), method: g[3], path: g[4], status: int(g[5]), bytes: int(g[6]), ms: int(g[7]) };
+}
+
+// ---------- tiny helpers ----------
+fn bump(counts, key) { counts[key] = (counts[key] ?? 0) + 1; }
+
+fn top(counts, n: int) {
+    let pairs = items(counts);
+    pairs.sort(fn(a, b) -> int { return b[1] - a[1]; });
+    return pairs.slice(0, min(n, len(pairs)));
+}
+
+fn percentile(sorted_vals, p: float) -> int {
+    return sorted_vals[int((len(sorted_vals) - 1) * p)];
+}
+
+fn bar(n: int, scale: int) -> string { return "#".repeat(idiv(n, scale)); }
+
+fn main() {
+    let raw = make_log(3000);
+
+    // ---------- parse ----------
+    var entries = [];
+    var rejected = 0;
+    for (line in raw) {
+        let e = parse_line(line);
+        if (e == null) { rejected += 1; } else { entries.push(e); }
+    }
+    print(f"parsed {len(entries)} requests ({rejected} unparseable lines skipped)");
+
+    // ---------- aggregate ----------
+    let by_path = {};  let by_ip = {};  let by_hour = {};  let by_class = {};
+    let bad_by_ip = {};   // 401/404 per client
+    let latency = [];
+    var total_bytes = 0;
+    var slow = [];
+    for (e in entries) {
+        bump(by_path, e.path);
+        bump(by_ip, e.ip);
+        bump(by_hour, two(e.hour));
+        bump(by_class, ["2xx", "3xx", "4xx", "5xx"][e.class()]);
+        if (e.status == 401 || e.status == 404) { bump(bad_by_ip, e.ip); }
+        latency.push(e.ms);
+        total_bytes += e.bytes;
+        if (e.ms > 500) { slow.push(e); }
+    }
+    latency.sort();
+
+    // ---------- report ----------
+    print("\n=== Traffic ===");
+    print(f"total transfer : {fmt1(total_bytes / 1048576.0)} MiB");
+    for (pair in top(by_path, 6)) { print(f"  {pair[0].pad_right(16)} {pair[1]}"); }
+
+    print("\n=== Status classes ===");
+    for (name in ["2xx", "3xx", "4xx", "5xx"]) {
+        let n = by_class[name] ?? 0;
+        print(f"  {name}  {str(n).pad_left(5)}  {fmt1(100.0 * n / len(entries)).pad_left(5)}%");
+    }
+    let error_rate = 100.0 * ((by_class["5xx"] ?? 0)) / len(entries);
+
+    print("\n=== Latency (ms) ===");
+    print(f"  p50={percentile(latency, 0.50)}  p95={percentile(latency, 0.95)}  p99={percentile(latency, 0.99)}  max={latency.last()}  slow(>500ms)={len(slow)}");
+
+    print("\n=== Requests per hour ===");
+    let hours = keys(by_hour);
+    hours.sort();
+    for (h in hours) { print(f"  {h}:00 {bar(by_hour[h], 8)} {by_hour[h]}"); }
+
+    print("\n=== Suspicious clients (401/404 count) ===");
+    var flagged = [];
+    for (pair in top(bad_by_ip, 3)) {
+        let share = 100.0 * pair[1] / by_ip[pair[0]];
+        let verdict = share > 80 ? "BLOCK (looks like credential stuffing)" : "ok";
+        print(f"  {pair[0].pad_right(15)} {str(pair[1]).pad_left(4)} bad requests, {fmt1(share)}% of its traffic -> {verdict}");
+        if (share > 80) { flagged.push(pair[0]); }
+    }
+
+    // ---------- export ----------
+    let dir = system.make_temp_dir("kc_logs_");
+    defer system.rmdir(dir, true);      // clean up even if something below throws
+
+    let report = {
+        total: len(entries), rejected: rejected,
+        error_rate_pct: int(error_rate * 100) / 100.0,
+        latency: { p50: percentile(latency, 0.50), p95: percentile(latency, 0.95), p99: percentile(latency, 0.99) },
+        top_paths: top(by_path, 5), status_classes: by_class, flagged_ips: flagged,
+    };
+    let json_path = system.path_join(dir, "report.json");
+    json.write_file(json_path, report);
+
+    let rows = [];
+    for (pair in top(by_path, 20)) { rows.push({ path: pair[0], hits: pair[1] }); }
+    let csv_path = system.path_join(dir, "top_paths.csv");
+    csv.write_file(csv_path, rows);
+
+    // round-trip to prove the files are real and well-formed
+    let back = json.parse_file(json_path);
+    let table = csv.parse_file(csv_path, "header infer");
+    print(f"\nexported report.json ({system.stat(json_path).size} bytes) and top_paths.csv ({len(table)} rows)");
+    print(f"round-trip check: total={back.total}, p95={back.latency.p95}, flagged={back.flagged_ips}, csv top={table[0]["path"]}");
+    assert_eq(back.total, len(entries));
+    assert(len(flagged) == 1 && flagged[0] == "203.0.113.66", "the hammering client must be flagged");
+}

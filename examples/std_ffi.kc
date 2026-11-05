@@ -1,0 +1,10 @@
+// First-class native FFI: bind straight to libm and libc.
+// (v0.1 binds by symbol name directly -- extern fn <symbol> declares
+//  and calls the real C symbol of that exact name.)
+extern fn sqrt(x: float) -> float from "libm.so.6";
+extern fn getpid() -> int from "libc.so.6";
+
+fn main() {
+    print("sqrt(2) via extern libm:", sqrt(2.0));
+    print("pid via extern libc:", getpid());
+}

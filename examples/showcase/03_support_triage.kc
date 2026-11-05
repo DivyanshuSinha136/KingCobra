@@ -1,0 +1,161 @@
+// SHOWCASE 3 — Customer-support ticket triage (classify, prioritize, route, deflect)
+//
+// An inbox of raw customer messages goes in; a prioritized triage board comes out:
+//   • strip HTML and pull out emails / order numbers / URLs
+//   • classify the topic with a Naive Bayes model trained here, and MEASURE its accuracy
+//   • score sentiment, and combine topic + sentiment into a priority
+//   • fix typos in the customer's words, then find the best help-center article with BM25
+//   • spot near-duplicate tickets with SimHash so one outage does not become ten tasks
+//
+// Uses: std.nlp (nb_*, sentiment, keywords, spell_*, bm25_*, simhash, extraction), structs, closures.
+//
+// Run:  kingcobra examples/showcase/03_support_triage.kc
+import std.nlp;
+import std.regx;
+
+// ------------------------------- training data -------------------------------
+let TRAIN = [
+    ["billing", "I was charged twice for my subscription this month"],
+    ["billing", "please refund the duplicate payment on my invoice"],
+    ["billing", "my credit card was billed the wrong amount"],
+    ["billing", "how do I update my payment method and download an invoice"],
+    ["billing", "the price on my receipt does not match the plan I bought"],
+    ["billing", "cancel my subscription and refund the last charge"],
+    ["bug", "the app crashes when I open the settings page"],
+    ["bug", "I get an error message and the upload fails every time"],
+    ["bug", "the page is broken and shows a blank screen after login redirect"],
+    ["bug", "export to pdf produces a corrupted file"],
+    ["bug", "the mobile app freezes and then crashes on startup"],
+    ["bug", "search returns an error instead of results"],
+    ["account", "I forgot my password and cannot log in"],
+    ["account", "please reset my two factor authentication"],
+    ["account", "I need to change the email address on my account"],
+    ["account", "my account is locked after too many login attempts"],
+    ["account", "how do I delete my account and personal data"],
+    ["account", "someone else logged into my account without permission"],
+    ["feature", "it would be great if you added a dark mode"],
+    ["feature", "please add support for exporting to excel"],
+    ["feature", "could you add a calendar integration in the next release"],
+    ["feature", "I would love a keyboard shortcut for creating tasks"],
+    ["feature", "suggestion: allow sharing a project with a public link"],
+    ["feature", "any plans to support single sign on in future versions"]
+];
+
+// a held-out set the model never sees during training
+let HOLDOUT = [
+    ["billing", "you billed me twice, I want my money back"],
+    ["bug", "the app crashes with an error when I upload a file"],
+    ["account", "I cannot log in, I forgot the password"],
+    ["feature", "would be nice to have a dark theme, please add it"],
+    ["billing", "wrong amount on the invoice for my payment"],
+    ["bug", "settings page shows a blank screen and the app freezes"],
+    ["account", "reset my login, my account is locked"],
+    ["feature", "please add an integration with my calendar"]
+];
+
+// ------------------------------- help center -------------------------------
+let KB = [
+    ["Refunds and duplicate charges", "If you were charged twice, refunds for a duplicate payment are issued within five business days. Open billing and choose request refund."],
+    ["Updating your payment method", "Change your credit card in billing settings. Download every invoice and receipt as pdf from the billing page."],
+    ["Fixing app crashes", "If the app crashes or freezes, update to the latest version, clear the cache and restart. Send the crash log from settings."],
+    ["Upload and export problems", "Large file upload errors are usually network timeouts. Export to pdf fails when the document contains unsupported fonts."],
+    ["Resetting your password", "Use forgot password on the login page. Locked accounts unlock automatically after thirty minutes; you can also reset two factor authentication."],
+    ["Deleting your account", "Account deletion removes your personal data permanently. Cancel your subscription first."],
+    ["Feature requests and roadmap", "We read every suggestion. Vote for a feature on the roadmap board: dark mode, calendar integration, excel export, single sign on."]
+];
+
+// ------------------------------- the inbox -------------------------------
+let INBOX = [
+    "<p>URGENT!!! I was <b>charged twice</b> for order #48211 and nobody answers. This is <b>terrible</b> service. Contact me: jane.doe@example.com</p>",
+    "The app crashes every time I open settings, im on version 4.2 and its really frustrating.",
+    "Hi team, I love the product! Would be great if you could add a dark mode someday. Thanks!",
+    "I cannot log in, forgot my pasword and the reset link never arrives. Email: sam@corp.io",
+    "URGENT charged twice for order #48211!!! refund me now, awful service. jane.doe@example.com",
+    "Could you please add exporting to excel? It would really help our finance team.",
+    "Bonjour, je ne peux pas me connecter à mon compte depuis hier.",
+    "The upload fails with an error, see https://status.example.com/incident/77 for the screenshot."
+];
+
+struct Ticket { id: int, text: string, topic: string, confidence: float, mood: string, score: float, priority: int, lang: string, hint: string }
+
+fn pct(x: float) -> string { return f"{int(x * 100 + 0.5)}%"; }
+
+fn priority_of(topic: string, mood: string, score: float, text: string) -> int {
+    // 1 = drop everything ... 4 = whenever
+    var p = match (topic) { "account" => 2, "billing" => 2, "bug" => 3, _ => 4 };
+    if (mood == "negative" && score < -0.5) { p -= 1; }
+    if (text.upper().contains("URGENT")) { p -= 1; }
+    return max(1, p);
+}
+
+fn main() {
+    // ---------- 1. train and honestly evaluate the classifier ----------
+    let nb = nlp.nb_new();
+    for (ex in TRAIN) { nlp.nb_train(nb, ex[1], ex[0]); }
+    var correct = 0;
+    for (ex in HOLDOUT) {
+        let guess = nlp.nb_predict(nb, ex[1]);
+        if (guess == ex[0]) { correct += 1; } else { print(f"  miss: '{ex[1]}' -> {guess} (wanted {ex[0]})"); }
+    }
+    print(f"classifier: trained on {len(TRAIN)} tickets, held-out accuracy {correct}/{len(HOLDOUT)} = {pct(1.0 * correct / len(HOLDOUT))}");
+
+    // ---------- 2. knowledge base search + spelling dictionary built from it ----------
+    var corpus = "";
+    var docs = [];
+    for (a in KB) { docs.push(a[0] + ". " + a[1]); corpus = corpus + " " + a[1] + " " + a[0]; }
+    let index = nlp.bm25_new(docs);
+    let speller = nlp.spell_new(corpus);
+
+    // ---------- 3. triage the inbox ----------
+    var board = [];
+    var id = 0;
+    for (raw in INBOX) {
+        id += 1;
+        let text = nlp.collapse_ws(nlp.strip_html(raw));
+        let lang = nlp.detect_lang(text);
+        let sent = nlp.sentiment(text);
+
+        var topic = "other";  var conf = 0.0;  var hint = "(no automatic answer: route to a human)";
+        if (lang.lang == "en") {
+            let scores = nlp.nb_scores(nb, text);
+            scores.sort(fn(a, b) -> int { return b[1] > a[1] ? 1 : -1; });
+            topic = scores[0][0];  conf = scores[0][1];
+            // fix typos word-by-word against the help-center vocabulary, then search
+            var fixed = [];
+            for (w in nlp.tokenize(text, "l")) { fixed.push(nlp.spell_known(speller, w) ? w : nlp.spell_correct(speller, w)); }
+            let hits = nlp.bm25_search(index, nlp.remove_stopwords(fixed).join(" "), 1);
+            if (len(hits) > 0 && hits[0][1] > 2.0) { hint = KB[hits[0][0]][0]; }
+        }
+        board.push(Ticket { id: id, text: text, topic: topic, confidence: conf, mood: sent.label, score: sent.compound,
+                            priority: priority_of(topic, sent.label, sent.compound, text), lang: lang.lang, hint: hint });
+    }
+    board.sort(fn(a, b) -> int { return a.priority != b.priority ? a.priority - b.priority : a.id - b.id; });
+
+    print("\n=== TRIAGE BOARD (most urgent first) ===");
+    for (t in board) {
+        let short = len(t.text) > 70 ? t.text.slice(0, 67) + "..." : t.text;
+        print(f"P{t.priority} #{t.id} [{t.lang}] {t.topic.pad_right(8)} {t.mood.pad_right(8)} conf {pct(t.confidence).pad_left(4)}  {short}");
+        print(f"        -> suggest: {t.hint}");
+    }
+
+    // ---------- 4. extraction: structured facts from free text ----------
+    print("\n=== extracted facts ===");
+    for (raw in INBOX) {
+        let text = nlp.strip_html(raw);
+        let e = nlp.emails(text);  let u = nlp.urls(text);  let orders = regx.find_all_groups("#(\\d+)", text).map(fn(g) -> string { return g[1]; });
+        if (len(e) + len(u) + len(orders) > 0) { print(f"  emails={e} urls={u} orders={orders}"); }
+    }
+
+    // ---------- 5. duplicates: one incident should be one work item ----------
+    // (token-count cosine on normalized text; nlp.simhash/hamming_bits is the cheaper choice at millions of tickets)
+    print("\n=== near-duplicate tickets ===");
+    var found = 0;
+    let norm = INBOX.map(fn(r) -> string { return nlp.normalize(nlp.strip_punct(nlp.strip_html(r))); });
+    for (i in 0..len(norm)) {
+        for (j in (i + 1)..len(norm)) {
+            let sim = nlp.cosine(norm[i], norm[j]);
+            if (sim > 0.55) { print(f"  ticket {i + 1} and ticket {j + 1} look like the same issue (similarity {pct(sim)}) -> merge"); found += 1; }
+        }
+    }
+    assert_eq(found, 1);
+}

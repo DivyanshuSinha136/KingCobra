@@ -1,0 +1,114 @@
+// std.nn example 5 — text classification, using std.nlp for preprocessing and std.nn for the model.
+// Pipeline: tokenize -> vocabulary -> integer ids -> pad_sequences -> embedding -> GRU -> softmax classifier.
+// Also compares the learned model with the built-in lexicon scorer nlp.sentiment.
+import std.nlp;
+import std.nn;
+
+fn ids_of(tokens: array, vocab: array) -> array {
+    // 0 = padding, 1 = unknown word, real words start at 2
+    let out = [];
+    for (w in tokens) {
+        var id = 1;
+        var k = 0;
+        while (k < len(vocab)) {
+            if (vocab[k] == w) { id = k + 2; k = len(vocab); }
+            k = k + 1;
+        }
+        out.push(id);
+    }
+    return out;
+}
+
+fn encode(texts: array, vocab: array, maxlen: int) -> any {
+    let seqs = [];
+    for (t in texts) { seqs.push(ids_of(nlp.tokenize(t, "l"), vocab)); }
+    return nn.pad_sequences(seqs, maxlen, 0, "pre");     // pad on the left so the GRU ends on real words
+}
+
+fn main() {
+    nn.seed(2);
+    let pos = [
+        "I loved this movie, the acting was great", "what a wonderful and beautiful film",
+        "the food was delicious and the service was excellent", "great product, works perfectly and easy to use",
+        "I am very happy with this purchase", "an amazing experience, highly recommended",
+        "the staff were friendly and helpful", "best pizza I have ever had",
+        "fantastic quality and fast delivery", "a brilliant story with a perfect ending",
+        "really enjoyed it, such a fun and lovely evening", "the hotel was clean and the room was comfortable",
+        "excellent value, I love it", "this is a good book and I enjoyed reading it",
+        "superb sound and the battery lasts all day", "the concert was incredible, we had a great time",
+        "nice design and very comfortable to wear", "I am impressed, the best phone I have owned",
+        "a delightful surprise, the dessert was perfect", "smooth, fast and reliable, I am satisfied",
+        "wonderful teacher, clear and very helpful lessons", "the park was beautiful and the weather was great",
+        "easy setup and the support team was excellent", "loved the cast, a really good and funny comedy"
+    ];
+    let neg = [
+        "I hated this movie, the acting was terrible", "what an awful and boring film",
+        "the food was cold and the service was terrible", "poor product, broke after one day and hard to use",
+        "I am very disappointed with this purchase", "a terrible experience, would not recommend",
+        "the staff were rude and unhelpful", "worst pizza I have ever had",
+        "bad quality and slow delivery", "a boring story with a stupid ending",
+        "really disliked it, such a dull and ugly evening", "the hotel was dirty and the room was noisy",
+        "awful value, I hate it", "this is a bad book and I regret reading it",
+        "horrible sound and the battery dies in an hour", "the concert was a disaster, we had a terrible time",
+        "ugly design and very uncomfortable to wear", "I am annoyed, the worst phone I have owned",
+        "an unpleasant surprise, the dessert was awful", "slow, buggy and unreliable, I am frustrated",
+        "terrible teacher, confusing and very boring lessons", "the park was dirty and the weather was awful",
+        "difficult setup and the support team was useless", "hated the cast, a really bad and stupid comedy"
+    ];
+    let test_pos = ["the movie was great and the food was delicious", "a lovely hotel and friendly staff, highly recommended",
+                    "fast delivery and a perfect product", "I enjoyed the concert, it was fantastic"];
+    let test_neg = ["the service was terrible and the food was cold", "a boring movie with a stupid ending",
+                    "slow delivery and a broken product", "I regret this purchase, the worst value"];
+
+    let texts = [];
+    let labels = [];
+    for (t in pos) { texts.push(t); labels.push(1); }
+    for (t in neg) { texts.push(t); labels.push(0); }
+
+    // 1. vocabulary from the training text (std.nlp builds it for us, most frequent first)
+    let docs = [];
+    for (t in texts) { docs.push(nlp.tokenize(t, "l")); }
+    let vocab = nlp.vocab(docs, 1);
+    let top = [];
+    var w = 0;
+    while (w < 6) { top.push(vocab[w]); w = w + 1; }
+    print("training sentences:", len(texts), " vocabulary size:", len(vocab), " most frequent words:", top);
+
+    // 2. model: embedding -> GRU -> 2-way classifier
+    let maxlen = 12;
+    let X = encode(texts, vocab, maxlen);
+    let model = nn.sequential([nn.embedding(len(vocab) + 2, 16, "padding_idx", 0), nn.gru(16, 24), nn.dense(24, 2)]);
+    print(nn.summary(model, [maxlen]));
+    let h = nn.fit(model, "ce", "adam", X, labels, "epochs", 60, "batch_size", 8, "lr", 0.01, "verbose", 20);
+
+    // 3. evaluate on sentences the model has never seen
+    let test_texts = [];
+    let test_labels = [];
+    for (t in test_pos) { test_texts.push(t); test_labels.push(1); }
+    for (t in test_neg) { test_texts.push(t); test_labels.push(0); }
+    let ev = nn.evaluate(model, "ce", encode(test_texts, vocab, maxlen), test_labels);
+    print("held-out accuracy of the GRU model:", ev.metric, "(a small, clean test set: the lexicon baseline below does well too)");
+
+    // 4. the same test set scored by the lexicon baseline from std.nlp
+    var right = 0;
+    var i = 0;
+    while (i < len(test_texts)) {
+        let lab = nlp.sentiment_label(test_texts[i]);
+        if ((lab == "positive" && test_labels[i] == 1) || (lab == "negative" && test_labels[i] == 0)) { right = right + 1; }
+        i = i + 1;
+    }
+    print("held-out accuracy of the nlp.sentiment lexicon baseline:", right / len(test_texts));
+
+    // 5. fresh sentences, including negation and mixed opinions. Both models are tiny, so expect some disagreement:
+    //    the lexicon knows "not" but no domain words; the GRU only knows what the 48 training sentences taught it.
+    let fresh = ["the dessert was perfect and the staff were lovely", "slow and buggy, the worst delivery",
+                 "I would not recommend this", "not good at all", "great sound, terrible battery"];
+    let probs = nn.softmax(nn.predict(model, encode(fresh, vocab, maxlen)));
+    let p = nn.to_array(probs);
+    print("sentence                                              GRU P(positive)   nlp.sentiment");
+    i = 0;
+    while (i < len(fresh)) {
+        print("  " + fresh[i], "->", p[i][1], "  ", nlp.sentiment_label(fresh[i]));
+        i = i + 1;
+    }
+}

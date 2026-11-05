@@ -1,0 +1,118 @@
+// A small interactive to-do app built with std.gui.
+// Run:  ./kingcobra run examples/gui/todo_app.kc
+// Try:  type a task and press Enter, double-click a task to mark it done,
+//       Delete removes the selected task, Tab moves between controls.
+import std.gui;
+
+var tasks = [];      // task titles
+var done = [];       // parallel array of bools
+
+var input = 0;
+var list = 0;
+var status = 0;
+var bar = 0;
+
+fn label_for(i: int) -> string {
+    if (done[i]) { return "[x] " + tasks[i]; }
+    return "[ ] " + tasks[i];
+}
+
+fn refresh() {
+    var items = [];
+    var finished = 0;
+    for (i in 0..len(tasks)) {
+        items.push(label_for(i));
+        if (done[i]) { finished += 1; }
+    }
+    let keep = gui.get(list, "selected");
+    gui.set(list, "items", items);
+    if (keep >= 0 && keep < len(items)) { gui.set(list, "selected", keep); }
+    gui.set(status, "text", "" + finished + " of " + len(tasks) + " done");
+    if (len(tasks) > 0) { gui.set(bar, "value", finished / len(tasks)); }
+    else { gui.set(bar, "value", 0); }
+}
+
+fn add_task(id, text) {
+    let t = gui.get(input, "text");
+    if (len(t.trim()) == 0) { return; }
+    tasks.push(t.trim());
+    done.push(false);
+    gui.set(input, "text", "");
+    refresh();
+}
+
+fn add_clicked(id) { add_task(id, ""); }
+
+fn toggle(id, idx) {
+    done[idx] = !done[idx];
+    refresh();
+}
+
+fn remove_selected(id) {
+    let i = gui.get(list, "selected");
+    if (i < 0) { return; }
+    var nt = [];
+    var nd = [];
+    for (k in 0..len(tasks)) {
+        if (k != i) { nt.push(tasks[k]); nd.push(done[k]); }
+    }
+    tasks = nt;
+    done = nd;
+    gui.set(list, "selected", -1);
+    refresh();
+}
+
+fn clear_done(id) {
+    var nt = [];
+    var nd = [];
+    for (k in 0..len(tasks)) {
+        if (!done[k]) { nt.push(tasks[k]); nd.push(false); }
+    }
+    tasks = nt;
+    done = nd;
+    refresh();
+}
+
+fn toggle_theme(id, dark) {
+    if (dark) { gui.theme("dark"); } else { gui.theme("light"); }
+}
+
+fn main() {
+    gui.window("KingCobra To-Do", 780, 460);
+
+    let title = gui.label(0, "My tasks");
+    gui.set(title, "color", "#4c8dff");
+
+    let row = gui.hbox(0);
+    input = gui.textbox(row, "");
+    gui.set(input, "placeholder", "What needs doing?");
+    gui.set(input, "weight", 1);
+    gui.on(input, "submit", add_task);
+    let add = gui.button(row, "Add", add_clicked);
+    gui.set(add, "bg", "#2563eb");
+
+    list = gui.list(0, []);
+    gui.set(list, "weight", 1);
+    gui.on(list, "activate", toggle);
+
+    bar = gui.progress(0, 0);
+    status = gui.label(0, "0 of 0 done");
+    gui.set(status, "color", "#8a8fa3");
+
+    let foot = gui.hbox(0);
+    gui.button(foot, "Delete selected", remove_selected);
+    gui.button(foot, "Clear finished", clear_done);
+    gui.spacer(foot);
+    gui.checkbox(foot, "Dark theme", true, toggle_theme);
+
+    // seed a few tasks so the window isn't empty
+    tasks = ["Read the std.gui docs", "Build something cool", "Ship it"];
+    done = [false, true, false];
+    refresh();
+    gui.focus(input);
+
+    if (gui.is_headless()) {
+        print("headless: wrote", gui.screenshot("/tmp/kingcobra_todo.bmp"), "bytes");
+    }
+    gui.run();
+}

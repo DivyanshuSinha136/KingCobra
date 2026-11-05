@@ -1,0 +1,123 @@
+// SHOWCASE 5 — Physics lab: ballistics + orbital mechanics with std.vector
+//
+// Two classic simulations, using vector math instead of hand-rolled x/y arithmetic:
+//   1. Artillery: projectile with quadratic air drag. Scan launch angles to find the one that maximizes range
+//      (vacuum theory says 45 degrees; drag says otherwise) and draw the trajectory as ASCII art.
+//   2. Orbit: a satellite around a planet integrated with velocity-Verlet. The check is physical: total
+//      energy and angular momentum must be conserved, and the orbit must close after one period.
+//
+// Uses: std.vector (vec2/vec3, add, scale, length, normalize, dot, cross), functions, structs, loops, asserts.
+//
+// Run:  kingcobra examples/showcase/05_physics_lab.kc
+import std.vector;
+
+const PI = 3.14159265358979;
+
+fn fmt(x: float, places: int) -> string {          // fixed-point text without printf
+    var scale = 1;
+    for (i in 0..places) { scale *= 10; }
+    let neg = x < 0;
+    let v = int(abs(x) * scale + 0.5);
+    let frac = str(v % scale).pad_left(places, "0");
+    return (neg ? "-" : "") + str(idiv(v, scale)) + (places > 0 ? "." + frac : "");
+}
+
+// ------------------------------------------------------------------ 1. ballistics
+struct Shot { range: float, apex: float, flight: float, path: array }
+
+fn fire(speed: float, angle_deg: float, drag: float) -> Shot {
+    let g = vector.vec2(0, -9.81);
+    var pos = vector.vec2(0, 0);
+    // there is no sin/cos builtin, and none is needed: rotate the unit vector instead
+    var vel = vector.scale(vector.rotate2(vector.vec2(1, 0), vector.deg2rad(angle_deg)), speed);
+    let dt = 0.01;
+    var t = 0.0;
+    var apex = 0.0;
+    var path = [];
+    var step = 0;
+    while (pos[1] >= 0) {
+        // acceleration = gravity - drag * |v| * v
+        let acc = vector.sub(g, vector.scale(vel, drag * vector.length(vel)));
+        vel = vector.add(vel, vector.scale(acc, dt));     // semi-implicit Euler: stable for this use
+        pos = vector.add(pos, vector.scale(vel, dt));
+        t += dt;
+        if (pos[1] > apex) { apex = pos[1]; }
+        if (step % 10 == 0) { path.push([pos[0], pos[1]]); }
+        step += 1;
+    }
+    return Shot { range: pos[0], apex: apex, flight: t, path: path };
+}
+
+fn plot(shot: Shot, cols: int, rows: int) {
+    var grid = [];
+    for (r in 0..rows) { grid.push(" ".repeat(cols)); }
+    for (p in shot.path) {
+        let c = int(p[0] / shot.range * (cols - 1));
+        let r = rows - 1 - int(p[1] / shot.apex * (rows - 1));
+        if (c >= 0 && c < cols && r >= 0 && r < rows) { grid[r] = grid[r].slice(0, c) + "*" + grid[r].slice(c + 1, cols); }
+    }
+    for (row in grid) { print("  |" + row); }
+    print("  +" + "-".repeat(cols) + f"  range {fmt(shot.range, 1)} m, apex {fmt(shot.apex, 1)} m");
+}
+
+// ------------------------------------------------------------------ 2. orbit
+fn gravity(pos, mu: float) {                          // a = -mu * r / |r|^3
+    let r = vector.length(pos);
+    return vector.scale(pos, -mu / (r * r * r));
+}
+
+fn energy(pos, vel, mu: float) -> float { return 0.5 * vector.dot(vel, vel) - mu / vector.length(pos); }
+fn ang_mom(pos, vel) -> float { return vector.cross(vector.vec3(pos[0], pos[1], 0), vector.vec3(vel[0], vel[1], 0))[2]; }
+
+fn main() {
+    print("=== 1. Artillery: best launch angle with and without air drag ===");
+    let speed = 100.0;
+    var best_vac = 0.0;  var best_vac_angle = 0;
+    var best_drag = 0.0; var best_drag_angle = 0;
+    for (deg in 20..71) {
+        let vac = fire(speed, deg, 0.0).range;
+        let air = fire(speed, deg, 0.004).range;
+        if (vac > best_vac) { best_vac = vac; best_vac_angle = deg; }
+        if (air > best_drag) { best_drag = air; best_drag_angle = deg; }
+    }
+    print(f"  vacuum : best angle {best_vac_angle} deg -> {fmt(best_vac, 1)} m   (theory: 45 deg, v^2/g = {fmt(speed * speed / 9.81, 1)} m)");
+    print(f"  with drag: best angle {best_drag_angle} deg -> {fmt(best_drag, 1)} m   (flatter shot wins in air)");
+    assert(abs(best_vac_angle - 45) <= 1, "vacuum optimum must be about 45 degrees");
+    assert(best_drag_angle < best_vac_angle, "drag must lower the optimal angle");
+    assert(abs(best_vac - speed * speed / 9.81) < 3.0, "vacuum range must match v^2/g");
+    print("\n  trajectory at the drag-optimal angle:");
+    plot(fire(speed, best_drag_angle, 0.004), 60, 10);
+
+    print("\n=== 2. Orbit: velocity-Verlet integration ===");
+    let mu = 1.0;                                     // gravitational parameter (normalized units)
+    var pos = vector.vec2(1.0, 0.0);
+    var vel = vector.vec2(0.0, 0.8);                  // slower than circular speed -> an ellipse
+    let e0 = energy(pos, vel, mu);
+    let l0 = ang_mom(pos, vel);
+    let a = -mu / (2.0 * e0);                         // semi-major axis from energy
+    let period = 2.0 * PI * sqrt(a * a * a / mu);
+    print(f"  semi-major axis {fmt(a, 4)}, period {fmt(period, 4)}, energy {fmt(e0, 6)}, angular momentum {fmt(l0, 6)}");
+
+    let steps = 20000;
+    let dt = period / steps;
+    var acc = gravity(pos, mu);
+    var rmin = 1e9;  var rmax = 0.0;
+    for (i in 0..steps) {
+        pos = vector.add(vector.add(pos, vector.scale(vel, dt)), vector.scale(acc, 0.5 * dt * dt));
+        let acc2 = gravity(pos, mu);
+        vel = vector.add(vel, vector.scale(vector.add(acc, acc2), 0.5 * dt));
+        acc = acc2;
+        let r = vector.length(pos);
+        if (r < rmin) { rmin = r; }
+        if (r > rmax) { rmax = r; }
+    }
+    let drift_e = abs((energy(pos, vel, mu) - e0) / e0);
+    let drift_l = abs((ang_mom(pos, vel) - l0) / l0);
+    let closure = vector.length(vector.sub(pos, vector.vec2(1.0, 0.0)));
+    print(f"  after exactly one period: distance from start {fmt(closure, 5)}, r in [{fmt(rmin, 3)}, {fmt(rmax, 3)}]");
+    print(f"  relative drift: energy {fmt(drift_e * 1e12, 2)}e-12, angular momentum {fmt(drift_l * 1e12, 2)}e-12");
+    assert(closure < 1e-3, "the orbit must close after one period");
+    assert(drift_e < 1e-6, "energy must be conserved");
+    assert(drift_l < 1e-9, "angular momentum must be conserved");
+    print("  conservation laws hold; the orbit closed.");
+}

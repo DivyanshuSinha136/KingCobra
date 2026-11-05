@@ -1,0 +1,78 @@
+// std.nn example 11 — the advanced math toolkit on real problems.
+// Shows: PCA (cov + eigh), low-rank approximation (svd), least squares (lstsq vs the normal equations),
+//        scaled dot-product attention written with einsum, numerically stable log-probabilities (logsumexp),
+//        whitening (cholesky + solve), top-k / nucleus-style sampling (topk + multinomial), and activation gradients.
+import std.nn;
+
+fn main() {
+    nn.seed(11);
+
+    // ---- 1. PCA: 3-D points that really live near a 2-D plane
+    let n = 400;
+    let basis = nn.tensor([[2.0, 1.0, 0.0], [0.0, 1.0, 1.0]]);                 // two directions spanning the plane
+    let coords = nn.mul(nn.randn([n, 2]), nn.tensor([[3.0, 0.7]]));             // big spread along dir 1, small along dir 2
+    let pts = nn.add(nn.matmul(coords, basis), nn.mul(nn.randn([n, 3]), 0.05)); // plus a little noise
+    let c = nn.cov(pts);
+    let ev = nn.eigh(c);                                                        // eigenvalues ascending
+    let total = nn.item(nn.sum(ev.values));
+    let v = nn.to_array(ev.values);
+    print("PCA explained variance (largest first):", v[2] / total, v[1] / total, v[0] / total);
+
+    // ---- 2. low-rank approximation: how much of a matrix survives rank-k truncation?
+    var M = nn.matmul(nn.randn([30, 4]), nn.randn([4, 20]));                    // exactly rank 4
+    let M = nn.add(M, nn.mul(nn.randn([30, 20]), 0.01));
+    let sv = nn.svd(M);
+    let s = nn.to_array(sv.s);
+    print("singular values 3,4,5:", s[2], s[3], s[4], " numeric rank:", nn.matrix_rank(M, 0.5));
+    let k = 4;
+    let Uk = nn.slice_axis(sv.u, 1, 0, k);
+    let Sk = nn.slice_axis(sv.s, 0, 0, k);
+    let Vk = nn.slice_axis(sv.vt, 0, 0, k);
+    let Mk = nn.matmul(nn.mul(Uk, nn.unsqueeze(Sk, 0)), Vk);
+    print("rank-4 reconstruction error (relative):", nn.matrix_norm(nn.sub(M, Mk)) / nn.matrix_norm(M));
+
+    // ---- 3. least squares: lstsq (SVD) and the normal equations agree on a well-posed problem
+    let X = nn.concat([nn.ones([50, 1]), nn.randn([50, 2])], 1);
+    let truth = nn.tensor([[1.5], [-2.0], [0.5]]);
+    let y = nn.add(nn.matmul(X, truth), nn.mul(nn.randn([50, 1]), 0.05));
+    let fit = nn.lstsq(X, y);
+    let normal = nn.solve(nn.matmul(nn.transpose(X), X), nn.matmul(nn.transpose(X), y));
+    print("lstsq weights:", nn.to_array(nn.reshape(fit.x, [-1])), " rank:", fit.rank);
+    print("matches the normal equations:", nn.allclose(fit.x, normal, 0.0001, 0.0001));
+
+    // ---- 4. attention with einsum:  softmax(Q K^T / sqrt(d)) V  for a batch of 2 sequences
+    let Q = nn.randn([2, 5, 8]); let K = nn.randn([2, 5, 8]); let V = nn.randn([2, 5, 8]);
+    var scores = nn.div(nn.einsum("bqd,bkd->bqk", Q, K), 2.8284271);
+    let weights = nn.softmax(scores, -1);
+    let out = nn.einsum("bqk,bkd->bqd", weights, V);
+    print("attention output shape:", nn.shape(out), " rows of weights sum to 1:", nn.allclose(nn.sum(weights, -1), nn.ones([2, 5]), 0.000001, 0.000001));
+
+    // ---- 5. stable log-probabilities: logits this large overflow a naive exp()
+    let logits = nn.tensor([[1000.0, 1001.0, 1002.0]]);
+    let logp = nn.log_softmax_axis(logits, 1);
+    print("log-probs of huge logits:", nn.to_array(nn.reshape(logp, [-1])), " sum of probs:", nn.item(nn.sum(nn.exp(logp))));
+
+    // ---- 6. whitening a correlated Gaussian cloud with its Cholesky factor
+    let A = nn.tensor([[2.0, 0.0], [1.2, 0.5]]);
+    let corr = nn.matmul(nn.randn([2000, 2]), A);
+    let L = nn.cholesky(nn.cov(corr));
+    let white = nn.transpose(nn.solve(L, nn.transpose(corr)));
+    print("covariance after whitening (should be ~identity):", nn.to_array(nn.reshape(nn.cov(white), [-1])));
+
+    // ---- 7. top-k filtered sampling from a score vector
+    let scores = nn.tensor([2.0, 0.5, 3.0, -1.0, 2.5, 0.0]);
+    let top = nn.topk(scores, 3);
+    let probs = nn.softmax(top.values, 0);
+    let picks = nn.multinomial(probs, 4000);
+    let counts = nn.to_array(nn.bincount(picks, 3));
+    print("top-3 indices:", nn.to_array(top.indices), " empirical pick frequencies:", counts[0] / 4000.0, counts[1] / 4000.0, counts[2] / 4000.0);
+    print("exact probabilities:                      ", nn.to_array(probs));
+
+    // ---- 8. checking a hand-written backward pass: d(gelu)/dx against central differences
+    let x = nn.linspace(-3.0, 3.0, 13);
+    let h = 0.000001;
+    let numeric = nn.div(nn.sub(nn.apply("gelu", nn.add(x, h)), nn.apply("gelu", nn.sub(x, h))), 2.0 * h);
+    print("analytic gelu gradient matches finite differences:", nn.allclose(nn.activation_grad("gelu", x), numeric, 0.0001, 0.0001));
+
+    print("math toolkit tour complete");
+}

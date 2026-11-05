@@ -1,0 +1,6 @@
+// KingCobra — hello world
+fn main() {
+    print("Hello from KingCobra!");
+    let name: string = "Divyanshu";
+    print("Author:", name);
+}

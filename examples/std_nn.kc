@@ -1,0 +1,77 @@
+// std.nn — neural networks: build, train, evaluate, save/load, and a tiny transformer.
+import std.nn;
+
+fn main() {
+    nn.seed(42);                                   // everything below is reproducible
+
+    // ---- 1. XOR with a multilayer perceptron (one-liner model, one-call training) ----
+    let X = [[0, 0], [0, 1], [1, 0], [1, 1]];
+    let Y = [[0], [1], [1], [0]];
+    let net = nn.mlp([2, 8, 1], "activation", "tanh", "out_activation", "sigmoid");
+    let h = nn.fit(net, "bce", "adam", X, Y, "epochs", 400, "batch_size", 4, "lr", 0.05, "verbose", 0);
+    print("XOR classes:", nn.predict_class(net, X), " final loss:", h.loss[h.epochs - 1], " accuracy:", h.metric[h.epochs - 1]);
+
+    // ---- 2. Regression on random data; the network recovers y = 2*x1 - x2 + 0.5 ----
+    let Xr = nn.randn([300, 2]);
+    let Yr = nn.add(nn.matmul(Xr, nn.tensor([[2.0], [-1.0]])), 0.5);
+    let lin = nn.sequential([nn.dense(2, 1)]);
+    nn.fit(lin, "mse", nn.sgd(lin, 0.1), Xr, Yr, "epochs", 60, "batch_size", 32, "verbose", 0);
+    print("learned weights:", nn.get_params(lin));
+
+    // ---- 3. Architecture summary ----
+    let cnn = nn.sequential([
+        nn.conv2d(1, 4, 3, "padding", 1), nn.batchnorm(4), nn.relu(), nn.maxpool2d(2),
+        nn.conv2d(4, 8, 3, "padding", 1), nn.relu(), nn.global_avg_pool(), nn.dense(8, 2)
+    ]);
+    print(nn.summary(cnn, [1, 8, 8]));
+
+    // ---- 4. A manual training loop: forward / loss / backward / step ----
+    let m = nn.sequential([nn.dense(2, 8), nn.relu(), nn.dense(8, 1)]);
+    let loss = nn.loss("mse");
+    let opt = nn.adam(m, 0.02);
+    var first = 0.0;
+    var last = 0.0;
+    var i = 0;
+    while (i < 200) {
+        let pred = nn.forward(m, Xr);
+        let l = nn.loss_value(loss, pred, Yr);
+        nn.zero_grad(m);
+        nn.backward(m, loss);
+        nn.clip_grad_norm(m, 5.0);
+        nn.step(opt);
+        nn.free(pred);                              // tensors are not garbage collected: free per-step temporaries
+        if (i == 0) { first = l; }
+        last = l;
+        i = i + 1;
+    }
+    print("manual loop: loss", first, "->", last);
+
+    // ---- 5. Save, reload, verify, and clone ----
+    nn.save(net, "xor_model.kcnn");
+    let again = nn.load("xor_model.kcnn");
+    print("reloaded model predicts:", nn.predict_class(again, X));
+    let target = nn.clone(again);                    // independent copy (e.g. an RL target network)
+    nn.copy_weights(target, again, 0.5);            // soft update: target = 0.5*online + 0.5*target
+
+    // ---- 6. A tiny causal transformer learns to continue the cycle 0 1 2 3 4 5 0 1 ... ----
+    let seqs = [];
+    let tgts = [];
+    var s = 0;
+    while (s < 6) {
+        let a = [];
+        let b = [];
+        var j = 0;
+        while (j < 8) { a.push((s + j) % 6); b.push((s + j + 1) % 6); j = j + 1; }
+        seqs.push(a);
+        tgts.push(b);
+        s = s + 1;
+    }
+    let gpt = nn.sequential([
+        nn.embedding(6, 16), nn.pos_encoding(),
+        nn.transformer_block(16, 2, 32, "causal", true),
+        nn.layernorm(16), nn.dense(16, 6)
+    ]);
+    nn.fit(gpt, "ce", "adamw", seqs, tgts, "epochs", 120, "batch_size", 6, "lr", 0.01, "verbose", 0,
+           "weight_decay", 0.001, "warmup", 5, "schedule", "cosine");
+    print("after [0,1,2,3] the transformer predicts:", nn.predict_class(gpt, [[0, 1, 2, 3]]));
+}

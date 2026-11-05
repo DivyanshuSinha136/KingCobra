@@ -1,0 +1,82 @@
+// std.gui, headless: builds a real UI, drives it with simulated input and
+// checks the results. Runs anywhere (no display needed).
+import std.gui;
+
+var clicks = 0;
+var last_text = "";
+var picked = -1;
+var confirmed = "none";
+var ticks = 0;
+
+fn on_click(id) { clicks += 1; }
+fn on_change(id, text) { last_text = text; }
+fn on_select(id, idx) { picked = idx; }
+fn on_confirm(yes) { confirmed = yes; }
+fn on_tick(id) { ticks += 1; }
+
+fn main() {
+    gui.headless(true);
+    gui.window("test", 480, 360);
+
+    let btn = gui.button(0, "Click me", on_click);
+    let box = gui.textbox(0, "", on_change);
+    let chk = gui.checkbox(0, "Enable", false);
+    let r1 = gui.radio(0, "g", "One", true);
+    let r2 = gui.radio(0, "g", "Two");
+    let sl = gui.slider(0, 0, 10, 5);
+    let lst = gui.list(0, ["a", "b", "c", "d"], on_select);
+    let dd = gui.dropdown(0, ["x", "y", "z"], 0);
+
+    gui.update();
+    gui.click(btn);
+    gui.click(btn);
+    print("clicks:", clicks);
+
+    gui.click(box);
+    gui.send_text("hello");
+    print("textbox:", gui.get(box, "text"), "| callback saw:", last_text);
+    gui.send_key("Backspace");
+    gui.send_key("Left");
+    gui.send_text("X");
+    print("after edit:", gui.get(box, "text"));
+    gui.send_key("a", 2);               // Ctrl+A
+    gui.send_text("new");
+    print("replace-all:", gui.get(box, "text"));
+
+    gui.click(chk);
+    print("checkbox:", gui.get(chk, "checked"));
+    gui.click(r2);
+    print("radio exclusive:", gui.get(r1, "checked"), gui.get(r2, "checked"));
+
+    gui.focus(sl);
+    gui.send_key("Right");
+    print("slider after Right:", gui.get(sl, "value"));
+    gui.send_key("End");
+    print("slider after End:", gui.get(sl, "value"));
+
+    gui.click(lst, 20, 50);
+    print("list picked index:", picked, gui.get(lst, "selected_text"));
+    gui.send_key("Down");
+    print("list after Down:", picked);
+
+    gui.focus(dd);
+    gui.send_key("Down");
+    print("dropdown:", gui.get(dd, "selected"), gui.get(dd, "selected_text"));
+
+    gui.confirm("Delete?", "This cannot be undone.", on_confirm);
+    print("dialog open:", gui.dialog_open());
+    gui.dialog_click(1);
+    print("confirm answer:", confirmed, "| dialog open:", gui.dialog_open());
+
+    gui.timer(100, on_tick);
+    gui.advance(350);
+    print("timer ticks in 350ms:", ticks);
+
+    gui.set(btn, "enabled", false);
+    gui.click(btn);
+    print("disabled button ignored:", clicks);
+
+    gui.remove(btn);
+    print("children after remove:", len(gui.children(0)));
+    print("screenshot bytes:", gui.screenshot("/tmp/kingcobra_gui_test.bmp"));
+}

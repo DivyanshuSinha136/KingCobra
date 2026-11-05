@@ -1,0 +1,37 @@
+// std.nn example 1 — curve fitting: learn y = sin(x) from noisy samples.
+// Shows: validation split, a cosine learning-rate schedule, early stopping with best-weight restore,
+//        and evaluating on points the model never saw.
+import std.nn;
+
+fn main() {
+    nn.seed(7);
+
+    // 400 noisy samples of sin(x) on [-3, 3]
+    let x = nn.reshape(nn.linspace(-3, 3, 400), [400, 1]);
+    let y = nn.add(nn.sin(x), nn.randn([400, 1], 0.1));
+
+    let model = nn.mlp([1, 32, 32, 1], "activation", "tanh");
+    print(nn.summary(model, [1]));
+
+    let h = nn.fit(model, "mse", "adam", x, y,
+                   "epochs", 300, "batch_size", 32, "lr", 0.01,
+                   "schedule", "cosine", "val_split", 0.2,
+                   "patience", 40, "verbose", 50);
+
+    print("trained", h.epochs, "epochs; best epoch", h.best_epoch, "with validation loss", h.best_loss);
+
+    // Compare with the true curve on a clean grid. (The loss on the *noisy* data cannot go below the noise
+    // variance, 0.01, but the error against the clean curve can: the network averages the noise away.)
+    let grid = nn.reshape(nn.linspace(-3, 3, 13), [13, 1]);
+    let pred = nn.predict(model, grid);
+    let truth = nn.to_array(nn.sin(grid));
+    print("   x     sin(x)   model");
+    let g = nn.to_array(grid);
+    var i = 0;
+    while (i < 13) {
+        print("  ", g[i][0], "  ", truth[i][0], "  ", pred[i][0]);
+        i = i + 1;
+    }
+    let ev = nn.evaluate(model, "mse", grid, nn.sin(grid));
+    print("mean squared error against the true curve:", ev.loss);
+}

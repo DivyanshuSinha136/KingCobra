@@ -1,0 +1,49 @@
+import std.regx;
+
+fn main() {
+    // ---- simple API: pass the pattern straight in ----
+    print("test digits:", regx.test("^\\d+$", "12345"), regx.test("^\\d+$", "12a45"));
+    print("find:", regx.find("\\d+", "order #4821 shipped"));
+    print("index:", regx.index("shipped", "order #4821 shipped"));
+    print("find_all:", regx.find_all("[a-z]+", "ab12cd345ef"));
+    print("count:", regx.count("a", "banana"));
+
+    // ---- groups, named groups ----
+    let g = regx.groups("(\\w+)@(\\w+)\\.com", "mail bob@example.com now");
+    print("groups:", g);
+    print("named year:", regx.group("(?<year>\\d{4})-(?<mon>\\d{2})", "on 2026-10-08", "year"));
+    print("named mon:", regx.group("(?<year>\\d{4})-(?<mon>\\d{2})", "on 2026-10-08", "mon"));
+
+    // ---- replace with templates, and with a callback ----
+    print("swap:", regx.replace("(\\w+) (\\w+)", "hello world", "$2 $1"));
+    print("named repl:", regx.replace("(?<d>\\d+)", "a1b22", "<${d}>"));
+    print("collapse ws:", regx.replace("\\s+", "a   b \t c", " "));
+    print("replace_first:", regx.replace_first("o", "foo boo", "0"));
+    fn shout(m) { return m[0].upper(); }
+    print("replace_fn:", regx.replace_fn("[aeiou]", "kingcobra", shout));
+
+    // ---- split ----
+    print("split:", regx.split("\\s*,\\s*", "a , b,c ,d"));
+    print("split limit:", regx.split(",", "a,b,c,d", 2));
+    print("split empty:", regx.split("", "abc"));
+
+    // ---- advanced: alternation, lazy, lookahead, backrefs, flags ----
+    print("alt:", regx.find_all("cat|dog", "cat dog bird cat"));
+    print("lazy:", regx.find("<.+?>", "<a><b>"));
+    print("greedy:", regx.find("<.+>", "<a><b>"));
+    print("lookahead:", regx.find_all("\\w+(?=!)", "hi! yo there!"));
+    print("neg lookahead:", regx.find_all("\\b\\w+\\b(?!!)", "hi! yo there!"));
+    print("backref:", regx.find("(\\w)\\1", "hello"));
+    print("ignore case:", regx.test("(?i)HELLO", "say hello"));
+    let re = regx.compile("^(\\d+)\\.(\\d+)$", "m");
+    print("compiled:", regx.groups(re, "3.14"), "groups:", regx.group_count(re));
+    print("multiline:", regx.find_all("(?m)^\\w+", "one\ntwo\nthree"));
+    print("dotall:", regx.test("a.b", "a\nb"), regx.test("(?s)a.b", "a\nb"));
+    print("counted:", regx.find("a{2,3}", "aaaa"));
+    print("posix:", regx.find_all("[[:upper:]]+", "ABc DEf"));
+    print("full:", regx.full("\\d+", "123"), regx.full("\\d+", "123x"));
+    print("utf8 dot:", len(regx.find(".", "é")));
+    print("escape:", regx.escape("a.b*c"));
+    print("valid:", regx.is_valid("(ab"), regx.is_valid("(ab)"), regx.is_valid("[z-a]"));
+    print("empty-loop safe:", regx.test("(a*)*b", "aaab"));
+}

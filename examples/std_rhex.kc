@@ -1,0 +1,59 @@
+import std.rhex;
+import std.system;
+
+// Raw machine code reads arguments from whatever registers the HOST OS's
+// calling convention puts them in — KingCobra doesn't translate this for
+// you (it can't know what the bytes mean). SysV (Linux/mac) passes the
+// first two integer args in rdi/rsi; Microsoft x64 (Windows) uses rcx/rdx
+// instead. Branch on it explicitly so this example gives 42 on both,
+// rather than silently reading leftover register garbage on whichever
+// OS it wasn't written for.
+fn add_code() -> any {
+    if (system.platform() == "windows") {
+        return [0x89, 0xC8, 0x01, 0xD0, 0xC3]; // mov eax, ecx ; add eax, edx ; ret
+    }
+    return [0x89, 0xF8, 0x01, 0xF0, 0xC3];     // mov eax, edi ; add eax, esi ; ret
+}
+
+// --- the v0.1 one-shot path still works unmodified -----------------
+// mov eax, 42 ; ret   ->   B8 2A 00 00 00 C3
+fn main() {
+    unsafe {
+        let result = rhex.exec([0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
+        print("one-shot exec:", result);
+
+        // --- buffers are now readable, re-protectable, and callable with args ---
+        let buf = rhex.from_bytes(add_code());
+        print("buffer size:", rhex.size(buf));
+        print("byte 0 before seal:", rhex.read(buf, 0));
+
+        rhex.protect(buf, "rx");
+        print("sealed?", rhex.is_sealed(buf));
+        let sum = rhex.call_args(buf, [19, 23]);
+        print("call_args(19, 23) ->", sum);
+
+        // re-open for writing and read the bytes back out, proving the
+        // rw <-> rx round trip actually works (not just one-way seal)
+        rhex.protect(buf, "rw");
+        let back = rhex.read_bytes(buf, 5);
+        print("read back:", back);
+        rhex.free(buf);
+
+        // --- CPU identification / timing / entropy (no unsafe needed for these) ---
+        print("vendor:", rhex.cpu_vendor());
+        print("has avx2:", rhex.has_feature("avx2"));
+        let t0 = rhex.rdtsc();
+        let t1 = rhex.rdtsc();
+        print("tsc advanced:", t1 >= t0);
+        let r = rhex.rdrand();
+        print("rdrand gave a value:", r != null);
+
+        // --- hardware MSR/port access reports failure cleanly without root ---
+        let msr = rhex.msr_read(0x10); // IA32_TIME_STAMP_COUNTER
+        if (msr == null) {
+            print("msr_read needs privilege here:", rhex.last_error());
+        } else {
+            print("msr 0x10:", msr);
+        }
+    };
+}

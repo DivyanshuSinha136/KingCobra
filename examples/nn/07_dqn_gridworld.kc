@@ -1,0 +1,147 @@
+// std.nn example 7 — reinforcement learning: Deep Q-Learning on a 4x4 grid world.
+//
+//     S . . .        S = start (top-left)          reward: +1 at G, -1 in the pit X, -0.04 per step
+//     . X . .        X = pit (episode ends)
+//     . . . .        G = goal (episode ends)
+//     . . . G
+//
+// Shows: an online Q-network, a slowly-updated target network (nn.clone + nn.copy_weights with tau),
+//        a replay buffer, epsilon-greedy exploration, and nn.train_step for each minibatch.
+import std.nn;
+
+let SIZE = 4;
+
+fn rnd() -> float {
+    let t = nn.rand([1]);
+    let v = nn.item(t);
+    nn.free(t);
+    return v;
+}
+
+fn onehot(s: int) -> array {
+    let v = [];
+    var i = 0;
+    while (i < 16) { if (i == s) { v.push(1.0); } else { v.push(0.0); } i = i + 1; }
+    return v;
+}
+
+// returns [next_state, reward, done]; actions: 0 up, 1 down, 2 left, 3 right (walls just block)
+fn step(s: int, a: int) -> array {
+    var r = int(s / 4);
+    var c = s % 4;
+    if (a == 0 && r > 0) { r = r - 1; }
+    if (a == 1 && r < 3) { r = r + 1; }
+    if (a == 2 && c > 0) { c = c - 1; }
+    if (a == 3 && c < 3) { c = c + 1; }
+    let ns = r * 4 + c;
+    if (ns == 15) { return [ns, 1.0, 1]; }
+    if (ns == 5) { return [ns, -1.0, 1]; }
+    return [ns, -0.04, 0];
+}
+
+fn argmax4(q: array) -> int {
+    var best = 0;
+    var i = 1;
+    while (i < 4) { if (q[i] > q[best]) { best = i; } i = i + 1; }
+    return best;
+}
+
+fn main() {
+    nn.seed(8);
+    let online = nn.mlp([16, 32, 4], "activation", "relu");
+    let target = nn.clone(online);                     // an independent copy that trails the online network
+    let opt = nn.adam(online, 0.01);
+
+    // replay buffer (parallel arrays, overwritten circularly)
+    let cap = 1500;
+    let bs = [];
+    let ba = [];
+    let br = [];
+    let bn = [];
+    let bd = [];
+    var head = 0;
+    let gamma = 0.95;
+    let episodes = 600;
+    var ep = 0;
+    var successes = 0;
+    while (ep < episodes) {
+        let eps = 1.0 - 0.95 * ep / episodes;          // exploration decays from 100% to 5%
+        var s = 0;
+        var t = 0;
+        var done = 0;
+        while (done == 0 && t < 30) {
+            var a = 0;
+            if (rnd() < eps) { a = int(rnd() * 4); if (a > 3) { a = 3; } }
+            else { a = nn.predict_class(online, [onehot(s)])[0]; }
+            let res = step(s, a);
+
+            if (len(bs) < cap) { bs.push(onehot(s)); ba.push(a); br.push(res[1]); bn.push(onehot(res[0])); bd.push(res[2]); }
+            else { bs[head] = onehot(s); ba[head] = a; br[head] = res[1]; bn[head] = onehot(res[0]); bd[head] = res[2]; head = (head + 1) % cap; }
+
+            if (len(bs) >= 64) {
+                // sample a minibatch and build the Bellman targets
+                let idx = [];
+                for (v in nn.to_array(nn.randint(0, len(bs), [32]))) { idx.push(int(v)); }
+                let S = [];
+                let S2 = [];
+                var i = 0;
+                while (i < 32) { S.push(bs[idx[i]]); S2.push(bn[idx[i]]); i = i + 1; }
+                let q = nn.forward(online, S, false);
+                let qn = nn.forward(target, S2, false);
+                let Y = nn.to_array(q);
+                let qmax = nn.to_array(nn.max(qn, 1));
+                i = 0;
+                while (i < 32) {
+                    let k = idx[i];
+                    Y[i][ba[k]] = br[k] + gamma * (1 - bd[k]) * qmax[i];     // only the taken action gets a new target
+                    i = i + 1;
+                }
+                nn.free(q);
+                nn.free(qn);
+                nn.train_step(online, "mse", opt, S, Y);
+                nn.copy_weights(target, online, 0.05);                       // soft (Polyak) update of the target network
+            }
+            if (res[2] == 1) { done = 1; if (res[1] > 0) { successes = successes + 1; } }
+            s = res[0];
+            t = t + 1;
+        }
+        ep = ep + 1;
+        if (ep % 100 == 0) { print("episode", ep, " epsilon", eps, " goals reached so far:", successes); }
+    }
+
+    // Show the learned greedy policy
+    let all = [];
+    var st = 0;
+    while (st < 16) { all.push(onehot(st)); st = st + 1; }
+    let pol = nn.predict_class(online, all);
+    let arrows = ["^", "v", "<", ">"];
+    print("learned policy:");
+    var r = 0;
+    while (r < 4) {
+        var line = "  ";
+        var c = 0;
+        while (c < 4) {
+            let sidx = r * 4 + c;
+            if (sidx == 15) { line = line + "G "; } else { if (sidx == 5) { line = line + "X "; } else { line = line + arrows[pol[sidx]] + " "; } }
+            c = c + 1;
+        }
+        print(line);
+        r = r + 1;
+    }
+
+    // Follow the greedy policy from the start
+    var s = 0;
+    var path = "0";
+    var total = 0.0;
+    var steps = 0;
+    var finished = 0;
+    while (finished == 0 && steps < 20) {
+        let res = step(s, pol[s]);
+        s = res[0];
+        total = total + res[1];
+        steps = steps + 1;
+        path = path + " -> " + str(s);
+        if (res[2] == 1) { finished = 1; }
+    }
+    print("greedy path from the start:", path, "  (return", total, "in", steps, "steps)");
+}

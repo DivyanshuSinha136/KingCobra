@@ -1,0 +1,55 @@
+import std.json;
+
+fn main() {
+    // ---- parse: objects are open objects (o.name or o["name"]), ints stay exact ----
+    let doc = json.parse("{\"name\":\"Ada\",\"age\":36,\"pi\":3.14,\"tags\":[\"math\",\"code\"],\"address\":{\"city\":\"London\",\"zip\":null}}");
+    print("name:", doc.name, "| age:", doc["age"], "| missing:", doc["nope"]);
+    print("types:", json.type_of(doc["age"]), json.type_of(doc["pi"]), json.type_of(doc["tags"]), json.type_of(doc["address"]));
+    print("keys:", json.keys(doc), "count:", len(doc));
+
+    // ---- build and mutate ----
+    doc["age"] = 37;
+    doc["langs"] = ["C", "KingCobra"];
+    json.set_path(doc, "address.geo.lat", 51.5);
+    print("compact:", json.stringify(doc));
+    print("sorted:", json.stringify(doc, "sort_keys"));
+    print(json.pretty(doc["address"], 2));
+
+    // ---- paths and pointers ----
+    print("path:", json.get_path(doc, "address.city"), json.get_path(doc, "tags[-1]"), json.get_path(doc, "/tags/0"), json.get_path(doc, "x.y", "default"));
+
+    // ---- errors are precise, and non-fatal variants exist ----
+    print("error:", json.error("{\"a\":1,}"));
+    print("valid?", json.is_valid("[1,2,3]"), json.is_valid("[1,2"));
+    print("fallback:", json.try_parse("not json", "BAD"));
+    print("lenient:", json.parse("// config\n[1, 2, /* three */ 3,]", "lenient"));
+
+    // ---- queries (JSONPath) ----
+    let store = json.parse("{\"book\":[{\"t\":\"A\",\"price\":8.95},{\"t\":\"B\",\"price\":12.99,\"isbn\":\"x1\"},{\"t\":\"C\",\"price\":22.99}]}");
+    print("titles:", json.query(store, "$.book[*].t"));
+    print("cheap:", json.query(store, "$.book[?(@.price < 13)].t"));
+    print("with isbn:", json.query(store, "$..book[?(@.isbn)].t"));
+    print("last:", json.query_first(store, "$.book[-1].t"), "paths:", json.query_paths(store, "$..price"));
+
+    // ---- diff / patch / merge ----
+    let a = json.parse("{\"a\":1,\"b\":{\"c\":[1,2,3]}}");
+    let b = json.parse("{\"a\":1,\"b\":{\"c\":[1,9]},\"g\":true}");
+    let ops = json.diff(a, b);
+    print("diff:", json.stringify(ops));
+    print("patch reproduces b:", json.deep_equal(json.patch(a, ops), b));
+    print("merge_patch:", json.stringify(json.merge_patch(a, json.parse("{\"a\":null,\"b\":{\"d\":\"new\"}}"))));
+    print("flatten:", json.stringify(json.flatten(a)));
+
+    // ---- schema validation ----
+    let schema = "{\"type\":\"object\",\"required\":[\"name\",\"age\"],\"properties\":{\"name\":{\"type\":\"string\",\"minLength\":2},\"age\":{\"type\":\"integer\",\"minimum\":0}},\"additionalProperties\":false}";
+    print("valid doc:", json.validate(json.parse("{\"name\":\"Ada\",\"age\":36}"), schema));
+    for (e in json.validate(json.parse("{\"name\":\"A\",\"age\":-1,\"extra\":true}"), schema)) { print("  problem:", e); }
+
+    // ---- files and JSON Lines ----
+    json.write_file("/tmp/kingcobra_json_demo.json", doc);
+    print("file round-trip:", json.deep_equal(json.parse_file("/tmp/kingcobra_json_demo.json"), doc));
+    json.write_lines("/tmp/kingcobra_json_demo.jsonl", [1, "two", [3]]);
+    json.append_line("/tmp/kingcobra_json_demo.jsonl", a);
+    print("jsonl:", json.read_lines("/tmp/kingcobra_json_demo.jsonl"));
+    print("format keeps numbers:", json.minify("{ \"x\" : 2.50 , \"big\" : 12345678901234567890123 }"));
+}

@@ -1,0 +1,13 @@
+# Shared patterns, pulled into a score with:  include "lib/groove.kcm"
+pattern four_floor
+  kick:q kick:q kick:q kick:q
+end
+pattern backbeat
+  r:q snare:q r:q snare:q
+end
+pattern hats8
+  hat:e hat:e hat:e hat:e hat:e hat:e hat:e hat:e
+end
+pattern bassline
+  A2:e A2:e r:e A2:e  C3:e r:e E2:e G2:e
+end

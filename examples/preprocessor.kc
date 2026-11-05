@@ -1,0 +1,32 @@
+// The preprocessor: #define / #include / #if, function-like macros, # stringizing and ## pasting.
+// Try:  kingcobra -DTRACE run examples/preprocessor.kc        or      -DWIDTH=16
+#include "preprocessor/config.kc"
+#include "preprocessor/config.kc"        // ignored: #pragma once
+
+#ifndef WIDTH
+#define WIDTH 8
+#endif
+
+#define SQUARE(x) ((x) * (x))
+#define NAME_OF(v) #v
+#define FIELD(prefix, n) prefix##_##n
+#define REPEAT(n, stmt) for (var _r = 0; _r < n; _r++) { stmt; }
+
+#if VERSION >= 200 && WIDTH > 4
+fn mode() -> string { return "modern"; }
+#else
+fn mode() -> string { return "legacy"; }
+#endif
+
+fn main() {
+    var FIELD(my, counter) = 0;
+    REPEAT(3, my_counter += SQUARE(2));
+    printf("%s  mode=%s  width=%d  my_counter=%d\n", banner(), mode(), WIDTH, my_counter);
+    printf("%s is %d\n", NAME_OF(VERSION), VERSION);
+    printf("line %d of %s\n", __LINE__, __FILE__);
+#ifdef TRACE
+    LOG("trace", "tracing is %s", "on");
+#else
+    LOG("info", "tracing is %s (pass -DTRACE)", "off");
+#endif
+}

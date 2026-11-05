@@ -1,0 +1,78 @@
+// SHOWCASE 4 — A REST API and its client, in one language
+//
+// Starts a real HTTP/1.1 JSON service (api/todo_server.kc) as a child process, then drives it over TCP the
+// way any mobile app or microservice would: authentication, create/read/update/delete, query filters,
+// validation errors, and a reusable keep-alive client with default headers.
+//
+// Uses: std.http (server + client), std.json, std.system (spawn/wait), std.io, error handling.
+//
+// Run:  kingcobra examples/showcase/04_rest_api.kc
+import std.http;
+import std.json;
+import std.io;
+import std.system;
+
+fn show(label: string, r) {
+    print(f"  {label.pad_right(26)} -> {r.status} {r.reason.pad_right(11)} {r.body}");
+}
+
+fn main() {
+    // ---- boot the service ----
+    let dir = system.make_temp_dir("kc_api_");
+    defer system.rmdir(dir, true);
+    let portfile = system.path_join(dir, "port");
+    system.setenv("KC_PORT_FILE", portfile);
+    system.setenv("KC_TOKEN", "s3cret-token");
+    let here = system.dirname(system.script_path());
+    let server = system.spawn([system.exe_path(), "run", system.path_join(here, "api", "todo_server.kc")], false);
+    var waited = 0;
+    while (!system.exists(portfile) && waited < 100) { system.sleep(0.05); waited += 1; }
+    assert(system.exists(portfile), "server did not start");
+    let base = "http://127.0.0.1:" + io.read_file(portfile);
+    print("service up at", base);
+
+    // ---- a client with default auth + JSON headers ----
+    let api = http.client();
+    http.set_option(api, "timeout", 5);
+    http.set_option(api, "bearer", "s3cret-token");
+    let JSON = ["Content-Type: application/json"];
+
+    print("\nauthentication:");
+    show("no token", http.get(base + "/tasks"));
+    let anon = http.client();
+    http.set_option(anon, "bearer", "wrong");
+    show("wrong token", http.get(anon, base + "/tasks"));
+
+    print("\ncreate:");
+    let titles = ["Write the release notes", "Fix flaky CI test", "Order team lunch", "   "];
+    var ids = [];
+    for (t in titles) {
+        let r = http.post(api, base + "/tasks", json.stringify({ title: t }), JSON);
+        show(f"POST \"{t.trim()}\"", r);
+        if (r.status == 201) { ids.push(json.parse(r.body)["id"]); }
+    }
+    show("POST not-json", http.post(api, base + "/tasks", "hello", JSON));
+
+    print("\nupdate and read:");
+    show(f"PUT /tasks/{ids[1]} done", http.put(api, base + f"/tasks/{ids[1]}", "{\"done\": true}", JSON));
+    show(f"PUT /tasks/{ids[0]} rename", http.put(api, base + f"/tasks/{ids[0]}", "{\"title\": \"Publish the release notes\"}", JSON));
+    show("GET /tasks/999", http.get(api, base + "/tasks/999"));
+    show("GET ?done=true", http.get(api, base + "/tasks?done=true"));
+
+    print("\ndelete:");
+    let del = http.delete(api, base + f"/tasks/{ids[2]}");
+    print(f"  DELETE /tasks/{ids[2]}            -> {del.status} (body bytes: {del.length})");
+
+    // ---- verify the final state like a real integration test would ----
+    let stats = json.parse(http.get(api, base + "/stats").body);
+    let all = json.parse(http.get(api, base + "/tasks").body);
+    print(f"\nfinal state: {json.stringify(stats)}  titles: {all.map(fn(t) -> string { return t["title"]; })}");
+    assert_eq(stats["total"], 2);
+    assert_eq(stats["done"], 1);
+    assert_eq(all[0]["title"], "Publish the release notes");
+
+    // ---- shut down cleanly ----
+    http.post(api, base + "/shutdown", "");
+    print("server exit code:", system.wait(server, 5.0));
+    system.proc_free(server);
+}

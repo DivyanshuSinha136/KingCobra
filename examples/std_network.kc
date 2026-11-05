@@ -1,0 +1,61 @@
+// std.network — advanced: UDP, raw sockets, and the protocol-builder
+// helpers (pack_*/unpack_*/checksum16). See docs/STD_NETWORK.md.
+import std.network;
+
+fn main() {
+    // ---- protocol builder: hand-assemble an 8-byte UDP header ----
+    // (source port, dest port, length, checksum — RFC 768)
+    var hdr = "";
+    hdr = network.pack_u16(hdr, 53124);   // source port
+    hdr = network.pack_u16(hdr, 53);      // dest port (DNS)
+    hdr = network.pack_u16(hdr, 8);       // length (header only, no payload here)
+    hdr = network.pack_u16(hdr, 0);       // checksum placeholder
+    print("udp header bytes:", len(hdr));
+
+    print("src port:", network.unpack_u16(hdr, 0));
+    print("dst port:", network.unpack_u16(hdr, 2));
+    print("length:  ", network.unpack_u16(hdr, 4));
+
+    // checksum16 is the same RFC 1071 algorithm every IPv4/ICMP/UDP/TCP
+    // header uses — compute it, then write it back into the buffer.
+    let sum = network.checksum16(hdr);
+    hdr = "";
+    hdr = network.pack_u16(hdr, 53124);
+    hdr = network.pack_u16(hdr, 53);
+    hdr = network.pack_u16(hdr, 8);
+    hdr = network.pack_u16(hdr, sum);
+    print("checksum:", sum);
+
+    // u32/bytes helpers, for longer fields (e.g. a sequence number or
+    // an embedded payload) in a custom wire format.
+    var packet = network.pack_u32("", 1);              // seq = 1
+    packet = network.pack_bytes(packet, "hello-wire");
+    print("seq:", network.unpack_u32(packet, 0), "payload len:", len(packet) - 4);
+
+    // ---- UDP: a real (local, no-network-required) round trip ----
+    let server = network.udp_bind(0);           // port 0 = let the OS pick
+    let addr = network.local_addr(server);
+    let port = int(addr.split(":")[1]);
+    print("udp server listening on port:", port);
+
+    let client = network.udp_socket();
+    network.set_broadcast(client, false);
+    network.set_recv_timeout(server, 2.0);
+    network.udp_send_to(client, "127.0.0.1", port, "ping");
+    let got = network.udp_recv_from(server, 64);
+    print("udp server received:", got[0], "from", got[1]);
+    network.close(client);
+    network.close(server);
+
+    // ---- raw sockets: construct one, set IP_HDRINCL, then close ----
+    // (sending actual raw IP traffic needs root/Administrator and isn't
+    // exercised here — this just proves the API end-to-end.)
+    let raw = network.raw_socket(1); // IPPROTO_ICMP
+    network.set_hdrincl(raw, true);
+    network.close(raw);
+    print("raw socket created and closed ok");
+
+    // ---- address resolution ----
+    let ips = network.resolve("127.0.0.1");
+    print("resolved 127.0.0.1 ->", ips);
+}

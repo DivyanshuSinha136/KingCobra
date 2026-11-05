@@ -1,0 +1,38 @@
+// std.ascii_screen showcase 7/10 — an infinite, streamed procedural world with a smooth-follow camera and distance fog.
+// WASD / arrows walk   f toggles fog   n new seed   q quit
+import std.ascii_screen;
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: infinite world", "fps", 30);
+    var seed = 7;
+    var world = ascii_screen.world("terrain", "seed", seed, "radius", 3);
+    ascii_screen.map_use(world);
+    ascii_screen.world_scale(2);
+    ascii_screen.physics(0.0);
+    ascii_screen.controller("both");
+    let player = ascii_screen.spawn(0.5, 0.5, "glyph", "@", "fg", "#ffd166", "w", 0.9, "h", 0.9, "z", 10);
+    ascii_screen.camera_follow(player, "smooth", 8);
+    var fog = true;
+    let h = ascii_screen.height();
+    while (ascii_screen.poll()) {
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        if (ascii_screen.key_pressed("f")) { fog = !fog; }
+        if (ascii_screen.key_pressed("n")) {
+            seed += 1;
+            let old = world;
+            world = ascii_screen.world("terrain", "seed", seed, "radius", 3);
+            ascii_screen.map_use(world);
+            ascii_screen.map_free(old);
+            ascii_screen.set(player, "x", 0.5); ascii_screen.set(player, "y", 0.5);
+        }
+        ascii_screen.set(player, "vx", ascii_screen.axis("move_x") * 9.0);
+        ascii_screen.set(player, "vy", ascii_screen.axis("move_y") * 5.0);
+        ascii_screen.begin();
+        if (fog) { ascii_screen.draw_world("fog", 28, "fog_color", "#0a0e14"); } else { ascii_screen.draw_world(); }
+        let st = ascii_screen.map_stats(world);
+        ascii_screen.fill(0, h - 1, ascii_screen.width(), 1, " ", "bg", "#101018");
+        ascii_screen.text(1, h - 1, "WASD walk  f fog  n new seed   seed " + str(seed) + "   x " + str(ascii_screen.floor(ascii_screen.get(player, "x"))) + " y " + str(ascii_screen.floor(ascii_screen.get(player, "y"))) + "   loaded chunks " + str(st["loaded_chunks"]), "fg", "gray", "bg", "#101018");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

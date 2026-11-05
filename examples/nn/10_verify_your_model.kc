@@ -1,0 +1,63 @@
+// std.nn example 10 — inspecting, verifying and managing a model.
+// Shows: nn.summary, parameter names, nn.gradcheck (proves backprop is correct for YOUR architecture),
+//        learning-rate schedules, gradient clipping, weight files, and mixing two model files safely.
+import std.nn;
+
+fn main() {
+    nn.seed(31);
+    // an architecture with several kinds of layers
+    let model = nn.sequential([
+        nn.embedding(20, 8, "padding_idx", 0),
+        nn.gru(8, 12),
+        nn.layernorm(12),
+        nn.dense(12, 16), nn.gelu(), nn.dropout(0.2),
+        nn.dense(16, 3)
+    ]);
+    print(nn.summary(model, [6]));                          // per-sample input shape: 6 token ids
+    print("parameter tensors:");
+    print(nn.param_names(model));
+
+    // ---- is the backward pass correct? compare analytic gradients with finite differences ----
+    let x = [[1, 4, 7, 2, 0, 0], [3, 3, 9, 1, 5, 0], [8, 2, 2, 6, 4, 7], [5, 5, 1, 0, 0, 0]];
+    let y = [0, 2, 1, 2];
+    let g = nn.gradcheck(model, "ce", x, y, "samples", 60);
+    print("gradcheck passed:", g.ok, " max relative error:", g.max_rel_error, " values checked:", g.checked);
+
+    // ---- learning-rate schedules, evaluated without training ----
+    print("learning rate by epoch (base 0.1, 10 epochs):");
+    let specs = ["cosine", "step:3:0.5", "exp:0.8", "linear:0.01"];
+    for (s in specs) {
+        var row = "  " + s + ":";
+        var e = 0;
+        while (e < 10) { row = row + " " + str(nn.lr_at(s, 0.1, e, 10)); e = e + 1; }
+        print(row);
+    }
+    print("  cosine with a 3-epoch warmup:", nn.lr_at("cosine", 0.1, 0, 10, 3), nn.lr_at("cosine", 0.1, 2, 10, 3), nn.lr_at("cosine", 0.1, 3, 10, 3));
+
+    // ---- training with gradient clipping and a manual step so we can watch the gradient norm ----
+    let loss = nn.loss("ce", "smoothing", 0.1);
+    let opt = nn.adamw(model, 0.01, "weight_decay", 0.01);
+    var ep = 0;
+    while (ep < 4) {
+        let pred = nn.forward(model, x);
+        let l = nn.loss_value(loss, pred, y);
+        nn.zero_grad(model);
+        nn.backward(model, loss);
+        let norm = nn.clip_grad_norm(model, 1.0);            // returns the norm BEFORE clipping
+        nn.step(opt);
+        nn.free(pred);
+        print("step", ep + 1, " loss", l, " gradient norm", norm);
+        ep = ep + 1;
+    }
+
+    // ---- weight files: save, load into an identical architecture, refuse a different one ----
+    nn.save_weights(model, "verify_weights.kcw");
+    let twin = nn.sequential([nn.embedding(20, 8, "padding_idx", 0), nn.gru(8, 12), nn.layernorm(12),
+                              nn.dense(12, 16), nn.gelu(), nn.dropout(0.2), nn.dense(16, 3)]);
+    nn.load_weights(twin, "verify_weights.kcw");
+    let same = nn.item(nn.max(nn.abs(nn.sub(nn.forward(model, x, false), nn.forward(twin, x, false)))));
+    print("largest prediction difference between the model and its reloaded twin:", same);
+    nn.save(model, "verify_model.kcnn");                     // architecture + weights in one file
+    let loaded = nn.load("verify_model.kcnn");
+    print("nn.load rebuilt a model with", nn.count_params(loaded), "parameters; predicted classes:", nn.predict_class(loaded, x));
+}

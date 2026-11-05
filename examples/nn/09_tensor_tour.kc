@@ -1,0 +1,65 @@
+// std.nn example 9 — a tour of the tensor API (no neural network needed).
+// Tensors are n-dimensional arrays; functions accept tensors, numbers or nested arrays interchangeably.
+import std.nn;
+
+fn main() {
+    // ---- creating and inspecting ----
+    let a = nn.tensor([[1, 2, 3], [4, 5, 6]]);
+    print("a =", a, " shape", nn.shape(a), " size", nn.size(a), " rank", nn.ndim(a));
+    print("zeros:", nn.zeros([2, 2]), " ones:", nn.ones([3]), " eye:", nn.eye(3));
+    print("arange:", nn.arange(5), nn.arange(2, 11, 3), " linspace:", nn.linspace(0, 1, 5));
+    print("element a[1][2] =", nn.get(a, 1, 2), "   last element =", nn.get(a, -1, -1));
+
+    // ---- elementwise math with broadcasting ----
+    print("a + 10          :", nn.add(a, 10));
+    print("a + row [10,20,30]:", nn.add(a, [10, 20, 30]));         // the row is applied to every row of a
+    print("a * column [[1],[2]]:", nn.mul(a, [[1], [2]]));         // the column is applied to every column
+    print("sqrt, exp, clip :", nn.sqrt(nn.tensor([4, 9, 16])), nn.exp(nn.tensor([0, 1])), nn.clip(nn.tensor([-5, 0.5, 5]), -1, 1));
+
+    // ---- reductions along an axis ----
+    print("sum all:", nn.sum(a), "  per column:", nn.sum(a, 0), "  per row:", nn.sum(a, 1));
+    print("mean per column:", nn.mean(a, 0), "  max per row:", nn.max(a, 1), "  std per row:", nn.std(a, 1));
+    print("argmax per row:", nn.argmax(a, 1), "  keepdims:", nn.sum(a, 1, true));
+
+    // ---- shaping ----
+    print("reshape to [3, 2]:", nn.reshape(a, [3, 2]), "   [3, -1] infers the 2:", nn.reshape(a, [3, -1]));
+    print("transpose:", nn.transpose(a));
+    print("stack rows (concat axis 0):", nn.concat([a, a], 0));
+    print("side by side (axis 1):", nn.concat([a, a], 1));
+    print("slice rows 1..2:", nn.slice(a, 1, 2), "  pick rows [1,0,1]:", nn.rows(a, [1, 0, 1]));
+
+    // ---- linear algebra ----
+    print("a x a^T:", nn.matmul(a, nn.transpose(a)));
+    print("a x vector [1,0,-1]:", nn.matmul(a, [1, 0, -1]), "   dot product:", nn.matmul([1, 2, 3], [4, 5, 6]));
+
+    // ---- probabilities and activations ----
+    print("softmax rows:", nn.softmax(nn.tensor([[1, 2, 3], [1, 1, 1]])));
+    print("gelu / sigmoid / tanh:", nn.apply("gelu", nn.tensor([-1, 0, 1])), nn.apply("sigmoid", nn.tensor([0, 2])), nn.apply("tanh", nn.tensor([0, 1])));
+
+    // ---- preparing data ----
+    let data = nn.tensor([[1, 10], [3, 20], [5, 30]]);
+    print("standardize (per column, mean 0 / std 1):", nn.standardize(data));
+    print("minmax (per column, 0..1):", nn.minmax(data));
+    print("one_hot labels:", nn.one_hot([0, 2, 1], 3));
+    print("pad_sequences:", nn.pad_sequences([[1, 2, 3], [4], [5, 6]], 4));
+    let w = nn.window_series([10, 20, 30, 40, 50, 60], 3);
+    print("sliding windows X:", w[0], " next values Y:", w[1]);
+
+    // ---- randomness, reproducibly ----
+    nn.seed(123);
+    print("rand:", nn.rand([3]), " randn:", nn.randn([3]), " randint:", nn.randint(0, 10, [5]));
+    let pairs = nn.shuffle(nn.arange(6), nn.arange(6));               // the same permutation is applied to both
+    print("shuffle keeps pairs aligned:", pairs[0], pairs[1]);
+    print("sample from logits (temperature 0.01 picks the largest):", nn.sample([0.1, 3.0, 0.2], 0.01));
+
+    // ---- metrics ----
+    print("accuracy:", nn.metric("accuracy", [[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]], [0, 1, 1]));
+    print("r2:", nn.metric("r2", [1.1, 2.0, 2.9], [1, 2, 3]), "  mae:", nn.metric("mae", [1, 2], [2, 4]));
+    print("confusion matrix:", nn.confusion_matrix([0, 1, 1, 2, 2, 2], [0, 1, 2, 2, 2, 0], 3));
+
+    // ---- memory: tensors are not garbage collected ----
+    let big = nn.zeros([1000, 1000]);
+    print("a 1000x1000 tensor:", big);
+    nn.free(big);                                                     // release it explicitly when you are done
+    print("after nn.free the handle reports:", big);
+}

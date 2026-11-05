@@ -1,0 +1,95 @@
+// SHOWCASE 7 — Classic algorithms, checked against known answers, with timings
+//
+// Number-crunching programs people use to compare languages. Every result is asserted against a value you
+// can look up (OEIS / Project Euler), so this is a correctness test as much as a speed demo. Hot integer
+// functions are compiled to native x86-64 by the closure JIT automatically; nothing to turn on.
+//
+// Run:  kingcobra examples/showcase/07_algorithms_speed.kc
+import std.system;
+
+fn fib(n: int) -> int {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn gcd(a: int, b: int) -> int {
+    if (b == 0) { return a; }
+    return gcd(b, a % b);
+}
+
+fn collatz_steps(n: int) -> int {
+    var steps = 0;
+    var x = n;
+    while (x != 1) {
+        if (x % 2 == 0) { x = x / 2; } else { x = 3 * x + 1; }
+        steps += 1;
+    }
+    return steps;
+}
+
+fn sieve_count(limit: int) -> int {
+    let composite = alloc(limit + 1);          // a byte per number, bounds-checked
+    defer free(composite);
+    var count = 0;
+    for (i in 2..(limit + 1)) {
+        if (composite[i] == 0) {
+            count += 1;
+            var j = i * i;
+            while (j <= limit) { composite[j] = 1; j += i; }
+        }
+    }
+    return count;
+}
+
+fn digit_sum_of_power_of_two(e: int) -> int {            // big number arithmetic by hand: 2^e as decimal digits
+    var digits = [1];
+    for (k in 0..e) {
+        var carry = 0;
+        for (i in 0..len(digits)) {
+            let v = digits[i] * 2 + carry;
+            digits[i] = v % 10;
+            carry = idiv(v, 10);
+        }
+        if (carry > 0) { digits.push(carry); }
+    }
+    return digits.sum();
+}
+
+fn timed(label: string, expected: int, f) {
+    let t0 = clock();
+    let got = f();
+    let dt = clock() - t0;
+    let ms = int(dt * 1000);
+    print(f"  {label.pad_right(34)} = {str(got).pad_left(8)}   {str(ms).pad_left(5)} ms   {got == expected ? "ok" : "WRONG"}");
+    assert_eq(got, expected);
+}
+
+fn main() {
+    print("algorithm                           result        time   check");
+    timed("fib(30)", 832040, fn() -> int { return fib(30); });
+    timed("primes below 2,000,000 (sieve)", 148933, fn() -> int { return sieve_count(2000000); });
+    timed("sum of gcd(i, 360360), i<=200000", 14135098, fn() -> int { return gcd_sum(200000); });
+
+    timed("longest Collatz chain start < 100000", 77031, fn() -> int {
+        var best = 1;  var best_len = 0;
+        for (n in 1..100000) {
+            let s = collatz_steps(n);
+            if (s > best_len) { best_len = s; best = n; }
+        }
+        return best;
+    });
+
+    timed("digit sum of 2^1000 (big integers)", 1366, fn() -> int { return digit_sum_of_power_of_two(1000); });
+    timed("sum of even Fibonacci terms < 4e6", 4613732, fn() -> int {
+        var a = 1;  var b = 2;  var total = 0;
+        while (a < 4000000) { if (a % 2 == 0) { total += a; } let t = a + b; a = b; b = t; }
+        return total;
+    });
+    print("\nall results match independently computed / published values");
+}
+
+fn gcd_sum(n: int) -> int {
+    var s = 0;
+    for (i in 1..(n + 1)) { s += gcd(i, 360360); }
+    return s;
+}

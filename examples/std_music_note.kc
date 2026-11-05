@@ -1,0 +1,60 @@
+import std.music_note;
+import std.io;
+
+// Options are "key=value" words (KingCobra has no object literals); the first word of an
+// effect spec is its type:  "reverb mix=0.3"  "lowpass freq=2000 slope=24".
+fn main() {
+    // ---- 1. the original one-liner still works: notes -> 16-bit mono sine WAV
+    let n = music_note.to_wav(["C4", "D4", "E4", "F4", "G4", "rest", "G4", "C5"], "/tmp/kingcobra_melody.wav", 0.3);
+    print("legacy melody:", n, "samples");
+
+    // ---- 2. a full multi-track score from a multiline notation file
+    let src = io.read_file("examples/music/ode_to_joy.kcm");
+    let score = music_note.parse(src, "strict_bars");     // strict_bars: every bar must add up
+    let info = music_note.score_info(score);
+    print(info.title, "-", info.composer, "|", info.tempo, "BPM,", info.key, "|", info.notes, "notes,", info.seconds, "s");
+    let audio = music_note.render(score);
+    music_note.save_wav(audio, "/tmp/kingcobra_ode.wav");
+    music_note.to_midi(score, "/tmp/kingcobra_ode.mid");     // open it in any DAW / notation program
+    print("rendered:", audio, "->", music_note.stats(audio).peak_db, "dBFS peak");
+
+    // ---- 3. notation can also be written inline: drums, chords, ties, tuplets, repeats
+    let groove = "title Groove\ntempo 100\nswing=0.3\n"
+        + "track drums drums\n|: kick:q hat:e hat:e snare:q hat:e hat:e :|x4\n"
+        + "track bass bass vol=0.9\n|: A2:q A2:e A2:e C3:q E2:q :|x4\n"
+        + "track keys epiano reverb=0.3 pan=0.3\n|: {Am7}:h {Dm7}:h :|x2 {Am7}:h {E7}:h {Am7}:w\n";
+    let g = music_note.render(groove);
+    music_note.save_wav(g, "/tmp/kingcobra_groove.wav");
+    print("groove:", g);
+
+    // ---- 4. DSP: every effect returns a new buffer; chain() applies several in order
+    let note = music_note.note("A3", 2.0, "instrument=pluck");
+    let wet = music_note.chain(note, ["highpass freq=120", "delay time=0.3 feedback=0.4 mix=0.3", "reverb mix=0.25 room=0.8", "limiter ceiling=-1"]);
+    music_note.save_wav(wet, "/tmp/kingcobra_pluck_fx.wav");
+    let shifted = music_note.pitch_shift(note, 7.0);       // a fifth up, same length
+    let slow = music_note.time_stretch(note, 2.0);          // twice as long, same pitch
+    print("pitch shifted:", music_note.pitch(shifted, "start=0.1").note, "| stretched:", music_note.info(slow).seconds, "s");
+
+    // ---- 5. analysis
+    let tuned = music_note.pitch(music_note.tone("sine", 442.0, 1.0), "start=0.2");
+    print("detected:", tuned.note, tuned.cents, "cents");
+    print("tempo of a click track:", music_note.bpm(music_note.click_track(96.0, 24)).bpm, "BPM");
+    print("theory:", music_note.chord("Cmaj7"), music_note.scale("D4", "dorian"), music_note.identify(["E4", "G4", "C5"]));
+
+    // ---- 6. phonk and funk: a seeded arrangement, produced and mastered
+    let phonk = music_note.groove("phonk", "bars=8 bpm=140 key=F#m seed=7");     // readable, editable notation
+    music_note.to_midi(phonk, "/tmp/kingcobra_phonk.mid");
+    let mix = music_note.produce("phonk", "bars=16 bpm=140 key=F#m seed=7");     // 808 slides, cowbell lead, kick sidechain, master
+    music_note.save_wav(mix, "/tmp/kingcobra_phonk.wav", "bits=24");
+    let funk = music_note.produce("funk", "bars=16 key=Em seed=11");
+    music_note.save_wav(funk, "/tmp/kingcobra_funk.wav");
+    print("phonk:", mix, music_note.stats(mix).rms_db, "dB RMS | funk:", funk);
+
+    // ---- 7. a KCM file: patterns, include, file + inline audio samples, timestamps
+    let kcm = music_note.parse_file("examples/music/showcase.kcm", "strict_bars");
+    for (m in music_note.markers(kcm)) { print("marker", m["name"], "at", m["timecode"]); }
+    print("samples:", len(music_note.sample_list(kcm)), "| timecode of 3725.5 s:", music_note.timecode(3725.5));
+    music_note.save_wav(music_note.render(kcm), "/tmp/kingcobra_showcase.wav");
+
+    // music_note.play(audio) would play it through the system audio player
+}

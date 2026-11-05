@@ -1,0 +1,66 @@
+// std.tts — text-to-speech: pronunciation, voices, SSML, lexicon, timing, and mixing with std.music_note.
+import std.tts;
+import std.music_note;
+
+fn main() {
+    // ---- 1. speak a sentence and save it ----
+    let r = tts.to_wav("Hello! I am KingCobra, and I can read numbers like 1,234, dates like 10/28/2026, and prices like $5.50.",
+                       "/tmp/kc_tts_hello.wav", { voice: "narrator", rate: 1.05 });
+    println("saved:", r.path, round_to(r.seconds), "seconds");
+
+    // ---- 2. see exactly how it will pronounce things ----
+    println("normalized:", tts.normalize("Dr. Smith paid $5.50 at 3:30 pm on 10/28/2026."));
+    println("phonemes  :", tts.phonemes("Hello world, this is a test."));
+    println("ipa       :", tts.ipa("computer science"));
+    println("explain   :", tts.explain("technology").phonemes, "(" + tts.explain("technology").source + ")");
+    println("homograph :", tts.phonemes("I read it. I have read it. A live show; to live."));
+
+    // ---- 3. fix a pronunciation yourself (ARPAbet or IPA), or substitute text ----
+    println("before    :", tts.pronounce("kobold"));
+    tts.add_word("kobold", "K OW1 B OW0 L D");
+    println("after     :", tts.pronounce("kobold"));
+    tts.add_sub("kc", "king cobra");
+    println("sub       :", tts.phonemes("kc rocks"));
+
+    // ---- 4. voices ----
+    for (v in tts.voices()) {
+        let a = tts.speak("The quick brown fox.", "voice=" + v);
+        println("voice", v, "->", round_to(music_note.info(a).seconds), "s");
+        tts.free(a);
+    }
+    tts.define_voice("hero", "male", { f0: 135, tract: 1.08, breath: 0.08, desc: "warm and slightly airy" });
+    println("custom voice:", tts.voice_info("hero").description);
+
+    // errors are ordinary catchable errors
+    try { tts.speak("x", { voice: "nobody" }); } catch (err) { println("caught:", err.message); }
+
+    // ---- 5. questions, lists, emphasis and SSML ----
+    tts.to_wav("Is this a question? Yes, it is. It is *really* very, very good!", "/tmp/kc_tts_prosody.wav", "voice=female");
+    let ssml = "<speak>One moment<break time=\"600ms\"/> please. <prosody rate=\"slow\" pitch=\"-2st\">Slow and low.</prosody> "
+             + "Say <phoneme alphabet=\"ipa\" ph=\"ˈkɪŋ\">king</phoneme> cobra.</speak>";
+    println("ssml seconds:", round_to(tts.duration(ssml)));
+    tts.to_wav(ssml, "/tmp/kc_tts_ssml.wav");
+
+    // ---- 6. expressive voice: styles, sound events, typos in tags are fixed automatically ----
+    let line = "[Happily] Hi it's great to meet u... [dramitaclly] but u didn't come...";
+    tts.to_wav(line, "/tmp/kc_tts_expressive.wav", "voice=female");
+    println("tag fixed:", tts.resolve_tag("dramitaclly"), "|", tts.resolve_tag("wisper"));
+    tts.to_wav("Oh no [sigh] I really thought we had it. [very sad] It is over. [laugh] Just kidding! [excited] We won!",
+               "/tmp/kc_tts_story.wav", { voice: "narrator" });
+    tts.define_style("grumpy", "angry", { pitch: -3, rate: 0.9, creak: 0.3, aliases: "cranky" });
+    tts.to_wav("[cranky] Get off my lawn. [+whisper] And stay off.", "/tmp/kc_tts_grumpy.wav");
+    println("styles:", len(tts.styles()), "events:", len(tts.events()), "interjections:", len(tts.interjections()));
+
+    // ---- 7. timing for subtitles and lip-sync ----
+    let t = tts.align("Good morning, world.");
+    for (w in t.words) { println(w.word, round_to(w.start), "-", round_to(w.end), w.phonemes); }
+    println("first phone:", t.words[0].phones[0]);
+
+    // ---- 8. speech is a std.music_note audio buffer: process it with the DSP toolbox ----
+    let voice = tts.speak("Robots do not dream.", "voice=robot");
+    let radio = music_note.filter(voice, "bandpass", 1500.0);
+    music_note.save_wav(radio, "/tmp/kc_tts_radio.wav");
+    println("radio effect:", round_to(music_note.info(radio).seconds), "s");
+}
+
+fn round_to(x) { return float(int(x * 100.0 + 0.5)) / 100.0; }

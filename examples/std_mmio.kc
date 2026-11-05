@@ -1,0 +1,33 @@
+import std.mmio;
+
+// A software ("virtual") device: same API as real hardware, no `unsafe` needed.
+// Models a tiny peripheral: CTRL @0x00, STATUS @0x04, DATA @0x08.
+fn main() {
+    let dev = mmio.virtual(4096, "demo-uart");
+
+    mmio.write32(dev, 0x00, 0x1);                  // CTRL.enable = 1
+    mmio.set_bits(dev, 0x00, 4, 0x80);             // CTRL.irq_en  (read-modify-write)
+    print("CTRL   =", mmio.hex(mmio.read32(dev, 0x00), 4));
+
+    // fields: put 0x5 into bits [11:8] of CTRL
+    let ctrl = mmio.read32(dev, 0x00);
+    mmio.write32(dev, 0x00, mmio.insert(ctrl, 8, 4, 0x5));
+    print("CTRL   =", mmio.hex(mmio.read32(dev, 0x00), 4),
+          " field[11:8] =", mmio.extract(mmio.read32(dev, 0x00), 8, 4));
+
+    // pretend the "hardware" raised STATUS.ready, then poll for it
+    mmio.write32(dev, 0x04, 0x2);
+    let ok = mmio.wait_bits(dev, 0x04, 4, 0x2, 0x2, 1000);
+    print("ready  =", ok);
+
+    mmio.write_block(dev, 0x100, 4, [1, 2, 3, 4]);
+    print("block  =", mmio.read_block(dev, 0x100, 4, 4));
+
+    mmio.trace(dev, true);
+    mmio.write8(dev, 0x08, 0x41);
+    mmio.read8(dev, 0x08);
+    print("trace  =", mmio.trace_dump());
+
+    print("info   =", mmio.info(dev));
+    mmio.unmap(dev);
+}

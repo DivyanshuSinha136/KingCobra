@@ -1,0 +1,10 @@
+// A plain KingCobra source file used as a module by ../modules_demo.kc
+fn square(x: int) -> int {
+    return x * x;
+}
+
+fn cube(x: int) -> int {
+    return x * x * x;
+}
+
+let PI = 3.14159;

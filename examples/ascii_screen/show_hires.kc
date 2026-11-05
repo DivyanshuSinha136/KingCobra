@@ -1,0 +1,74 @@
+// std.ascii_screen showcase 3/10 — sub-cell graphics: braille (2x4), quad (2x2) and half (1x2) pixels.
+// Live sine plot, a Lissajous curve and a spinning polygon. space = cycle resolution mode, q = quit.
+import std.ascii_screen;
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: hi-res", "fps", 30);
+    let modes = ["braille", "quad", "half"];
+    var mode = 0;
+    var t = 0.0;
+    let W = 36;
+    let H = 10;
+    var layer = ascii_screen.hires(W, H, modes[mode]);
+    while (ascii_screen.poll()) {
+        t += ascii_screen.dt();
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        if (ascii_screen.key_pressed("space")) {
+            ascii_screen.hires_free(layer);
+            mode = (mode + 1) % 3;
+            layer = ascii_screen.hires(W, H, modes[mode]);
+        }
+        let px = ascii_screen.hires_size(layer);
+        let pw = px[0];
+        let ph = px[1];
+
+        ascii_screen.begin();
+        // 1: scrolling sine mix, drawn with plot()
+        var series = [];
+        var i = 0;
+        while (i < 90) { series.push(ascii_screen.sin(i * 0.22 + t * 3.0) * 0.6 + ascii_screen.sin(i * 0.09 - t * 1.3) * 0.4); i += 1; }
+        ascii_screen.hires_clear(layer);
+        ascii_screen.plot(layer, series, "color", "#7fd1ff", "min", -1.0, "max", 1.0);
+        ascii_screen.box(1, 1, W + 2, H + 2, "style", "round", "title", "plot  (" + modes[mode] + ")", "fg", "cyan");
+        ascii_screen.hires_draw(layer, 2, 2);
+
+        // 2: Lissajous curve
+        ascii_screen.hires_clear(layer);
+        i = 0;
+        var lx = pw / 2;
+        var ly = ph / 2;
+        while (i <= 200) {
+            let a = i * 0.0314159 * 2.0;
+            let x = ascii_screen.floor(pw / 2.0 + ascii_screen.sin(3.0 * a + t) * (pw / 2.0 - 1));
+            let y = ascii_screen.floor(ph / 2.0 + ascii_screen.sin(2.0 * a) * (ph / 2.0 - 1));
+            if (i > 0) { ascii_screen.hires_line(layer, lx, ly, x, y, ascii_screen.hsv(i / 200.0, 0.8, 1.0)); }
+            lx = x; ly = y;
+            i += 1;
+        }
+        ascii_screen.box(W + 5, 1, W + 2, H + 2, "style", "round", "title", "lissajous", "fg", "magenta");
+        ascii_screen.hires_draw(layer, W + 6, 2);
+
+        // 3: spinning polygon + circles
+        ascii_screen.hires_clear(layer);
+        let cx = pw / 2;
+        let cy = ph / 2;
+        let r = ascii_screen.min(pw / 4, ph / 2) - 1;
+        var k = 0;
+        while (k < 5) {
+            let a0 = t + k * 1.2566;
+            let a1 = t + (k + 2) * 1.2566;
+            ascii_screen.hires_line(layer, cx + ascii_screen.floor(ascii_screen.cos(a0) * r * 2), cy + ascii_screen.floor(ascii_screen.sin(a0) * r), cx + ascii_screen.floor(ascii_screen.cos(a1) * r * 2), cy + ascii_screen.floor(ascii_screen.sin(a1) * r), "#ffd166");
+            k += 1;
+        }
+        ascii_screen.hires_circle(layer, cx, cy, ascii_screen.floor(r * (0.5 + 0.4 * ascii_screen.sin(t * 2.0))), "#ef476f");
+        ascii_screen.box(1, H + 4, W + 2, H + 2, "style", "round", "title", "polygon", "fg", "yellow");
+        ascii_screen.hires_draw(layer, 2, H + 5);
+
+        ascii_screen.text(W + 6, H + 6, "braille = 2x4 dots per cell", "fg", "gray");
+        ascii_screen.text(W + 6, H + 7, "quad    = 2x2 blocks per cell", "fg", "gray");
+        ascii_screen.text(W + 6, H + 8, "half    = 1x2 blocks per cell", "fg", "gray");
+        ascii_screen.text(W + 6, H + 10, "space cycles the mode, q quits", "fg", "#a0e0a0");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

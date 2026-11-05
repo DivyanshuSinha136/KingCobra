@@ -1,0 +1,36 @@
+// std.game — every built-in "custom" model, auto-arranged, slowly turning.
+// Pass your own model path as the first script argument slot below to see it too:
+//   edit `extra` to a .glb / .gltf / .fbx / .obj / .pskx / .stl / .ply file.
+import std.game;
+
+let extra = "";
+var t = 0.0;
+var names = [];
+
+fn update(dt) {
+    t += dt;
+    if (game.key_pressed("escape")) { game.quit(); }
+    let a = t * 0.15;
+    game.camera(game.dsin(a * 57.3) * 22.0, 9.0, game.dcos(a * 57.3) * 22.0, a * 57.3, -18.0);
+}
+fn draw() {
+    var i = 0;
+    let n = len(names);
+    while (i < n) {
+        let col = i % 8;
+        let row = i / 8;
+        game.draw_model(names[i], -14.0 + col * 4.0, 0.0, -8.0 + row * 5.0, "yaw", t * 40.0);
+        i += 1;
+    }
+    if (extra != "") { game.draw_model(extra, 0.0, 0.0, 12.0, "yaw", t * 40.0); }
+    game.text(8, 8, "std.game built-in models: " + n, "white", 1, true);
+}
+fn main() {
+    game.window("KingCobra models", 800, 450);
+    game.sky("#8fb8e8");
+    game.fog("exp", 30.0, 90.0);
+    game.light(-0.4, -0.9, -0.3, "#ffffff", 0.45);
+    names = game.models();
+    if (extra != "") { game.model_load(extra, "ground", true, "scale", 1.0); }
+    game.run(update, draw, 0);
+}

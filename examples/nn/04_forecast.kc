@@ -1,0 +1,52 @@
+// std.nn example 4 — time-series forecasting with an LSTM.
+// Shows: window_series to build training pairs, standardisation, an LSTM regressor, and a multi-step
+//        forecast by feeding predictions back in — compared against a naive "repeat the last value" baseline.
+import std.nn;
+
+fn main() {
+    nn.seed(11);
+    let T = 420;
+    // A series with two seasonalities, a slow trend and a little noise
+    let t = nn.arange(T);
+    let series = nn.add(nn.add(nn.sin(nn.mul(t, 0.15)), nn.mul(nn.sin(nn.mul(t, 0.047)), 0.5)),
+                        nn.add(nn.mul(t, 0.002), nn.randn([T], 0.05)));
+
+    let train_len = 360;
+    let mu = nn.item(nn.mean(nn.slice(series, 0, train_len)));
+    let sd = nn.item(nn.std(nn.slice(series, 0, train_len)));
+    let z = nn.div(nn.sub(series, mu), sd);                          // standardised with training statistics only
+
+    let window = 24;
+    let w = nn.window_series(nn.slice(z, 0, train_len), window);     // X [S,24,1], Y [S,1]
+    print("training windows:", nn.shape(w[0]), "->", nn.shape(w[1]));
+
+    let model = nn.sequential([nn.lstm(1, 32), nn.dense(32, 1)]);
+    let h = nn.fit(model, "mse", "adam", w[0], w[1], "epochs", 60, "batch_size", 32, "lr", 0.01,
+                   "clip_norm", 1.0, "val_split", 0.15, "patience", 10, "verbose", 20);
+
+    // Forecast the 60 unseen steps recursively: predict one step, append it, slide the window.
+    let horizon = T - train_len;
+    var hist = nn.to_array(nn.slice(z, train_len - window, train_len));     // last 24 known values
+    let fc = [];
+    var k = 0;
+    while (k < horizon) {
+        let inp = [];
+        var j = 0;
+        while (j < window) { inp.push([hist[j]]); j = j + 1; }
+        let nxt = nn.predict(model, [inp])[0][0];
+        fc.push(nxt);
+        hist.push(nxt);
+        hist = nn.to_array(nn.slice(hist, 1, window + 1));
+        k = k + 1;
+    }
+    let truth = nn.slice(z, train_len, T);
+    let rmse_model = nn.metric("rmse", fc, truth);
+    let last = nn.item(nn.slice(z, train_len - 1, train_len));
+    let rmse_naive = nn.metric("rmse", nn.mul(nn.ones([horizon]), last), truth);
+    print("60-step recursive forecast RMSE (standardised units): model", rmse_model, " naive last-value", rmse_naive);
+
+    print("step   truth   forecast");
+    let tr = nn.to_array(truth);
+    k = 0;
+    while (k < horizon) { print("  ", k + 1, "  ", tr[k], "  ", fc[k]); k = k + 12; }
+}

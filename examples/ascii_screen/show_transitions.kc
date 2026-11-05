@@ -1,0 +1,40 @@
+// std.ascii_screen showcase 8/10 — screen transitions between two live scenes (plasma <-> title card).
+// space = next transition kind   q = quit
+import std.ascii_screen;
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: transitions", "fps", 30);
+    let w = ascii_screen.width();
+    let h = ascii_screen.height();
+    let kinds = ["fade", "dissolve", "wipe_left", "wipe_right", "wipe_up", "wipe_down", "iris", "curtain", "blinds", "slide_left", "slide_right"];
+    let a = ascii_screen.canvas(w, h);
+    let b = ascii_screen.canvas(w, h);
+    let plasma = ascii_screen.effect("plasma", w, h);
+    let tunnel = ascii_screen.effect("tunnel", w, h);
+    var k = 0;
+    var t = 0.0;
+    var dir = 1.0;
+    while (ascii_screen.poll()) {
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        if (ascii_screen.key_pressed("space")) { k = (k + 1) % kinds.len; t = 0.0; dir = 1.0; }
+        t += dir * ascii_screen.dt() * 0.5;
+        if (t >= 1.0) { t = 1.0; dir = -1.0; }
+        if (t <= 0.0) { t = 0.0; dir = 1.0; }
+
+        ascii_screen.target(a);
+        ascii_screen.clear();
+        ascii_screen.effect_draw(plasma, 0, 0);
+        ascii_screen.big_text(w / 2, h / 2 - 3, "PLASMA", "font", "half", "align", "center", "fg", "white", "shadow", "#202020");
+        ascii_screen.target(b);
+        ascii_screen.clear();
+        ascii_screen.effect_draw(tunnel, 0, 0);
+        ascii_screen.big_text(w / 2, h / 2 - 3, "TUNNEL", "font", "half", "align", "center", "fg", "#ffd166", "shadow", "#202020");
+        ascii_screen.target(0);
+
+        ascii_screen.begin();
+        ascii_screen.transition(kinds[k], a, b, t);
+        ascii_screen.text(2, h - 1, "transition: " + kinds[k] + "   space: next   q: quit", "fg", "white", "bg", "#101018");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}

@@ -1,0 +1,158 @@
+// SHOWCASE 6 — A binary telemetry protocol: encode, corrupt, recover (systems programming, safely)
+//
+// What you would normally write in C, with the memory-safety net left on. Sensors send framed binary
+// packets; the wire is noisy. We
+//   • define the wire format as `packed struct`s (exact byte layout, no padding),
+//   • encode frames into a byte buffer with a CRC-16,
+//   • damage the stream (bit flip, junk bytes, a truncated tail),
+//   • decode it with typed struct POINTERS over the raw bytes, re-synchronizing on the magic number,
+//   • and prove that memory errors are caught errors, never silent corruption.
+//
+// Uses: packed struct, sizeof/offsetof, buffer(), pointer casts and arithmetic, bitwise ops, defer/free,
+//       try/catch, mem_stats() leak check.
+//
+// Run:  kingcobra examples/showcase/06_telemetry_protocol.kc          (and: kingcobra --leaks <file>)
+const MAGIC = 0xC0B4;
+
+packed struct Header  { magic: u16, version: u8, kind: u8, count: u16, seq: u32 }      // 10 bytes
+packed struct Reading { sensor: u16, value: f32, ts: u32 }                              // 10 bytes
+const TRAILER = 2;                                                                       // CRC-16
+
+// CRC-16/CCITT-FALSE over buf[lo .. hi)
+fn crc16(buf, lo: int, hi: int) -> int {
+    var crc = 0xFFFF;
+    for (i in lo..hi) {
+        crc = crc ^ (buf.get_u8(i) << 8);
+        for (bit in 0..8) {
+            if (crc & 0x8000 != 0) { crc = ((crc << 1) ^ 0x1021) & 0xFFFF; }
+            else { crc = (crc << 1) & 0xFFFF; }
+        }
+    }
+    return crc;
+}
+
+fn fmt1(x: float) -> string {
+    let t = int(abs(x) * 10 + 0.5);
+    return (x < 0 ? "-" : "") + f"{idiv(t, 10)}.{t % 10}";
+}
+
+// ---------------------------------------------------------------- encoder
+fn encode_frame(out, seq: int, readings) {
+    let start = out.pos;
+    out.write_u16(MAGIC);
+    out.write_u8(1);                      // version
+    out.write_u8(7);                      // kind: temperature
+    out.write_u16(len(readings));
+    out.write_u32(seq);
+    for (r in readings) {
+        out.write_u16(r[0]);
+        out.write_f32(r[1]);
+        out.write_u32(r[2]);
+    }
+    out.write_u16(crc16(out, start, out.pos));
+}
+
+// ---------------------------------------------------------------- decoder
+struct Stats { frames: int, readings: int, bad_crc: int, junk_bytes: int, truncated: int }
+
+fn decode(stream, sink) -> Stats {
+    var st = Stats { frames: 0, readings: 0, bad_crc: 0, junk_bytes: 0, truncated: 0 };
+    var pos = 0;
+    let n = len(stream);
+    while (pos + sizeof(Header) + TRAILER <= n) {
+        if (stream.get_u16(pos) != MAGIC) { st.junk_bytes += 1; pos += 1; continue; }     // resync
+        let h = (stream.ptr + pos) as *Header;                                             // typed view, no copy
+        let total = sizeof(Header) + h->count * sizeof(Reading) + TRAILER;
+        if (pos + total > n) { st.truncated += 1; break; }
+        if (crc16(stream, pos, pos + total - TRAILER) != stream.get_u16(pos + total - TRAILER)) {
+            st.bad_crc += 1; pos += 1; continue;                                           // not a real frame: keep scanning
+        }
+        let recs = (h + 1) as *Reading;                                                    // records follow the header
+        for (i in 0..h->count) {
+            let r = recs[i];
+            sink.push([r.sensor, r.value, r.ts]);
+            st.readings += 1;
+        }
+        st.frames += 1;
+        pos += total;
+    }
+    return st;
+}
+
+fn run() {
+    print(f"wire format: Header = {sizeof(Header)} bytes (count at offset {offsetof(Header, count)}, seq at {offsetof(Header, seq)}), Reading = {sizeof(Reading)} bytes");
+
+    // ---- encode 6 frames; sensors 1..3 report slowly rising temperatures ----
+    let stream = buffer(4096);
+    defer stream.free();
+    var sent = 0;
+    var frame_starts = [];
+    for (seq in 0..6) {
+        var rs = [];
+        for (sensor in 1..4) { rs.push([sensor, 20.0 + sensor * 2 + seq * 0.25, 1000 + seq * 10]); }
+        frame_starts.push(stream.pos);
+        encode_frame(stream, seq, rs);
+        sent += len(rs);
+    }
+    let good_len = stream.pos;
+    print(f"encoded 6 frames, {sent} readings, {good_len} bytes");
+
+    // ---- 1. clean channel ----
+    let clean = []; 
+    let s1 = decode(stream.slice(0, good_len), clean);
+    print(f"\nclean channel : frames={s1.frames} readings={s1.readings} bad_crc={s1.bad_crc} junk={s1.junk_bytes} truncated={s1.truncated}");
+    assert_eq(s1.readings, sent);
+
+    // ---- 2. noisy channel: flip a bit in frame 2, insert junk before frame 4, cut the tail of frame 5 ----
+    let noisy = buffer(good_len + 64);
+    defer noisy.free();
+    let cut = frame_starts[3];
+    noisy.copy_from(stream, 0, 0, cut);                                      // frames 0..2
+    noisy.seek(cut);
+    noisy.write_str("\x00\x13garbage!\xff");                                 // 11 bytes of line noise
+    let tail = frame_starts[5] + 25 - cut;                                   // frames 3 and 4, plus only 25 bytes of frame 5
+    noisy.copy_from(stream, cut, cut + 11, tail);
+    let noisy_len = cut + 11 + tail;
+    noisy.put_u8(frame_starts[2] + 14, noisy.get_u8(frame_starts[2] + 14) ^ 0x10);   // single bit flip inside frame 2
+    let dirty = [];
+    let s2 = decode(noisy.slice(0, noisy_len), dirty);
+    print(f"noisy channel : frames={s2.frames} readings={s2.readings} bad_crc={s2.bad_crc} junk={s2.junk_bytes} truncated={s2.truncated}");
+    assert_eq(s2.frames, 4);            // frames 0,1,3,4 survive; 2 is corrupt; 5 is cut off
+    assert(s2.bad_crc >= 1 && s2.truncated == 1 && s2.junk_bytes >= 11, "each kind of damage must be detected");
+    print("  (junk counts every byte skipped while re-synchronizing, including the 41 left over from the corrupt frame)");
+    print("  -> corrupted frame rejected by CRC, junk skipped, partial tail detected, decoder re-synchronized");
+
+    // ---- aggregate what survived ----
+    let agg = {};
+    for (r in dirty) {
+        let k = str(r[0]);
+        let a = agg[k] ?? { n: 0, sum: 0.0, lo: 1e9, hi: -1e9 };
+        a["n"] += 1; a["sum"] += r[1];
+        if (r[1] < a["lo"]) { a["lo"] = r[1]; }
+        if (r[1] > a["hi"]) { a["hi"] = r[1]; }
+        agg[k] = a;
+    }
+    for (k in keys(agg)) {
+        let a = agg[k];
+        print(f"  sensor {k}: n={a["n"]} min={fmt1(a["lo"])} max={fmt1(a["hi"])} mean={fmt1(a["sum"] / a["n"])} C");
+    }
+
+    // ---- 3. memory safety: these would be silent corruption in C ----
+    print("\nmemory safety (each of these is an error you can catch, not undefined behaviour):");
+    try { let r = (stream.ptr + good_len + 4000) as *Reading; print(r->value); }
+    catch (e) { print("  out-of-bounds read    ->", e.message); }
+    try { let blk = alloc(16) as *u32; free(blk); blk[0] = 1; }
+    catch (e) { print("  use after free        ->", e.message); }
+    try { let blk = alloc(16); free(blk); free(blk); }
+    catch (e) { print("  double free           ->", e.message); }
+    try { let none: *Header = null; print(none->seq); }
+    catch (e) { print("  null dereference      ->", e.message); }
+}
+
+fn main() {
+    let before = mem_stats().regions_live;
+    run();
+    let after = mem_stats().regions_live;
+    print(f"\nleak check: live memory regions before={before} after={after}");
+    assert_eq(after, before);       // `defer` released every buffer on every path
+}

@@ -1,0 +1,85 @@
+import std.nlp;
+
+fn main() {
+    // ---- cleanup & normalization (UTF-8 aware) ----
+    print("lower:", nlp.lower("ÀÉÎ ΑΒΓ ПРИВЕТ"), " upper:", nlp.upper("straße"), " title:", nlp.title("hello wORLD"));
+    print("accents:", nlp.strip_accents("Crème brûlée, Zoë, Łódź"));
+    print("normalize:", nlp.normalize("  “Smart” quotes — and…  ÉCOLE  "));
+    print("slug:", nlp.slugify("Hello, World! Crème Brûlée & more"));
+    print("contractions:", nlp.expand_contractions("I can't go, they're late and it's fine. Don't!"));
+    print("html:", nlp.strip_html("<p>Hi &amp; welcome<script>x=1</script> <b>bold</b></p>"));
+
+    // ---- segmentation ----
+    print("tokens:", nlp.tokenize("Hello, World! It's 3.14 o'clock — don't panic, café."));
+    print("tokens lp:", nlp.tokenize("Hello, World!", "lp"));
+    print("clitics:", nlp.tokenize("I can't, it's they're", "lc"));
+    print("sentences:", nlp.sentences("Dr. Smith went to Washington. He arrived at 3 p.m. It was cold! Was it? Yes."));
+    print("ngrams:", nlp.ngrams(["a", "b", "c", "d"], 2), " char:", nlp.char_ngrams("abcd", 3));
+
+    // ---- linguistics ----
+    print("stems:", nlp.stem_all(["running", "caresses", "ponies", "relational", "happiness", "controlling"]));
+    print("stopword:", nlp.is_stopword("The"), nlp.is_stopword("cobra"), " kept:", nlp.remove_stopwords(["the", "cat", "is", "on", "a", "mat"]));
+    print("soundex:", nlp.soundex("Robert"), nlp.soundex("Rupert"), nlp.soundex("Pfister"));
+    print("syllables:", nlp.syllables("beautiful"), nlp.syllables("syllable"));
+    let r = nlp.readability("The cat sat on the mat. It was a sunny day.");
+    print("readability:", r.words, "words,", r.sentences, "sentences, flesch", r.flesch);
+
+    // ---- similarity & fuzzy matching ----
+    print("levenshtein:", nlp.levenshtein("kitten", "sitting"), " damerau:", nlp.damerau("ca", "ac"), " hamming:", nlp.hamming("karolin", "kathrin"), " lcs:", nlp.lcs("AGGTAB", "GXTXAYB"));
+    print("jaro:", nlp.jaro("MARTHA", "MARHTA"), " jaro_winkler:", nlp.jaro_winkler("MARTHA", "MARHTA"), " dice:", nlp.dice("night", "nacht"));
+    print("jaccard:", nlp.jaccard("the cat sat", "the cat ran"), " cosine:", nlp.cosine("a b b", "b b c"), " vec:", nlp.cosine([1, 0, 1], [1, 1, 0]));
+    print("closest:", nlp.closest("recieve", ["receive", "relieve", "deceive"]));
+    print("fuzzy:", nlp.fuzzy("aple", ["apple", "banana", "grape"], 2));
+    let h1 = nlp.simhash("the quick brown fox jumps over the lazy dog");
+    let h2 = nlp.simhash("the quick brown fox jumped over the lazy dog");
+    print("simhash near-dup distance:", nlp.hamming_bits(h1, h2));
+
+    // ---- statistics ----
+    let text = "Natural language processing is a field of computer science. It studies how computers understand human language. Language models predict the next word in a sentence. Researchers build language models using large text corpora.";
+    let toks = nlp.tokenize(text, "l");
+    print("freq:", nlp.freq(nlp.remove_stopwords(toks), 3));
+    print("collocations:", nlp.collocations(toks, 2, 2));
+    print("stats:", nlp.stats(text));
+    print("keywords:", nlp.keywords(text, 3));
+    print("summary:", nlp.summarize(text, 2));
+
+    // ---- ranked search (BM25) ----
+    let docs = ["the cat sat on the mat", "the dog chased the cat", "dogs and cats are pets",
+                "stock markets fell sharply today", "investors sold stocks as markets fell"];
+    let idx = nlp.bm25_new(docs);
+    print("bm25 'markets fell':", nlp.bm25_search(idx, "markets fell", 2));
+
+    // ---- TF-IDF vectors ----
+    let tf = nlp.tfidf_fit(docs);
+    print("tfidf vocab:", nlp.tfidf_size(tf), "terms; sparse row:", nlp.tfidf_sparse(tf, "cat cat dog"));
+    let a = nlp.tfidf_vector(tf, docs[0]);
+    print("doc similarity: cat/dog =", nlp.cosine(a, nlp.tfidf_vector(tf, docs[1])), " cat/stocks =", nlp.cosine(a, nlp.tfidf_vector(tf, docs[3])));
+
+    // ---- naive Bayes text classifier ----
+    let nb = nlp.nb_new();
+    nlp.nb_train_many(nb, ["great movie loved it", "wonderful acting and plot", "fantastic fun film",
+                           "terrible boring waste", "awful plot bad acting", "hated this horrible film"],
+                          ["pos", "pos", "pos", "neg", "neg", "neg"]);
+    print("nb:", nlp.nb_predict(nb, "what a great fun film"), nlp.nb_predict(nb, "boring and awful"), nlp.nb_scores(nb, "loved the wonderful plot"));
+
+    // ---- spelling correction ----
+    let sp = nlp.spell_new("the quick brown fox jumps over the lazy dog the fox the dog receive believe because");
+    print("spell:", nlp.spell_correct(sp, "teh"), nlp.spell_correct(sp, "quikc"), nlp.spell_correct(sp, "Recieve"), nlp.spell_suggest(sp, "dgo", 2));
+
+    // ---- sentiment, language ----
+    print("sentiment:", nlp.sentiment("I absolutely LOVE this, it's great!!!"));
+    print("negation:", nlp.sentiment_label("This is not good at all."), " mixed:", nlp.sentiment("The food was great but the service was terrible.").compound);
+    print("lang:", nlp.detect_lang("El gato está en la casa y no quiere salir de la cama").lang,
+          nlp.detect_lang("Ich habe das nicht gewusst und wir sind nach Hause gegangen").lang,
+          nlp.detect_lang("Привет, как дела?").lang, nlp.detect_lang("こんにちは世界").lang);
+
+    // ---- extraction ----
+    let msg = "Mail bob.smith@example.co.uk or ping @alice_w. See https://example.com/a?b=1, www.test.org/page). Cost: -42 or 1,234.50. #KingCobra";
+    print("emails:", nlp.emails(msg), " urls:", nlp.urls(msg));
+    print("mentions:", nlp.mentions(msg), " hashtags:", nlp.hashtags(msg), " numbers:", nlp.numbers(msg));
+
+    // ---- chunking for retrieval / LLM pipelines ----
+    let chunks = nlp.chunk(text, 120, 40);
+    print("chunks:", len(chunks));
+    for (c in chunks) { print("  |", c); }
+}

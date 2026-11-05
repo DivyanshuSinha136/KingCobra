@@ -1,0 +1,8 @@
+#pragma once
+// config.kc: a header, spliced in by #include. #pragma once makes a second include a no-op.
+#define APP_NAME "demo"
+#define VERSION_MAJOR 2
+#define VERSION_MINOR 1
+#define VERSION (VERSION_MAJOR * 100 + VERSION_MINOR)
+#define LOG(level, fmt, ...) printf("[" level "] " fmt "\n", __VA_ARGS__)
+fn banner() -> string { return sprintf("%s v%d.%d", APP_NAME, VERSION_MAJOR, VERSION_MINOR); }

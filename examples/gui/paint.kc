@@ -1,0 +1,78 @@
+// Mouse-driven canvas demo: drag to draw, pick a color, adjust brush size.
+// Run:  ./kingcobra run examples/gui/paint.kc
+import std.gui;
+
+var strokes = [];        // each stroke: [color, size, x, y, x, y, ...]
+var current = 0;
+var color = "#ff8800";
+var brush = 6;
+var drawing = false;
+var canvas = 0;
+
+fn render(id, w, h) {
+    gui.clear("#101018");
+    for (s in strokes) {
+        let c = s[0];
+        let sz = s[1];
+        var i = 2;
+        gui.circle(s[2], s[3], sz / 2, c);
+        while (i + 3 < len(s)) {
+            gui.line(s[i], s[i + 1], s[i + 2], s[i + 3], c, sz);
+            i += 2;
+        }
+    }
+}
+
+fn pressed(id, x, y, button) {
+    strokes.push([color, brush, x, y]);
+    drawing = true;
+}
+
+fn moved(id, x, y) {
+    if (!drawing) { return; }
+    let s = strokes[len(strokes) - 1];
+    s.push(x);
+    s.push(y);
+    gui.invalidate();
+}
+
+fn released(id, x, y, button) { drawing = false; }
+
+fn pick(id) { color = gui.get(id, "text"); }
+fn set_brush(id, v) { brush = v; }
+fn clear_all(id) { strokes = []; gui.invalidate(); }
+
+fn main() {
+    gui.window("KingCobra Paint", 960, 560);
+
+    let bar = gui.hbox(0);
+    gui.label(bar, "Color:");
+    gui.button(bar, "#ff8800", pick);
+    gui.button(bar, "#33cc99", pick);
+    gui.button(bar, "#4c8dff", pick);
+    gui.button(bar, "#ff4466", pick);
+    gui.button(bar, "#ffffff", pick);
+    gui.spacer(bar);
+    gui.label(bar, "Brush:");
+    let sl = gui.slider(bar, 2, 30, brush, set_brush);
+    gui.set(sl, "width", 120);
+    gui.set(sl, "step", 1);
+    gui.button(bar, "Clear", clear_all);
+
+    canvas = gui.canvas(0, 100, 100, render);
+    gui.set(canvas, "weight", 1);
+    gui.set(canvas, "width", 0);
+    gui.set(canvas, "height", 0);
+    gui.on(canvas, "mouse_down", pressed);
+    gui.on(canvas, "mouse_move", moved);
+    gui.on(canvas, "mouse_up", released);
+
+    if (gui.is_headless()) {
+        pressed(canvas, 50, 50, 1);
+        moved(canvas, 120, 90);
+        moved(canvas, 220, 60);
+        released(canvas, 220, 60, 1);
+        print("headless: wrote", gui.screenshot("/tmp/kingcobra_paint.bmp"), "bytes");
+    }
+    gui.run();
+}

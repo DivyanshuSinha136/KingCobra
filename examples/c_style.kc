@@ -1,0 +1,95 @@
+// C-style KingCobra (v0.8): the control flow, operators and standard library a C programmer expects.
+#define TABLE_SIZE 8
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define CHECK(cond) assert(cond, "check failed: " #cond)
+
+enum Op { Add, Sub, Mul, Halt }
+
+// static locals: initialised once, kept between calls
+fn next_id() -> int {
+    static counter = 100;
+    return counter++;
+}
+
+// switch with C fall-through, grouped cases and default
+fn describe(code: int) -> string {
+    switch (code) {
+        case 0:
+            return "zero";
+        case 1, 2, 3:
+            return "small";
+        case 4:
+        case 5:
+            return "medium";
+        default:
+            return "large";
+    }
+    return "?";
+}
+
+// a tiny stack machine: switch on an enum, goto for the error path
+fn run(program: int[]) -> int {
+    var stack = [0; 16];
+    var sp = 0, pc = 0;
+    while (true) {
+        let op = program[pc++];
+        switch (op) {
+            case Op.Add: stack[sp - 2] += stack[sp - 1]; sp--; break;
+            case Op.Sub: stack[sp - 2] -= stack[sp - 1]; sp--; break;
+            case Op.Mul: stack[sp - 2] *= stack[sp - 1]; sp--; break;
+            case Op.Halt: goto done;
+            default:      stack[sp++] = op - 10;          // any other number pushes (number - 10)
+        }
+    }
+    done:
+    return stack[0];
+}
+
+fn main() -> int {
+    // for (init; cond; step) with the comma operator, ++ / -- in both forms
+    printf("%-6s %-6s %s\n", "n", "n^2", "binary");
+    for (var i = 1, sq = 1; i <= 5; i++, sq = i * i) {
+        printf("%-6d %-6d %#b\n", i, sq, sq);
+    }
+
+    // do-while: the body runs at least once
+    var n = 27, steps = 0;
+    do {
+        n = (n % 2 == 0) ? n / 2 : 3 * n + 1;
+        steps++;
+    } while (n != 1);
+    printf("collatz(27) takes %d steps\n", steps);
+
+    // switch + static
+    for (var c = 0; c <= 6; c += 2) printf("%d -> %s\n", c, describe(c));
+    printf("ids: %d %d %d\n", next_id(), next_id(), next_id());
+
+    // the stack machine: (3 + 4) * 5  ->  push 13, push 14, Add, push 15, Mul
+    CHECK(run([13, 14, Op.Add, 15, Op.Mul, Op.Halt]) == 35);
+    printf("3+4 times 5 = %d\n", run([13, 14, Op.Add, 15, Op.Mul, Op.Halt]));
+
+    // arrays, qsort with a comparator, bsearch
+    var a = [9, 4, 7, 1, 8, 2, 6, 3];
+    qsort(a, fn(x, y) { return x - y; });
+    printf("sorted: %s  (7 is at index %d)\n", a, bsearch(a, 7, fn(k, e) { return k - e; }));
+    printf("MAX(3, %d) = %d, TABLE_SIZE = %d\n", len(a), MAX(3, len(a)), TABLE_SIZE);
+
+    // C strings: strlen/strcmp/strstr/toupper and a hand-rolled word counter with isspace
+    let text = "  the quick  brown fox ";
+    var words = 0, in_word = false;
+    for (var i = 0; i < strlen(text); i++) {
+        if (isspace(char(text, i))) { in_word = false; }
+        else if (!in_word) { in_word = true; words++; }
+    }
+    printf("%d words, 'quick' at %d, %s\n", words, strstr(text, "quick"), toupper("done"));
+
+    // unions: one memory, two views (reinterpreting float bits)
+    union Bits { as_int: u32, as_float: f32 }
+    let b = alloc(sizeof(Bits)) as *Bits;
+    b->as_float = 1.5;
+    printf("1.5f is 0x%08X as bits\n", b->as_int);
+    free(b);
+
+    // main's return value is the process exit status
+    return 0;
+}

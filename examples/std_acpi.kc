@@ -1,0 +1,29 @@
+import std.acpi;
+
+// Reads real firmware tables via the OS (no `unsafe`, no root on most Linux
+// systems for the FADT/MADT/MCFG...; some distros restrict /sys/firmware/acpi).
+fn main() {
+    if (!acpi.available()) {
+        print("no ACPI tables exposed on this machine (", acpi.last_error(), ")");
+        return;
+    }
+    print("tables:", acpi.list());
+
+    let fadt = acpi.load("FACP");
+    if (fadt == null) { print("FACP:", acpi.last_error()); return; }
+    print("FADT rev", acpi.revision(fadt), "oem", acpi.oem_id(fadt),
+          "checksum ok:", acpi.checksum_ok(fadt));
+    print("profile:", acpi.get(fadt, "pm_profile_name"), " flags:", acpi.flags(fadt));
+
+    let madt = acpi.load("APIC");
+    if (madt != null) {
+        var n = 0;
+        for (e in acpi.entries(madt)) {
+            if (e[0] == "lapic") { n += 1; }
+        }
+        print("MADT: local APICs =", n, " total entries =", len(acpi.entries(madt)));
+    }
+
+    let p = acpi.power();
+    print("power: ac_online =", p[0], " battery% =", p[2]);
+}

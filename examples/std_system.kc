@@ -1,0 +1,59 @@
+// std.system tour — information, environment, paths, files, time, processes.
+// The std.system functions are portable; the shell commands used in the
+// "processes" section (sleep, cat, echo 1>&2) are POSIX — on Windows swap in
+// your own commands.
+import std.system;
+import std.io;
+
+fn main() {
+    // --- what machine is this? -------------------------------------------
+    let i = system.info();
+    print("os:", i.os, i.os_version, "| arch:", i.arch, "| cpus:", i.cpus);
+    print("platform:", system.platform(), "| pid:", system.pid(), "| cwd:", system.cwd());
+
+    // --- environment (setenv is visible to getenv on every OS) ------------
+    system.setenv("KC_DEMO", "kingcobra");
+    print("env:", system.getenv("KC_DEMO"), system.has_env("KC_DEMO"), system.getenv_or("KC_MISSING", "fallback"));
+    print("expand:", system.expand_env("demo=${KC_DEMO} literal=$$"));
+
+    // --- paths (pure string work) ----------------------------------------
+    let p = system.path_join("project", "src", "main.kc");
+    print("path:", p, "| base:", system.basename(p), "| dir:", system.dirname(p),
+          "| ext:", system.extension(p), "| stem:", system.stem(p));
+    print("normalize:", system.normalize("a/./b/../c//d"));
+
+    // --- a scratch directory: create, populate, inspect, delete -----------
+    let root = system.make_temp_dir("kc_demo_");
+    let deep = system.path_join(root, "a", "b");
+    system.mkdir(deep, true);
+    io.write_file(system.path_join(deep, "note.txt"), "hello");
+    system.copy_file(system.path_join(deep, "note.txt"), system.path_join(root, "copy.txt"));
+    print("listing:", system.list_dir(root), "| size of copy:", system.stat(system.path_join(root, "copy.txt")).size);
+    if (system.mkdir(deep) == false) {
+        print("mkdir on an existing dir fails softly:", system.last_error() != "");
+    }
+    system.rmdir(root, true);
+    print("cleaned up:", system.exists(root) == false);
+
+    // --- time -------------------------------------------------------------
+    print("epoch + 1 day (UTC):", system.format_time(86400, "%Y-%m-%d %H:%M:%S", true));
+    let t = system.monotonic();
+    system.sleep(0.05);
+    print("slept at least 50ms:", system.monotonic() - t >= 0.049);
+
+    // --- processes --------------------------------------------------------
+    let r = system.run("echo to-stdout; echo to-stderr 1>&2; exit 3");
+    print("run:", r.code, "stdout:", r.stdout, "stderr:", r.stderr);
+    let safe = system.run_argv(["echo", "no shell, so $HOME and * stay literal"]);
+    print("run_argv:", safe.stdout);
+    print("stdin + timeout:", system.run_argv(["cat"], "fed through stdin", 5.0).stdout);
+    let slow = system.run("sleep 30", null, 0.2);
+    print("timed out and was killed:", slow.timed_out);
+
+    // a long-lived child we talk to
+    let child = system.spawn(["cat"], true);
+    system.proc_write(child, "ping\n");
+    system.proc_close_stdin(child);
+    print("spawned child exited with", system.wait(child, 5.0), "and said:", system.proc_read(child));
+    system.proc_free(child);
+}

@@ -1,0 +1,25 @@
+// KingCobra v0.2 — match expressions: a switch-like expression over
+// literal patterns, with `_` as a required-or-error wildcard.
+
+fn describe(n: int) -> string {
+    return match (n) {
+        0 => "zero",
+        1 => "one",
+        2 => "two",
+        _ => "many",
+    };
+}
+
+fn main() {
+    for (i in 0..5) {
+        print(i, "->", describe(i));
+    }
+
+    let s = "b";
+    let r = match (s) {
+        "a" => 1,
+        "b" => 2,
+        _ => -1,
+    };
+    print("match on string 'b' ->", r);
+}

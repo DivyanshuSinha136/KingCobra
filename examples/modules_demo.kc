@@ -1,0 +1,10 @@
+// KingCobra v0.2 — a real, file-based module system. Import paths
+// resolve relative to the importing file's own directory.
+import "modules/mathutils.kc";
+import "modules/mathutils.kc" as mu;
+
+fn main() {
+    print("square(5) =", mathutils.square(5));  // default name: file stem
+    print("cube(3) =", mu.cube(3));              // explicit alias
+    print("PI =", mu.PI);
+}

@@ -1,0 +1,50 @@
+import std.fbin;
+
+fn main() {
+    // ---- build a small binary file format in memory ----
+    let b = fbin.buffer();
+    fbin.write_string(b, "KCBN");                 // magic
+    fbin.write_u16(b, 2);                         // version
+    fbin.write_u32(b, 4000000000);                // u32 beyond i32 range
+    fbin.write_i32(b, -123456, "be");             // per-call byte order
+    fbin.write_f64(b, 3.14159);
+    fbin.write_pstring(b, "length-prefixed", 2);
+    fbin.write_cstring(b, "c-string");
+    fbin.write_uvarint(b, 300);
+    fbin.write_svarint(b, -1000);
+    fbin.write_bits(b, 5, 3); fbin.write_bits(b, 1, 1); fbin.write_bits(b, 255, 8);
+    fbin.bit_align(b);
+    print("size:", fbin.size(b));
+    print(fbin.hexdump(b));
+
+    // ---- read it back ----
+    fbin.seek(b, 0);
+    print("magic:", fbin.read_string(b, 4), "version:", fbin.read_u16(b));
+    print("u32:", fbin.read_u32(b), "i32 be:", fbin.read_i32(b, "be"), "f64:", fbin.read_f64(b));
+    print("pstring:", fbin.read_pstring(b, 2), "| cstring:", fbin.read_cstring(b));
+    print("varints:", fbin.read_uvarint(b), fbin.read_svarint(b));
+    print("bits:", fbin.read_bits(b, 3), fbin.read_bits(b, 1), fbin.read_bits(b, 8));
+
+    // ---- struct-style pack / unpack ----
+    let p = fbin.buffer();
+    fbin.pack(p, "<4sHIf?", ["ABCD", 513, 70000, 2.5, true]);
+    print("packed:", fbin.to_hex(p), "size:", fbin.calcsize("<4sHIf?"));
+    fbin.seek(p, 0);
+    print("unpacked:", fbin.unpack(p, "<4sHIf?"));
+    print("network order:", fbin.pack_hex("!BBH", [1, 2, 772]), fbin.unpack_hex("!BBH", "01020304"));
+
+    // ---- files ----
+    let f = fbin.open("/tmp/kingcobra_fbin_demo.bin", "w+");
+    fbin.write_u32(f, 0xdeadbeef);
+    fbin.write_string(f, "tail");
+    fbin.seek(f, 0);
+    print("file u32:", fbin.read_u32(f), "size:", fbin.size(f), "crc32:", fbin.crc32(f));
+    fbin.close(f);
+    let loaded = fbin.load("/tmp/kingcobra_fbin_demo.bin");
+    print("magic check:", fbin.expect_hex(loaded, "efbeadde"), "find:", fbin.find(loaded, "tail"));
+
+    // ---- codecs and hashes ----
+    print("base64:", fbin.to_base64(fbin.from_string("hello world")), fbin.to_string(fbin.from_base64("aGVsbG8=")));
+    print("sha256(abc):", fbin.sha256_string("abc"));
+    print("crc32(123456789):", fbin.crc32_string("123456789"), "u64:", fbin.u64_to_string(fbin.parse_u64("18446744073709551615")));
+}

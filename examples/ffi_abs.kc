@@ -1,0 +1,9 @@
+extern fn abs(x: int) -> int from "libc.so.6";
+
+fn main() {
+    let x = -42;
+    let result = abs(x);
+
+    print("input:", x);
+    print("FFI result:", result);
+}

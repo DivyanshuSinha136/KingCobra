@@ -1,0 +1,74 @@
+import std.mmu;
+
+// std.mmu tour: a software MMU (page tables, TLB, faults, COW, swap) plus the real host VM.
+fn main() {
+    // ---- 1. an x86-64 machine with 64 MiB of simulated RAM
+    let ram = mmu.phys("64M");
+    let cpu = mmu.space("x86_64", ram, "tlb=32,ways=4", "kernel");
+
+    // identity-ish mappings written by hand: code (r-x), data (rw-), a 2 MiB huge page, a device-like page
+    mmu.map(cpu, 0x400000, 0x1000000, "r,x,u");
+    mmu.map(cpu, 0x600000, 0x1001000, "r,w,u");
+    mmu.map(cpu, 0x40000000, 0x1200000, "r,w", 2097152);
+    mmu.map(cpu, "0xFFFF800000000000", 0x1002000, "r,w,g,nc");
+    print(mmu.dump(cpu));
+
+    mmu.write32(cpu, 0x600010, 0xC0FFEE);
+    print("data word  =", mmu.hex(mmu.read32(cpu, 0x600010), 8), "at physical", mmu.hex(mmu.virt_to_phys(cpu, 0x600010)));
+
+    // ---- 2. page-table walk, like a debugger would show it
+    let w = mmu.walk(cpu, 0x600010);
+    for (st in w.steps) { print("  L" + str(st.level), "table", mmu.hex(st.table, 6), "idx", st.index, "entry", mmu.hex(st.raw)); }
+
+    // ---- 3. faults carry the architecture's own status codes
+    print("write to code page:", mmu.write8(cpu, 0x400000, 1, "u"), "->", mmu.last_fault().message);
+    print("user touching kernel page:", mmu.translate(cpu, "0xFFFF800000000000", "r", "u").kind);
+    print("exec of data page allowed:", mmu.can(cpu, 0x600000, "x", "u"));
+
+    // ---- 4. the TLB is real: stale until invalidated
+    let lazy = mmu.space("x86_64", ram, "manual_tlb");
+    mmu.map(lazy, 0x1000, 0x2000000, "r,w");
+    mmu.write8(lazy, 0x1000, 42);
+    mmu.unmap(lazy, 0x1000, 4096);
+    print("stale TLB entry still reads:", mmu.read8(lazy, 0x1000));
+    mmu.tlb_invalidate(lazy, 0x1000);
+    print("after INVLPG:", mmu.read8(lazy, 0x1000), "(", mmu.last_fault().kind, ")");
+
+    // ---- 5. an OS-style process: demand paging, fork + copy-on-write
+    let proc = mmu.space("x86_64", ram, "", "init");
+    let heap = mmu.mmap(proc, null, 16384, "r,w,u", "heap");
+    mmu.write32(proc, heap, 100, "u");
+    print("resident after one write:", mmu.stats(proc).mapped_bytes, "bytes of", 16384);
+    let child = mmu.fork(proc, "child");
+    mmu.write32(child, heap, 200, "u");
+    print("parent sees", mmu.read32(proc, heap, "u"), "- child sees", mmu.read32(child, heap, "u"),
+          "- COW faults:", mmu.stats(child).faults.cow);
+
+    // ---- 6. swap + clock reclaim under memory pressure
+    let small = mmu.phys("2M");
+    mmu.swap_init(small, 128);
+    let vm = mmu.space("riscv_sv39", small);
+    let area = mmu.mmap(vm, null, 32 * 4096, "r,w,u", "anon");
+    for (i in range(32)) { mmu.write32(vm, area + i * 4096, i * i, "u"); }
+    print("reclaimed", mmu.reclaim(vm, 8), "pages, swapped:", mmu.stats(vm).swapped_pages);
+    var sum = 0;
+    for (i in range(32)) { sum += mmu.read32(vm, area + i * 4096, "u"); }
+    print("sum of squares survives swapping:", sum, "swap-ins:", mmu.stats(vm).faults.swap_in);
+
+    // ---- 7. other architectures use the same API
+    for (a in ["x86_32", "arm64", "riscv_sv48"]) {
+        let s = mmu.space(a, mmu.phys("8M"));
+        mmu.map(s, 0x10000, 0x200000, "r,w,u");
+        print(a, "pte =", mmu.hex(mmu.query(s, 0x10000).raw), mmu.query(s, 0x10000).flags);
+    }
+
+    // ---- 8. consistency check + the real host
+    print("verify:", mmu.verify(cpu), mmu.verify(proc));
+    let host = mmu.host_info();
+    print("host page size is a power of two:", host.page_size % 4096 == 0);
+    let r = mmu.host_alloc(4 * host.page_size, "r,w,guard");
+    mmu.host_write32(r, 8, 7);
+    mmu.host_protect(r, 0, host.page_size, "r");
+    print("host: write to read-only page refused:", mmu.host_write32(r, 8, 9) == false, "- value still", mmu.host_read32(r, 8));
+    mmu.host_free(r);
+}

@@ -1,0 +1,18 @@
+// KingCobra v0.3 — native import: load a compiled object file (or a
+// shared library directly) and call into it with no `extern`
+// declaration at all. See examples/native/mathutil.c for the source;
+// build it once with:
+//   cc -fPIC -c examples/native/mathutil.c -o examples/native/mathutil.o
+//
+// The calling convention is INFERRED from the arguments you pass at
+// the call site (all-int -> int64 call/return; all-float -> double
+// call/return) since there's no declaration to read a signature from.
+// For anything that inference can't guess correctly, use a declared
+// `extern fn ... from "lib.so";` instead (see examples/std_ffi.kc).
+import "native/mathutil.o" as mu;
+
+fn main() {
+    print("square(6) =", mu.square(6));
+    print("cube(4) =", mu.cube(4));
+    print("half(7.0) =", mu.half(7.0));
+}

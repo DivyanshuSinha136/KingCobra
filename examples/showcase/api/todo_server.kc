@@ -1,0 +1,95 @@
+// A small JSON REST API (in-memory task store) — started as a child process by 04_rest_api.kc.
+// Routes:  GET /tasks[?done=true|false]   POST /tasks   GET|PUT|DELETE /tasks/<id>   GET /stats   POST /shutdown
+// Auth:    every request needs "Authorization: Bearer <token>"  (token from env KC_TOKEN)
+// Run it alone:  KC_PORT_FILE=/tmp/port KC_TOKEN=secret kingcobra run examples/showcase/api/todo_server.kc
+import std.http;
+import std.json;
+import std.io;
+import std.system;
+
+var tasks = [];
+var next_id = 1;
+
+fn reply(req, status: int, value) {
+    http.respond(req, status, json.stringify(value), ["Content-Type: application/json"]);
+}
+fn fail(req, status: int, msg: string) { reply(req, status, { error: msg }); }
+
+fn find_index(id: int) -> int {
+    for (i in 0..len(tasks)) { if (tasks[i]["id"] == id) { return i; } }
+    return -1;
+}
+
+fn authorized(req, token: string) -> bool {
+    for (h in req.headers) {
+        if (h.lower().starts_with("authorization:") && h.trim().ends_with("Bearer " + token)) { return true; }
+    }
+    return false;
+}
+
+fn handle(req, token: string) -> bool {      // returns false to stop the server
+    if (!authorized(req, token)) { fail(req, 401, "missing or wrong bearer token"); return true; }
+    let parts = req.path.split("/");          // "/tasks/3" -> ["", "tasks", "3"]
+    let m = req.method;
+
+    if (req.path == "/shutdown" && m == "POST") { reply(req, 200, { ok: true }); return false; }
+
+    if (req.path == "/stats" && m == "GET") {
+        var done = 0;
+        for (t in tasks) { if (t["done"]) { done += 1; } }
+        reply(req, 200, { total: len(tasks), done: done, open: len(tasks) - done });
+        return true;
+    }
+    if (parts[1] != "tasks") { fail(req, 404, "no such route"); return true; }
+
+    if (len(parts) == 2) {
+        if (m == "GET") {
+            var want = null;
+            for (pair in http.query_parse(req.query)) { if (pair[0] == "done") { want = pair[1] == "true"; } }
+            let out = [];
+            for (t in tasks) { if (want == null || t["done"] == want) { out.push(t); } }
+            reply(req, 200, out);
+        } else if (m == "POST") {
+            let body = json.try_parse(req.body, null);
+            if (body == null || typeof(body) != "object" || typeof(body["title"]) != "string" || len(body["title"].trim()) == 0) {
+                fail(req, 400, "body must be JSON with a non-empty string 'title'");
+            } else {
+                let t = { id: next_id, title: body["title"].trim(), done: false };
+                next_id += 1;
+                tasks.push(t);
+                http.respond(req, 201, json.stringify(t), ["Content-Type: application/json", "Location: /tasks/" + t["id"]]);
+            }
+        } else { fail(req, 405, "method not allowed"); }
+        return true;
+    }
+
+    let idx = find_index(int(parts[2]));
+    if (idx < 0) { fail(req, 404, "no task " + parts[2]); return true; }
+    if (m == "GET") { reply(req, 200, tasks[idx]); }
+    else if (m == "PUT") {
+        let body = json.try_parse(req.body, null);
+        if (body == null || typeof(body) != "object") { fail(req, 400, "body must be a JSON object"); return true; }
+        if (body["title"] != null) { tasks[idx]["title"] = body["title"]; }
+        if (body["done"] != null) { tasks[idx]["done"] = body["done"]; }
+        reply(req, 200, tasks[idx]);
+    } else if (m == "DELETE") {
+        tasks.remove(idx);
+        http.respond(req, 204, "");
+    } else { fail(req, 405, "method not allowed"); }
+    return true;
+}
+
+fn main() {
+    let token = system.getenv_or("KC_TOKEN", "secret");
+    let s = http.listen(0);
+    let portfile = system.getenv_or("KC_PORT_FILE", "");
+    if (portfile != "") { io.write_file(portfile, "" + http.server_port(s)); }
+    var running = true;
+    while (running) {
+        let req = http.accept(s, 30);
+        if (req == null) { break; }
+        try { running = handle(req, token); }
+        catch (e) { http.respond(req, 500, json.stringify({ error: "internal error: " + e.message }), ["Content-Type: application/json"]); }
+    }
+    http.close(s);
+}

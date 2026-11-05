@@ -1,0 +1,42 @@
+// A tiny KingCobra web server, used by examples/std_http.kc (which starts it as a child process).
+// Run it on its own:   KC_PORT_FILE=/tmp/port kingcobra run examples/http/server.kc
+import std.http;
+import std.io;
+import std.system;
+
+fn main() {
+    let s = http.listen(0);                              // port 0 = pick any free port
+    let portfile = system.getenv_or("KC_PORT_FILE", "");
+    if (portfile != "") { io.write_file(portfile, "" + http.server_port(s)); }
+    print("server: listening on 127.0.0.1:" + http.server_port(s));
+
+    var running = true;
+    while (running) {
+        let req = http.accept(s, 30);                    // give up after 30 s of silence
+        if (req == null) { break; }
+        if (req.path == "/hello") {
+            let q = http.query_parse(req.query);
+            var who = "world";
+            for (pair in q) { if (pair[0] == "name") { who = pair[1]; } }
+            http.respond(req, 200, "Hello, " + who + "!");
+        } else if (req.path == "/echo") {
+            http.respond(req, 200, req.method + " " + len(req.body) + " bytes: " + req.body, ["Content-Type: text/plain"]);
+        } else if (req.path == "/old") {
+            http.respond(req, 302, "", ["Location: /new"]);
+        } else if (req.path == "/new") {
+            http.respond(req, 200, "you were redirected");
+        } else if (req.path == "/file") {
+            var body = "";
+            var i = 0;
+            while (i < 500) { body = body + "line " + i + "\n"; i = i + 1; }
+            http.respond(req, 200, body, ["Content-Type: text/plain"]);
+        } else if (req.path == "/quit") {
+            http.respond(req, 200, "bye");
+            running = false;
+        } else {
+            http.respond(req, 404, "no such page: " + req.path);
+        }
+    }
+    http.close(s);
+    print("server: stopped");
+}

@@ -1,0 +1,36 @@
+// std.ascii_screen showcase 5/10 — particles: fireworks with gravity, colour fade and screen shake.
+// Click (or press space) to launch one at the mouse / a random spot. Auto-launches too. q = quit.
+import std.ascii_screen;
+
+fn burst(x: int, y: int) {
+    let c1 = ascii_screen.hsv(ascii_screen.rand(), 0.8, 1.0);
+    let c2 = ascii_screen.hsv(ascii_screen.rand(), 0.9, 0.5);
+    ascii_screen.emit(x, y, "count", 70, "speed", 14, "spread", 360, "life", 1.4, "gravity", 9, "drag", 0.6, "glyphs", "*+.o", "fg", c1, "fg2", c2, "screen", true);
+    ascii_screen.emit(x, y, "count", 25, "speed", 6, "spread", 360, "life", 0.8, "gravity", 4, "glyphs", "·•", "fg", "#ffffff", "fg2", c1, "screen", true);
+    ascii_screen.camera_shake(0.4, 0.15);
+}
+
+fn main() {
+    ascii_screen.open("title", "ascii_screen showcase: fireworks", "fps", 40);
+    let w = ascii_screen.width();
+    let h = ascii_screen.height();
+    var timer = 0.0;
+    var launched = 0;
+    while (ascii_screen.poll()) {
+        if (ascii_screen.key_pressed("q") || ascii_screen.key_pressed("escape")) { ascii_screen.quit(); }
+        timer -= ascii_screen.dt();
+        if (ascii_screen.mouse_pressed("left")) {
+            let m = ascii_screen.mouse();
+            burst(m[0], m[1]); launched += 1;
+        }
+        if (ascii_screen.key_pressed("space") || timer <= 0.0) {
+            burst(ascii_screen.rand_int(8, w - 8), ascii_screen.rand_int(4, h / 2)); launched += 1;
+            timer = 0.6 + ascii_screen.rand() * 0.9;
+        }
+        ascii_screen.begin();
+        ascii_screen.draw_world("tiles", false, "entities", false, "particles", true);
+        ascii_screen.text(2, h - 1, "click / space: launch   q: quit   fireworks: " + str(launched), "fg", "gray");
+        ascii_screen.present();
+    }
+    ascii_screen.close();
+}
