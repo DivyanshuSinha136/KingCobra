@@ -1,0 +1,34 @@
+; bootsector.kasm -- a 512-byte real-mode boot sector:   kasm bootsector.kasm -o boot.img
+;   qemu-system-i386 -drive format=raw,file=boot.img
+bits 16
+org 0x7c00
+
+start:
+    cli
+    xor     ax, ax
+    mov     ds, ax
+    mov     es, ax
+    mov     ss, ax
+    mov     sp, 0x7c00
+    sti
+    mov     si, banner
+    call    puts
+.halt:
+    hlt
+    jmp     .halt
+
+puts:                           ; ds:si -> zero terminated string, BIOS teletype
+    lodsb
+    test    al, al
+    jz      .done
+    mov     ah, 0x0e
+    mov     bx, 7
+    int     0x10
+    jmp     puts
+.done:
+    ret
+
+banner: db "Booted by KASM", 13, 10, 0
+
+times 510 - ($ - $$) db 0
+dw 0xAA55

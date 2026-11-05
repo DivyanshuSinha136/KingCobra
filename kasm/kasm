@@ -1,0 +1,4 @@
+#!/bin/sh
+# kasm -- the KingCobra assembler.   usage: kasm [options] input.kasm     (see: kasm --help)
+here="$(cd "$(dirname "$0")" && pwd)"
+exec "${KINGCOBRA:-$here/../kingcobra}" "$here/src/main.kc" "$@"

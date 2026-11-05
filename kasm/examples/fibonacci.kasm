@@ -1,0 +1,54 @@
+; fibonacci.kasm -- macros, %rep, local labels and a loop.  Prints the first 10 Fibonacci numbers (Linux, libc-free).
+;   kasm fibonacci.kasm -f elf -o fib && ./fib
+bits 64
+default rel
+global _start
+
+%macro syscall3 4               ; number, a, b, c
+    mov     eax, %1
+    mov     rdi, %2
+    mov     rsi, %3
+    mov     rdx, %4
+    syscall
+%endmacro
+
+%define STDOUT 1
+%define SYS_write 1
+%define SYS_exit  60
+
+section .bss
+buf:    resb 32
+
+section .text
+; rdi = value, returns rsi = pointer to digits, rdx = length (appends a newline)
+itoa:
+    lea     rsi, [buf + 31]
+    mov     byte [rsi], 10
+    mov     rax, rdi
+    mov     ecx, 10
+.next:
+    xor     edx, edx
+    div     rcx
+    add     dl, '0'
+    dec     rsi
+    mov     [rsi], dl
+    test    rax, rax
+    jnz     .next
+    lea     rdx, [buf + 32]
+    sub     rdx, rsi
+    ret
+
+_start:
+    xor     r12d, r12d          ; a
+    mov     r13d, 1             ; b
+    mov     r14d, 10            ; count
+.loop:
+    mov     rdi, r12
+    call    itoa
+    syscall3 SYS_write, STDOUT, rsi, rdx
+    lea     rax, [r12 + r13]
+    mov     r12, r13
+    mov     r13, rax
+    dec     r14d
+    jnz     .loop
+    syscall3 SYS_exit, 0, 0, 0

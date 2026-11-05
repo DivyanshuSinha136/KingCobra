@@ -1,0 +1,73 @@
+fld dword ptr [rax]
+fld qword ptr [rax]
+fld tbyte ptr [rax]
+fld st(1)
+fst qword ptr [rax]
+fstp dword ptr [rax]
+fstp tbyte ptr [rax]
+fstp st(2)
+fild word ptr [rax]
+fild dword ptr [rax]
+fild qword ptr [rax]
+fist dword ptr [rax]
+fistp qword ptr [rax]
+fisttp dword ptr [rax]
+fadd dword ptr [rax]
+fadd qword ptr [rax]
+fadd st, st(1)
+fadd st(1), st
+faddp st(1), st
+faddp
+fmul st, st(2)
+fmulp st(1), st
+fsub st, st(1)
+fsub st(1), st
+fsubp st(1), st
+fsubr st(1), st
+fsubrp st(1), st
+fdiv st, st(1)
+fdiv st(1), st
+fdivp st(1), st
+fdivr st(1), st
+fdivrp st(1), st
+fiadd dword ptr [rax]
+fimul word ptr [rax]
+fcom st(1)
+fcomp qword ptr [rax]
+fcomi st, st(1)
+fcomip st, st(1)
+fucomi st, st(2)
+fucomip st, st(1)
+fucompp
+fxch st(1)
+fxch
+fchs
+fabs
+fsqrt
+fsin
+fcos
+fptan
+fpatan
+fld1
+fldz
+fldpi
+fldl2e
+f2xm1
+fyl2x
+frndint
+fscale
+fxam
+ftst
+fnstcw word ptr [rax]
+fldcw word ptr [rax]
+fnstsw ax
+fnstsw word ptr [rax]
+fninit
+finit
+fnclex
+fwait
+fcmovb st, st(1)
+fcmovne st, st(2)
+fnsave [rax]
+frstor [rax]
+ffree st(3)

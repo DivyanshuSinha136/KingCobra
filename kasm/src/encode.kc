@@ -1,0 +1,585 @@
+// encode.kc -- the instruction encoder: operands + table forms -> machine code (+ relocations).
+//
+// ctx fields used: mode (16|32|64), here, sec, line, floors, default_rel, warnings, syms, undef_refs, file.
+// An encoded instruction is { bytes: int[], relocs: [ { off, size, rel, sg, val, end, call } ] }
+//   rel=false : field = value                 rel=true : field = value - (address of the end of the instruction)
+// Author: Divyanshu Sinha (MIT License)
+import "util.kc" as util;
+import "expr.kc" as ex;
+import "regs.kc" as regs;
+import "tables.kc" as tb;
+
+fn err(ctx, msg: string, col: int = 1) { util.fail(msg, ctx.line, col); }
+
+fn fits_s(v: int, bits: int) -> bool {
+    if (bits >= 64) { return true; }
+    let lim = 1 << (bits - 1);
+    return v >= -lim && v < lim;
+}
+fn fits_su(v: int, bits: int) -> bool {          // fits as signed or as unsigned of that width
+    if (bits >= 64) { return true; }
+    let lim = 1 << (bits - 1);
+    return v >= -lim && v < (lim << 1);
+}
+
+fn size_of_letter(c: string, osz: int) -> int {
+    if (c == "b") { return 1; }
+    if (c == "w") { return 2; }
+    if (c == "d") { return 4; }
+    if (c == "q") { return 8; }
+    if (c == "v") { return idiv(osz, 8); }
+    if (c == "t") { return 10; }
+    if (c == "o") { return 16; }
+    if (c == "y") { return 32; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- operand preparation
+fn prep_ops(ctx, ins) -> any {
+    let out = [];
+    for (o in ins.ops) {
+        if (o.k == "reg") {
+            if (ctx.mode != 64 && ((o.cls == "r" && o.sz == 8) || ((o.cls == "r" || o.cls == "x" || o.cls == "y") && o.n >= 8 && o.cls != "ip") || o.rex)) {
+                err(ctx, "register '" + o.name + "' needs 64-bit mode (use 'bits 64')", o.col == null ? 1 : o.col);
+            }
+            if (ctx.mode != 64 && o.cls == "ip" && o.sz == 8) { err(ctx, "'rip' is only available in 64-bit mode", 1); }
+            out.push(o);
+        } else if (o.k == "imm") {
+            let v = ex.eval(ctx, o.ast);
+            out.push({ k: "imm", val: v, size: o.size, strict: o.strict, short: o.short, near: o.near, far: o.far, wrt: o["wrt"] == null ? "" : o["wrt"] });
+        } else if (o.k == "mem") {
+            let dv = o.disp == null ? ex.konst(0) : ex.eval(ctx, o.disp);
+            out.push({ k: "mem", size: o.size, seg: o.seg, base: o.base, index: o.index, scale: o.scale, dv: dv, rel: o.rel, abs: o.abs, far: o.far, wrt: o["wrt"] == null ? "" : o["wrt"] });
+        } else if (o.k == "farptr") {
+            out.push({ k: "farptr", sel: ex.eval(ctx, o.seg), off: ex.eval(ctx, o.off) });
+        } else { err(ctx, "internal: bad operand kind " + o.k); }
+    }
+    return out;
+}
+
+/// Address size in bits implied by a memory operand's registers (0 when it has none).
+fn mem_abits(ctx, m) -> int {
+    var bits = 0;
+    let rl = [m.base, m.index];
+    for (r in rl) {
+        if (r == null) { continue; }
+        var b = r.sz == 8 ? 64 : (r.sz == 4 ? 32 : 16);
+        if (r.cls == "ip") { b = r.sz == 8 ? 64 : 32; }
+        if (bits != 0 && bits != b) { err(ctx, "address registers have different sizes"); }
+        bits = b;
+    }
+    return bits;
+}
+
+// ---------------------------------------------------------------- operand matching
+/// Does `op` fit operand spec `s` for operand size `osz`?  `info` collects { msz } for size-ambiguity checks.
+fn match_op(ctx, f, s: string, op, osz: int, info) -> bool {
+    let c = s[0];
+    if (s == "1") { return op.k == "imm" && op.val.sec == null && op.val.ext == null && op.val.pcsec == null && !op.val.undef && op.val.v == 1 && op.size == 0; }
+    if (s == "AL") { return op.k == "reg" && op.cls == "r" && op.sz == 1 && op.n == 0 && !op.hi; }
+    if (s == "CL") { return op.k == "reg" && op.cls == "r" && op.sz == 1 && op.n == 1 && !op.hi; }
+    if (s == "DX") { return op.k == "reg" && op.cls == "r" && op.sz == 2 && op.n == 2; }
+    if (s == "AX") { return op.k == "reg" && op.cls == "r" && op.sz == 2 && op.n == 0; }
+    if (s == "EAX") { return op.k == "reg" && op.cls == "r" && op.sz == 4 && op.n == 0; }
+    if (s == "RAX") { return op.k == "reg" && op.cls == "r" && op.sz == 8 && op.n == 0; }
+    if (s == "Av") { return op.k == "reg" && op.cls == "r" && op.sz == idiv(osz, 8) && op.n == 0 && !op.hi; }
+    if (s == "ES" || s == "CS" || s == "SS" || s == "DS" || s == "FS" || s == "GS") { return op.k == "reg" && op.cls == "s" && op.name == s.lower(); }
+    if (s == "X0") { return op.k == "reg" && op.cls == "x" && op.n == 0; }
+    if (s == "ST0") { return op.k == "reg" && op.cls == "f" && op.n == 0; }
+    if (s == "STi") { return op.k == "reg" && op.cls == "f"; }
+    if (s == "Sw") { return op.k == "reg" && op.cls == "s"; }
+    if (s == "Cd") { return op.k == "reg" && op.cls == "c"; }
+    if (s == "Dd") { return op.k == "reg" && op.cls == "d"; }
+    if (s == "Ap") { return op.k == "farptr"; }
+    if (s == "Mp") { return op.k == "mem" && op.far; }
+    if (c == "E") {
+        let sz = size_of_letter(s[1], osz);
+        if (op.k == "reg") { return op.cls == "r" && op.sz == sz; }
+        if (op.k == "mem") {
+            if (op.far) { return false; }
+            if (op.size == 0) { info.msz = sz; return true; }
+            return op.size == sz;
+        }
+        return false;
+    }
+    if (c == "M") {
+        if (op.k != "mem") { return false; }
+        if (len(s) == 1) { return true; }
+        let sz = size_of_letter(s[1], osz);
+        if (op.size == 0) { info.msz = sz; return true; }
+        return op.size == sz;
+    }
+    if (c == "R" || c == "G" || c == "Z") {
+        if (op.k != "reg" || op.cls != "r") { return false; }
+        return op.sz == size_of_letter(s[1], osz);
+    }
+    if (c == "L") { return op.k == "reg" && (s[1] == "x" ? op.cls == "x" : op.cls == "y"); }
+    if (c == "H" && s[1] == "v") { return op.k == "reg" && op.cls == "r" && op.sz == idiv(osz, 8); }
+    if (c == "V" || c == "U" || c == "H") {
+        if (op.k != "reg") { return false; }
+        return s[1] == "x" ? op.cls == "x" : op.cls == "y";
+    }
+    if (c == "W") {
+        let sz = size_of_letter(s[1], osz);
+        if (op.k == "reg") { return sz == 32 ? op.cls == "y" : op.cls == "x"; }
+        if (op.k == "mem") {
+            if (op.size == 0) { info.msz = sz; return true; }
+            return op.size == sz;
+        }
+        return false;
+    }
+    if (c == "O") {
+        if (op.k != "mem" || op.base != null || op.index != null || op.rel) { return false; }
+        if (s == "Oq") { return ctx.mode == 64; }
+        if (ctx.mode == 64) { return false; }
+        let sz = size_of_letter(s[1], osz);
+        if (op.size == 0) { info.msz = sz; return true; }
+        return op.size == sz;
+    }
+    if (c == "I") { return match_imm(ctx, s, op, osz); }
+    if (c == "J") { return match_rel(ctx, f, s, op); }
+    return false;
+}
+
+fn imm_field_size(s: string, osz: int) -> int {
+    if (s == "Ib" || s == "Ibs") { return 1; }
+    if (s == "Iw") { return 2; }
+    if (s == "Id") { return 4; }
+    if (s == "Iq") { return 8; }
+    if (s == "Iz") { return osz == 16 ? 2 : 4; }
+    return osz == 16 ? 2 : (osz == 32 ? 4 : 8);       // Iv
+}
+
+fn match_imm(ctx, s: string, op, osz: int) -> bool {
+    if (op.k != "imm") { return false; }
+    let val = op.val;
+    let fs = imm_field_size(s, osz);
+    if (op.size != 0 && op.size != fs && !(s == "Iz" && osz == 64 && op.size == 8)) { return false; }
+    if (val.undef) { return s != "Ibs"; }
+    if (val.sec != null || val.ext != null || val.pcsec != null) {
+        if (fs == 1) { return false; }
+        if (fs == 2) { return ctx.mode == 16 || osz == 16; }
+        return true;
+    }
+    let v = val.v;
+    if (s == "Ibs") { return v >= -128 && v <= 127; }
+    if (s == "Ib") { return v >= -128 && v <= 255; }
+    if (s == "Iw") { return fits_su(v, 16); }
+    if (s == "Id") { return fits_su(v, 32); }
+    if (s == "Iq") { return true; }
+    if (s == "Iz") {
+        if (osz == 16) { return fits_su(v, 16); }
+        if (osz == 32) { return fits_su(v, 32); }
+        return fits_s(v, 32);
+    }
+    // Iv
+    if (osz == 16) { return fits_su(v, 16); }
+    if (osz == 32) { return fits_su(v, 32); }
+    if (op.size == 0 && !op.strict && fits_s(v, 32)) { return false; }
+    return true;
+}
+
+fn match_rel(ctx, f, s: string, op) -> bool {
+    if (op.k != "imm") { return false; }
+    if (op.far) { return false; }
+    let val = op.val;
+    if (s == "Jz") { return !op.short; }
+    // Jb: a short jump
+    if (op.near) { return false; }
+    if (val.undef) { return true; }                       // optimistic: assume it will fit, grow later if not
+    if (val.ext != null || val.pcsec != null || val.sec == null || val.sec != ctx.sec) { return false; }
+    let n = len(f.opc) + (f.a16 || f.a32 ? 1 : 0) + ctx.pfxlen;
+    let d = val.v - (ctx.here + n + 1);
+    return d >= -128 && d <= 127;
+}
+
+// ---------------------------------------------------------------- candidate search
+fn osz_candidates(ctx, f) -> any {
+    if (!f.usesv) { return [32]; }
+    if (f.no16) { return ctx.mode == 64 ? [32, 64] : [32]; }
+    if (ctx.mode == 64) {
+        if (f.d64) { return [64, 16]; }
+        if (f.o32max) { return [32, 16]; }
+        return [32, 64, 16];
+    }
+    if (ctx.mode == 32) { return [32, 16]; }
+    return [16, 32];
+}
+
+fn find_candidates(ctx, mn: string, fl, ops) -> any {
+    let out = [];
+    var tried_mode = false;
+    for (f in fl) {
+        if (len(f.specs) != len(ops)) { continue; }
+        if (f.x64 && ctx.mode != 64) { tried_mode = true; continue; }
+        if (f.no64 && ctx.mode == 64) { tried_mode = true; continue; }
+        for (osz in osz_candidates(ctx, f)) {
+            let info = { msz: -1 };
+            var ok = true;
+            for (i in 0..len(ops)) {
+                if (!match_op(ctx, f, f.specs[i], ops[i], osz, info)) { ok = false; break; }
+            }
+            if (ok) { out.push({ f: f, osz: osz, msz: info.msz }); }
+        }
+    }
+    return { list: out, mode_issue: tried_mode };
+}
+
+fn describe_ops(ops) -> string {
+    var parts = [];
+    for (o in ops) {
+        if (o.k == "reg") { parts.push(o.name); }
+        else if (o.k == "mem") { parts.push(o.size == 0 ? "memory" : ("memory" + str(o.size * 8))); }
+        else if (o.k == "imm") { parts.push("immediate"); }
+        else { parts.push("far pointer"); }
+    }
+    return parts.join(", ");
+}
+
+// ---------------------------------------------------------------- emission helpers
+fn put_le(bytes, v: int, n: int) {
+    var x = v;
+    for (i in 0..n) { bytes.push(x & 0xFF); x = x >>> 8; }
+}
+
+fn log2_scale(s: int) -> int { if (s == 1) { return 0; } if (s == 2) { return 1; } if (s == 4) { return 2; } return 3; }
+
+fn has_reloc(v) -> bool { return v.sec != null || v.ext != null || v.pcsec != null; }
+
+/// Build ModRM/SIB/disp for a memory operand.  Returns { bytes, rexx, rexb, disp: {off,size,val,rel,sg}|null }.
+fn encode_mem(ctx, m, regfield: int, abits: int, st) -> any {
+    let out = [];
+    var rexx = 0;
+    var rexb = 0;
+    var disp = null;
+    let dv = m.dv;
+    let rg = (regfield & 7) << 3;
+    let reloc_disp = has_reloc(dv) || dv.undef;
+    let rip = (m.base != null && m.base.cls == "ip") || (m.base == null && m.index == null && abits == 64 && !m.abs && (m.rel || ctx.default_rel));
+    if (abits == 16) {
+        let b = m.base; let x = m.index;
+        var rm = -1;
+        if (b == null && x == null) {
+            out.push(rg | 6);
+            disp = { off: 1, size: 2, val: dv, rel: false, sg: false };
+            put_le(out, dv.v, 2);
+            return { bytes: out, rexx: 0, rexb: 0, disp: disp };
+        }
+        var bn = b == null ? -1 : b.n;
+        var xn = x == null ? -1 : x.n;
+        if (m.scale != 1 && x != null) { err(ctx, "16-bit addressing does not allow a scale"); }
+        if (bn == 6 || bn == 7) { let t = bn; bn = xn; xn = t; }       // allow [si+bx]
+        if (bn == 3 && xn == 6) { rm = 0; } else if (bn == 3 && xn == 7) { rm = 1; }
+        else if (bn == 5 && xn == 6) { rm = 2; } else if (bn == 5 && xn == 7) { rm = 3; }
+        else if (bn == -1 && xn == 6) { rm = 4; } else if (bn == -1 && xn == 7) { rm = 5; }
+        else if (bn == 6 && xn == -1) { rm = 4; } else if (bn == 7 && xn == -1) { rm = 5; }
+        else if (bn == 5 && xn == -1) { rm = 6; } else if (bn == 3 && xn == -1) { rm = 7; }
+        if (rm < 0) { err(ctx, "invalid 16-bit address (use [bx|bp] + [si|di] + displacement)"); }
+        var mod = 0;
+        if (reloc_disp) { mod = 2; }
+        else if (dv.v == 0 && rm != 6) { mod = 0; }
+        else if (dv.v >= -128 && dv.v <= 127) { mod = 1; }
+        else { mod = 2; }
+        if (st.d32 && mod < 2 && !(mod == 0 && dv.v == 0)) { mod = 2; }
+        if (rm == 6 && mod == 0) { mod = 1; }
+        out.push((mod << 6) | rg | rm);
+        if (mod == 1) { out.push(dv.v & 0xFF); disp = { off: 1, size: 1, val: dv, rel: false, sg: true }; }
+        if (mod == 2) { disp = { off: 1, size: 2, val: dv, rel: false, sg: false }; put_le(out, dv.v, 2); st.d32 = true; }
+        return { bytes: out, rexx: 0, rexb: 0, disp: disp };
+    }
+    // 32 / 64-bit addressing
+    if (rip) {
+        out.push(rg | 5);
+        disp = { off: 1, size: 4, val: dv, rel: m.base == null || has_reloc(dv), sg: true, wrt: m.wrt };
+        put_le(out, dv.v, 4);
+        return { bytes: out, rexx: 0, rexb: 0, disp: disp };
+    }
+    var base = m.base;
+    var index = m.index;
+    var scale = m.scale;
+    if (base == null && index == null) {
+        if (abits == 64) {
+            out.push(rg | 4); out.push(0x25);
+            disp = { off: 2, size: 4, val: dv, rel: false, sg: true };
+        } else {
+            out.push(rg | 5);
+            disp = { off: 1, size: 4, val: dv, rel: false, sg: false };
+        }
+        put_le(out, dv.v, 4);
+        return { bytes: out, rexx: 0, rexb: 0, disp: disp };
+    }
+    if (index != null && index.n == 4 && index.cls == "r") {
+        if (scale == 1 && base != null && base.n != 4) { let t = base; base = index; index = t; }
+        else { err(ctx, "'" + index.name + "' cannot be used as an index register"); }
+    }
+    if (index != null && index.n >= 8) { rexx = 1; }
+    if (base == null) {
+        // index only: disp32, no base
+        out.push(rg | 4);
+        out.push((log2_scale(scale) << 6) | ((index.n & 7) << 3) | 5);
+        disp = { off: 2, size: 4, val: dv, rel: false, sg: true };
+        put_le(out, dv.v, 4);
+        return { bytes: out, rexx: rexx, rexb: 0, disp: disp };
+    }
+    if (base.n >= 8) { rexb = 1; }
+    let need_sib = index != null || (base.n & 7) == 4;
+    var mod = 0;
+    if (reloc_disp) { mod = 2; }
+    else if (dv.v == 0 && (base.n & 7) != 5) { mod = 0; }
+    else if (dv.v >= -128 && dv.v <= 127) { mod = 1; }
+    else { mod = 2; }
+    if (st.d32 && mod == 1) { mod = 2; }
+    out.push((mod << 6) | rg | (need_sib ? 4 : (base.n & 7)));
+    if (need_sib) {
+        let ix = index == null ? 4 : (index.n & 7);
+        out.push((log2_scale(scale) << 6) | (ix << 3) | (base.n & 7));
+    }
+    if (mod == 1) { disp = { off: len(out), size: 1, val: dv, rel: false, sg: true }; out.push(dv.v & 0xFF); }
+    if (mod == 2) { disp = { off: len(out), size: 4, val: dv, rel: false, sg: true }; put_le(out, dv.v, 4); st.d32 = true; }
+    return { bytes: out, rexx: rexx, rexb: rexb, disp: disp };
+}
+
+fn seg_prefix(name: string) -> int {
+    if (name == "es") { return 0x26; }
+    if (name == "cs") { return 0x2E; }
+    if (name == "ss") { return 0x36; }
+    if (name == "ds") { return 0x3E; }
+    if (name == "fs") { return 0x64; }
+    return 0x65;
+}
+
+/// Encode one candidate (form + operand size).
+fn emit(ctx, f, osz: int, ops, ins, st) -> any {
+    let roles = f.roles;
+    var rmop = null; var regop = null; var zop = null; var immops = []; var relop = null; var is4op = null; var moffsop = null; var farop = null; var vvop = null;
+    for (i in 0..len(ops)) {
+        let r = roles[i];
+        if (r == "rm") { rmop = ops[i]; }
+        else if (r == "reg") { regop = ops[i]; }
+        else if (r == "opc") { zop = ops[i]; }
+        else if (r == "imm") { immops.push({ op: ops[i], spec: f.specs[i] }); }
+        else if (r == "rel") { relop = ops[i]; }
+        else if (r == "moffs") { moffsop = ops[i]; }
+        else if (r == "far") { farop = ops[i]; }
+        else if (r == "vvvv") { vvop = ops[i]; }
+        else if (r == "is4") { is4op = ops[i]; }
+    }
+    if (f.dup) { rmop = regop; }
+    // ---- prefixes
+    let pre = [];
+    if (ins.pfx.lock) { pre.push(0xF0); }
+    if (ins.pfx.rep) { pre.push(0xF3); }
+    if (ins.pfx.repne) { pre.push(0xF2); }
+    var mem = null;
+    if (rmop != null && rmop.k == "mem") { mem = rmop; }
+    if (moffsop != null) { mem = moffsop; }
+    var abits = ctx.mode;
+    if (mem != null) {
+        let ab = mem_abits(ctx, mem);
+        if (ab != 0) { abits = ab; }
+        if (ctx.mode == 64 && abits == 16) { err(ctx, "16-bit addressing is not available in 64-bit mode"); }
+        if (ctx.mode != 64 && abits == 64) { err(ctx, "64-bit addressing needs 64-bit mode"); }
+        if (mem.seg != null) { pre.push(seg_prefix(mem.seg.name)); }
+    }
+    if (ins.pfx.lock && mem == null) { err(ctx, "the lock prefix needs a memory operand"); }
+    if (abits != ctx.mode || ins.pfx.a16 || ins.pfx.a32) { pre.push(0x67); }
+    else if (f.a16 && ctx.mode != 16) { pre.push(0x67); }
+    else if (f.a32 && ctx.mode != 32) { pre.push(0x67); }
+    if (f.vex != null) { }
+    else if (f.usesv && f.mp == 0) {
+        if (osz == 16 && ctx.mode != 16) { pre.push(0x66); }
+        else if (osz == 32 && ctx.mode == 16) { pre.push(0x66); }
+    } else if (f.usesv && f.mp != 0x66) {
+        if (osz == 16 && ctx.mode != 16) { pre.push(0x66); }
+        else if (osz == 32 && ctx.mode == 16) { pre.push(0x66); }
+    }
+    if (ins.pfx.o16 && ctx.mode != 16 && !(f.usesv && osz == 16)) { pre.push(0x66); }
+    if (ins.pfx.o32 && ctx.mode == 16 && !(f.usesv && osz == 32)) { pre.push(0x66); }
+    if (f.o16 && ctx.mode != 16) { pre.push(0x66); }
+    if (f.o32 && ctx.mode == 16) { pre.push(0x66); }
+    if (f.mp != 0 && f.vex == null) { pre.push(f.mp); }
+    // ---- REX
+    var rexw = f.rexw || (f.usesv && osz == 64 && !f.d64 && ctx.mode == 64);
+    var rexr = 0; var rexx = 0; var rexb = 0;
+    var need_rex = false;
+    var has_hi = false;
+    for (o in ops) {
+        if (o.k == "reg" && o.cls == "r" && o.sz == 1) { if (o.rex) { need_rex = true; } if (o.hi) { has_hi = true; } }
+    }
+    if (regop != null && regop.k == "reg" && regop.n >= 8 && regop.cls != "ip") { rexr = 1; }
+    if (rmop != null && rmop.k == "reg" && rmop.n >= 8 && rmop.cls != "ip") { rexb = 1; }
+    if (zop != null && zop.k == "reg" && zop.n >= 8) { rexb = 1; }
+    // ---- ModRM
+    var modrm_bytes = [];
+    var disp = null;
+    if (f.modrm) {
+        var regfield = 0;
+        if (f.ext >= 0) { regfield = f.ext; }
+        else if (regop != null) { regfield = regop.n; }
+        if (rmop == null) { err(ctx, "internal: form has ModRM but no r/m operand"); }
+        if (rmop.k == "reg") {
+            modrm_bytes = [0xC0 | ((regfield & 7) << 3) | (rmop.n & 7)];
+        } else {
+            let em = encode_mem(ctx, rmop, regfield, abits, st);
+            modrm_bytes = em.bytes;
+            rexx = em.rexx;
+            if (em.rexb == 1) { rexb = 1; }
+            disp = em.disp;
+        }
+    }
+    if (rexw || rexr == 1 || rexx == 1 || rexb == 1) { need_rex = true; }
+    if (f.vex != null) { need_rex = false; }
+    if (need_rex && ctx.mode != 64) { err(ctx, "this instruction needs a REX prefix (64-bit mode)"); }
+    if (need_rex && has_hi) { err(ctx, "ah/bh/ch/dh cannot be used together with a REX prefix or an extended register"); }
+    // ---- assemble
+    let bytes = [];
+    for (p in pre) { bytes.push(p); }
+    if (need_rex) { bytes.push(0x40 | (rexw ? 8 : 0) | (rexr << 2) | (rexx << 1) | rexb); }
+    if (f.vex != null) {
+        if (ctx.mode != 64 && (rexr == 1 || rexx == 1 || rexb == 1)) { err(ctx, "extended registers need 64-bit mode"); }
+        var vw = f.vexw;
+        if (vw == 2) { vw = osz == 64 ? 1 : 0; }
+        let vv = vvop == null ? 0 : vvop.n;
+        let vbits = (15 - (vv & 15)) << 3;
+        if (f.vexmap == 1 && vw == 0 && rexx == 0 && rexb == 0) {
+            bytes.push(0xC5);
+            bytes.push(((1 - rexr) << 7) | vbits | (f.vexl << 2) | f.vexpp);
+        } else {
+            bytes.push(0xC4);
+            bytes.push(((1 - rexr) << 7) | ((1 - rexx) << 6) | ((1 - rexb) << 5) | f.vexmap);
+            bytes.push((vw << 7) | vbits | (f.vexl << 2) | f.vexpp);
+        }
+    }
+    let opc_start = len(bytes);
+    for (i in 0..len(f.opc)) {
+        var b = f.opc[i];
+        if (f.plusr && i == len(f.opc) - 1) { b = b + (zop.n & 7); }
+        bytes.push(b);
+    }
+    let relocs = [];
+    let mbase = len(bytes);
+    for (b in modrm_bytes) { bytes.push(b); }
+    if (disp != null) {
+        disp.off = disp.off + mbase;
+        if (has_reloc(disp.val) || disp.rel) { relocs.push(disp); }
+    }
+    // moffs
+    if (moffsop != null) {
+        let sz = f.moffs == "oq" ? 8 : (ctx.mode == 16 ? 2 : 4);
+        let at = len(bytes);
+        put_le(bytes, moffsop.dv.v, sz);
+        if (has_reloc(moffsop.dv)) { relocs.push({ off: at, size: sz, rel: false, sg: false, val: moffsop.dv }); }
+    }
+    // immediates
+    var ii = 0;
+    for (tk in f.imms) {
+        let io = immops[ii];
+        ii = ii + 1;
+        var sz = 1;
+        if (tk == "iw") { sz = 2; } else if (tk == "id") { sz = 4; } else if (tk == "iq") { sz = 8; }
+        else if (tk == "iz") { sz = osz == 16 ? 2 : 4; }
+        else if (tk == "iv") { sz = osz == 16 ? 2 : (osz == 32 ? 4 : 8); }
+        let at = len(bytes);
+        let v = io.op.val;
+        put_le(bytes, v.v, sz);
+        if (has_reloc(v)) {
+            relocs.push({ off: at, size: sz, rel: false, sg: (tk == "iz" && osz == 64) || tk == "id" && false, val: v });
+        }
+    }
+    if (is4op != null) { bytes.push((is4op.n & 15) << 4); }
+    if (f.imm8 >= 0) { bytes.push(f.imm8); }
+    // far pointer
+    if (farop != null) {
+        let sz = osz == 16 ? 2 : 4;
+        var at = len(bytes);
+        put_le(bytes, farop.off.v, sz);
+        if (has_reloc(farop.off)) { relocs.push({ off: at, size: sz, rel: false, sg: false, val: farop.off }); }
+        at = len(bytes);
+        put_le(bytes, farop.sel.v, 2);
+        if (has_reloc(farop.sel)) { relocs.push({ off: at, size: 2, rel: false, sg: false, val: farop.sel }); }
+    }
+    // relative branch
+    if (relop != null) {
+        let sz = f.rel == "cb" ? 1 : (ctx.mode == 16 ? 2 : 4);
+        let at = len(bytes);
+        let end = at + sz;
+        let tv = relop.val;
+        for (i in 0..sz) { bytes.push(0); }
+        let local = tv.sec != null && tv.sec == ctx.sec && tv.ext == null && tv.pcsec == null;
+        if (local) {
+            let d = tv.v - (ctx.here + end);
+            if (sz == 1 && (d < -128 || d > 127)) { if (!tv.undef) { err(ctx, "short jump out of range (" + str(d) + " bytes); use 'near' or a closer target"); } }
+            if (sz == 2 && (d < -32768 || d > 32767) && !tv.undef) { err(ctx, "jump out of 16-bit range"); }
+            var x = d;
+            for (i in 0..sz) { bytes[at + i] = x & 0xFF; x = x >> 8; }
+        } else if (tv.undef) {
+            // value unknown in this pass: leave zero
+        } else {
+            if (sz == 1) { err(ctx, "a short jump cannot reach a label in another section or an external symbol"); }
+            relocs.push({ off: at, size: sz, rel: true, sg: true, val: tv, end: end, call: ins.mn == "call" || ins.mn == "jmp", wrt: relop.wrt });
+        }
+    }
+    for (r in relocs) { if (r.rel && r["end"] == null) { r["end"] = len(bytes); } }
+    // rip-relative displacement: fold when the target is in the same section
+    let final = [];
+    for (r in relocs) {
+        if (r.rel && r.val.sec != null && r.val.sec == ctx.sec && r.val.ext == null && r.val.pcsec == null) {
+            let d = r.val.v - (ctx.here + r.end);
+            var x = d;
+            for (i in 0..r.size) { bytes[r.off + i] = x & 0xFF; x = x >> 8; }
+            continue;
+        }
+        if (r.rel && r.val.undef) { continue; }
+        if (!r.rel && r.val.undef) { continue; }
+        final.push(r);
+    }
+    return { bytes: bytes, relocs: final };
+}
+
+// ---------------------------------------------------------------- the public entry point
+fn encode(ctx, ins, site: string) -> any {
+    let mn = ins.mn.lower();
+    let fl = tb.forms(mn);
+    if (fl == null) {
+        let sg = util.suggest(mn, tb.mnemonics());
+        err(ctx, "unknown instruction '" + ins.mn + "'" + (sg != "" ? " (did you mean '" + sg + "'?)" : ""), ins.col);
+    }
+    var ops = prep_ops(ctx, ins);
+    // mov r64, imm32 (zero-extended) -> mov r32, imm32: five bytes instead of seven or ten
+    if (mn == "mov" && len(ops) == 2 && ctx.mode == 64 && ops[0].k == "reg" && ops[0].cls == "r" && ops[0].sz == 8 && ops[1].k == "imm"
+        && ops[1].size == 0 && !ops[1].strict && !ops[1].val.undef && ex.is_abs(ops[1].val) && ops[1].val.v >= 0 && ops[1].val.v <= 0xFFFFFFFF) {
+        ops = [regs.as_dword(ops[0]), ops[1]];
+    }
+    var st = ctx.floors[site];
+    if (st == null) { st = { len: 0, d32: false }; ctx.floors[site] = st; }
+    let res = find_candidates(ctx, mn, fl, ops);
+    let cands = res.list;
+    if (len(cands) == 0) {
+        for (o in ops) {
+            if (o.k == "imm" && o.short) { err(ctx, "short jump is out of range or cannot reach that target (drop 'short' to let KASM pick the size)", ins.col); }
+        }
+        var msg = "invalid combination of opcode and operands: " + mn + " " + describe_ops(ops);
+        if (res.mode_issue) { msg = msg + " (in " + str(ctx.mode) + "-bit mode)"; }
+        err(ctx, msg, ins.col);
+    }
+    // operand-size ambiguity: an unsized memory operand that several forms would accept with different sizes
+    let c0 = cands[0];
+    if (c0.msz >= 0 && !c0.f.d64) {
+        for (c in cands) {
+            if (c.msz >= 0 && c.msz != c0.msz && !c.f.d64) { err(ctx, "operation size not specified (use byte, word, dword, qword ...)", ins.col); }
+        }
+    }
+    var chosen = null;
+    var best = null;
+    for (c in cands) {
+        let sst = { len: 0, d32: st.d32 };
+        let e = emit(ctx, c.f, c.osz, ops, ins, sst);
+        if (best == null || len(e.bytes) > len(best.e.bytes)) { best = { e: e, st: sst }; }
+        if (len(e.bytes) >= st.len) { chosen = { e: e, st: sst }; break; }
+    }
+    if (chosen == null) { chosen = best; }
+    if (len(chosen.e.bytes) > st.len) { ctx.changed = true; }
+    st.len = len(chosen.e.bytes);
+    if (chosen.st.d32) { st.d32 = true; }
+    return chosen.e;
+}

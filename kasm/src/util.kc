@@ -1,0 +1,118 @@
+// util.kc -- small helpers shared by every KASM stage.
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.system;
+
+/// Stage tracing (kasm -v or KASM_TRACE=1): shows where a crash happens.
+fn set_trace(on: bool) { if (on) { system.setenv("KASM_TRACE", "1"); } }
+fn trace(msg: string) {
+    let t = system.getenv("KASM_TRACE");
+    if (t != null && t != "") { println("kasm: [" + msg + "]"); }
+}
+
+/// Raise an assembler diagnostic. Drivers catch it and print  file:line:col: error: msg
+fn fail(msg: string, line: int, col: int) {
+    throw { message: msg, line: line, col: col, kind: "compile" };
+}
+
+fn starts_with(s: string, p: string) -> bool {
+    return len(s) >= len(p) && s[0..len(p)] == p;
+}
+
+fn ends_with(s: string, p: string) -> bool {
+    return len(s) >= len(p) && s[len(s) - len(p)..len(s)] == p;
+}
+
+fn str_bytes(s: string) -> int[] {
+    return fbin.to_bytes(fbin.from_string(s));
+}
+
+fn hex2(v: int) -> string {
+    let h = "0123456789ABCDEF";
+    return h[(v >> 4) & 15] + h[v & 15];
+}
+
+fn hexn(v: int, digits: int) -> string {
+    let h = "0123456789ABCDEF";
+    var out = "";
+    var i = digits - 1;
+    while (i >= 0) { out = out + h[(v >>> (i * 4)) & 15]; i = i - 1; }
+    return out;
+}
+
+fn hex_of(arr) -> string {
+    var out = "";
+    for (b in arr) { out = out + hex2(b); }
+    return out;
+}
+
+fn align_up(n: int, a: int) -> int {
+    if (a <= 1) { return n; }
+    return idiv(n + a - 1, a) * a;
+}
+
+fn is_pow2(n: int) -> bool { return n > 0 && (n & (n - 1)) == 0; }
+
+/// IEEE-754 bit pattern of a double / single as an unsigned-looking int.
+fn f64_bits(x: float) -> int {
+    let s = fbin.buffer();
+    fbin.write_f64(s, x);
+    fbin.seek(s, 0);
+    return fbin.read_i64(s);
+}
+fn f32_bits(x: float) -> int {
+    let s = fbin.buffer();
+    fbin.write_f32(s, x);
+    fbin.seek(s, 0);
+    return fbin.read_u32(s);
+}
+
+/// Levenshtein distance, capped (for "did you mean").
+fn edit_distance(a: string, b: string) -> int {
+    let la = len(a);
+    let lb = len(b);
+    if (la == 0) { return lb; }
+    if (lb == 0) { return la; }
+    var prev = [];
+    for (j in 0..lb + 1) { prev.push(j); }
+    for (i in 1..la + 1) {
+        var cur = [i];
+        for (j in 1..lb + 1) {
+            let cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            var best = prev[j - 1] + cost;
+            if (prev[j] + 1 < best) { best = prev[j] + 1; }
+            if (cur[j - 1] + 1 < best) { best = cur[j - 1] + 1; }
+            cur.push(best);
+        }
+        prev = cur;
+    }
+    return prev[lb];
+}
+
+/// Best suggestion from `names` for `word`, or "" when nothing is close.
+fn suggest(word: string, names) -> string {
+    var best = "";
+    var bd = 99;
+    let limit = len(word) <= 3 ? 1 : 2;
+    for (n in names) {
+        if (n == word) { continue; }
+        let d = abs(len(n) - len(word));
+        if (d > limit) { continue; }
+        let e = edit_distance(word.lower(), n.lower());
+        if (e < bd) { bd = e; best = n; }
+    }
+    return bd <= limit ? best : "";
+}
+
+/// Byte-wise string comparison: -1, 0 or 1.
+fn str_cmp(a: string, b: string) -> int {
+    let x = str_bytes(a);
+    let y = str_bytes(b);
+    var i = 0;
+    while (i < len(x) && i < len(y)) {
+        if (x[i] != y[i]) { return x[i] < y[i] ? -1 : 1; }
+        i = i + 1;
+    }
+    if (len(x) == len(y)) { return 0; }
+    return len(x) < len(y) ? -1 : 1;
+}

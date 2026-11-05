@@ -1,0 +1,314 @@
+// out.kc -- output formats: flat binary, Intel HEX, ELF64 executable, ELF64 relocatable object, source arrays,
+// plus the listing and map text.  Everything takes the assembled context `ctx` (see asm.kc).
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import "util.kc" as util;
+import "expr.kc" as ex;
+import "asm.kc" as asm;
+
+fn fail(msg: string) { throw { kind: "compile", message: msg, line: 0, col: 0 }; }
+
+// ---------------------------------------------------------------- string tables
+fn strtab_new() { return { bytes: [0], map: {} }; }
+fn strtab_add(t, s: string) -> int {
+    if (s == "") { return 0; }
+    let m = t.map[s];
+    if (m != null) { return m; }
+    let at = len(t.bytes);
+    for (b in util.str_bytes(s)) { t.bytes.push(b); }
+    t.bytes.push(0);
+    t.map[s] = at;
+    return at;
+}
+
+fn w16(s, v: int) { fbin.write_u16(s, v & 0xFFFF); }
+fn w32(s, v: int) { fbin.write_u32(s, v & 0xFFFFFFFF); }
+fn w64(s, v: int) { fbin.write_u64(s, v); }
+fn pad_to(s, align: int) { let n = fbin.size(s); let t = util.align_up(n, align); fbin.seek(s, 0, "end"); if (t > n) { fbin.fill(s, 0, t - n); } }
+
+fn shdr(s, name: int, type: int, flags: int, addr: int, off: int, size: int, link: int, info: int, align: int, entsize: int) {
+    w32(s, name); w32(s, type); w64(s, flags); w64(s, addr); w64(s, off); w64(s, size); w32(s, link); w32(s, info); w64(s, align); w64(s, entsize);
+}
+
+fn sym_entry(s, name: int, info: int, shndx: int, value: int, size: int) {
+    w32(s, name); fbin.write_u8(s, info); fbin.write_u8(s, 0); w16(s, shndx); w64(s, value); w64(s, size);
+}
+
+fn sec_flags(s) -> int {
+    var f = 0;
+    if (s.flags.write) { f = f | 1; }
+    if (s.flags.alloc) { f = f | 2; }
+    if (s.flags.exec) { f = f | 4; }
+    return f;
+}
+
+fn raw_bytes(ctx) {
+    for (n in ctx.order) {
+        let s = ctx.secs[n];
+        s.bytes = s.flags.nobits ? [] : fbin.to_bytes(s.buf, 0, s.pos);
+    }
+}
+
+fn sym_type(s) -> int {
+    let t = s["type"];
+    if (t == "function") { return 2; }
+    if (t == "data" || t == "object") { return 1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- ELF64 relocatable object
+fn reloc_type(ctx, r, via_pcsec: bool) -> int {
+    if (r.rel || via_pcsec) {
+        if (r.size == 4 && r["wrt"] == "got") { return 9; }
+        if (r.size == 4) { return ((r.call && r.val.ext != null) || r["wrt"] == "plt") ? 4 : 2; }
+        if (r.size == 1) { return 15; }
+        if (r.size == 2) { return 13; }
+        return 24;
+    }
+    if (r.size == 8) { return 1; }
+    if (r.size == 4) { return r.sg ? 11 : 10; }
+    if (r.size == 2) { return 12; }
+    return 14;
+}
+
+fn build_elf_obj(ctx, opts) -> any {
+    if (ctx.init_mode != 64) { fail("ELF output is 64-bit only (use 'bits 64')"); }
+    raw_bytes(ctx);
+    let secs = [];
+    for (n in ctx.order) { let s = ctx.secs[n]; if (s.pos > 0 || len(s.relocs) > 0 || n != ".text") { secs.push(s); } }
+    if (len(secs) == 0) { secs.push(ctx.secs[".text"] == null ? asm.get_section(ctx, ".text") : ctx.secs[".text"]); }
+    var sec_index = {};
+    for (i in 0..len(secs)) { sec_index[secs[i].name] = i + 1; }
+    // symbols: [0] null, section symbols, locals, globals, undefined externs
+    let strt = strtab_new();
+    let symt = fbin.buffer();
+    sym_entry(symt, 0, 0, 0, 0, 0);
+    var nsym = 1;
+    var sec_sym = {};
+    for (s in secs) { sym_entry(symt, 0, 3, sec_index[s.name], 0, 0); sec_sym[s.name] = nsym; nsym = nsym + 1; }
+    let names = keys(ctx.syms);
+    var sym_idx = {};
+    // locals
+    for (n in names) {
+        let sy = ctx.syms[n];
+        if (sy.val == null || sy.kind != "label" || sy.global) { continue; }
+        if (util.starts_with(n, "..@")) { continue; }
+        if (sec_index[sy.val.sec] == null) { continue; }
+        sym_entry(symt, strtab_add(strt, n), sym_type(sy), sec_index[sy.val.sec], sy.val.v, 0);
+        sym_idx[n] = nsym; nsym = nsym + 1;
+    }
+    let first_global = nsym;
+    for (n in names) {
+        let sy = ctx.syms[n];
+        if (!sy.global || sy.kind == "extern" || sy.val == null) { continue; }
+        let bind = sy["weak"] == true ? 2 : 1;
+        if (sy.val.sec != null && sec_index[sy.val.sec] != null) {
+            sym_entry(symt, strtab_add(strt, n), (bind << 4) | sym_type(sy), sec_index[sy.val.sec], sy.val.v, 0);
+        } else if (sy.val.sec == null && sy.val.ext == null) {
+            sym_entry(symt, strtab_add(strt, n), (bind << 4), 0xFFF1, sy.val.v, 0);
+        } else { continue; }
+        sym_idx[n] = nsym; nsym = nsym + 1;
+    }
+    // externs that are actually referenced (or declared)
+    for (n in names) {
+        let sy = ctx.syms[n];
+        if (sy.kind != "extern") { continue; }
+        sym_entry(symt, strtab_add(strt, n), (sy["weak"] == true ? 2 : 1) << 4, 0, 0, 0);
+        sym_idx[n] = nsym; nsym = nsym + 1;
+    }
+    // relocation tables
+    let rela = [];
+    for (s in secs) {
+        if (len(s.relocs) == 0) { continue; }
+        let tb = fbin.buffer();
+        for (r in s.relocs) {
+            let v = r.val;
+            var symi = 0; var addend = 0; var via_pc = false;
+            if (v.ext != null) { symi = sym_idx[v.ext]; addend = v.v; }
+            else if (v.sec != null) { symi = sec_sym[v.sec]; addend = v.v; if (symi == null) { fail("section '" + v.sec + "' has no content to relocate against"); } }
+            else { throw { kind: "compile", message: "a jump to an absolute address cannot be expressed in an object file", line: r.line, col: 1, file: r.file }; }
+            if (v.pcsec != null) {
+                if (v.pcsec != r.sec || r.rel) { throw { kind: "compile", message: "a difference of labels from different sections cannot be expressed in an object file", line: r.line, col: 1, file: r.file }; }
+                via_pc = true;
+                addend = addend - v.pcoff + r.soff;
+            } else if (r.rel) { addend = addend - (r.pcend - r.soff); }
+            w64(tb, r.soff); w64(tb, (symi << 32) | reloc_type(ctx, r, via_pc)); w64(tb, addend);
+        }
+        rela.push({ sec: s, bytes: fbin.to_bytes(tb) });
+    }
+    // lay out the file
+    let shstr = strtab_new();
+    let f = fbin.buffer();
+    fbin.write_bytes(f, [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    w16(f, 1); w16(f, 0x3E); w32(f, 1); w64(f, 0); w64(f, 0);
+    let shoff_at = fbin.tell(f);
+    w64(f, 0); w32(f, 0); w16(f, 64); w16(f, 0); w16(f, 0); w16(f, 64);
+    let shnum_at = fbin.tell(f);
+    w16(f, 0); w16(f, 0);
+    let offs = {};
+    for (s in secs) {
+        if (s.flags.nobits) { offs[s.name] = fbin.size(f); continue; }
+        pad_to(f, s.align > 16 ? 16 : s.align);
+        offs[s.name] = fbin.size(f);
+        fbin.seek(f, 0, "end");
+        fbin.write_bytes(f, s.bytes);
+    }
+    let rela_off = [];
+    for (r in rela) { pad_to(f, 8); rela_off.push(fbin.size(f)); fbin.seek(f, 0, "end"); fbin.write_bytes(f, r.bytes); }
+    pad_to(f, 8);
+    let symoff = fbin.size(f);
+    fbin.seek(f, 0, "end");
+    fbin.write_bytes(f, fbin.to_bytes(symt));
+    let symsize = fbin.size(symt);
+    let stroff = fbin.size(f);
+    fbin.write_bytes(f, strt.bytes);
+    // section header names
+    let secnames = [];
+    for (s in secs) { secnames.push(strtab_add(shstr, s.name)); }
+    let rela_names = [];
+    for (r in rela) { rela_names.push(strtab_add(shstr, ".rela" + (util.starts_with(r.sec.name, ".") ? r.sec.name : "." + r.sec.name))); }
+    let n_note = strtab_add(shstr, ".note.GNU-stack");
+    let n_symtab = strtab_add(shstr, ".symtab"); let n_strtab = strtab_add(shstr, ".strtab"); let n_shstr = strtab_add(shstr, ".shstrtab");
+    let shstroff = fbin.size(f);
+    fbin.write_bytes(f, shstr.bytes);
+    pad_to(f, 8);
+    let shoff = fbin.size(f);
+    fbin.seek(f, 0, "end");
+    shdr(f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    for (i in 0..len(secs)) {
+        let s = secs[i];
+        shdr(f, secnames[i], s.flags.nobits ? 8 : 1, sec_flags(s), 0, offs[s.name], s.pos, 0, 0, s.align, 0);
+    }
+    let nsec = len(secs);
+    let symtab_idx = nsec + len(rela) + 2;
+    for (i in 0..len(rela)) {
+        shdr(f, rela_names[i], 4, 0x40, 0, rela_off[i], len(rela[i].bytes), symtab_idx, sec_index[rela[i].sec.name], 8, 24);
+    }
+    shdr(f, n_note, 1, 0, 0, fbin.size(f), 0, 0, 0, 1, 0);
+    shdr(f, n_symtab, 2, 0, 0, symoff, symsize, symtab_idx + 1, first_global, 8, 24);
+    shdr(f, n_strtab, 3, 0, 0, stroff, len(strt.bytes), 0, 0, 1, 0);
+    shdr(f, n_shstr, 3, 0, 0, shstroff, len(shstr.bytes), 0, 0, 1, 0);
+    let shnum = nsec + len(rela) + 5;
+    fbin.seek(f, shoff_at); w64(f, shoff);
+    fbin.seek(f, shnum_at); w16(f, shnum); w16(f, shnum - 1);
+    return f;
+}
+
+// ---------------------------------------------------------------- text formats
+/// Order map rows by address, then name (an insertion sort: no closures, which the Windows interpreter build mishandles).
+fn sort_rows(rows) -> any {
+    let out = [];
+    for (r in rows) {
+        var k = len(out);
+        while (k > 0 && (out[k - 1][0] > r[0] || (out[k - 1][0] == r[0] && util.str_cmp(out[k - 1][1], r[1]) > 0))) { k = k - 1; }
+        out.insert(k, r);
+    }
+    return out;
+}
+
+fn hex_lower(b: int) -> string { return util.hex2(b); }
+
+/// Intel HEX records for `bytes` loaded at `base`.
+fn intel_hex(bytes, base: int, entry: int) -> string {
+    var out = "";
+    var cur_hi = -1;
+    var i = 0;
+    let n = len(bytes);
+    while (i < n) {
+        let addr = base + i;
+        let hi = addr >> 16;
+        if (hi != cur_hi) {
+            let sum = (2 + 0 + 0 + 4 + ((hi >> 8) & 255) + (hi & 255)) & 255;
+            out = out + ":02000004" + util.hexn(hi, 4) + util.hexn((256 - sum) & 255, 2) + "\n";
+            cur_hi = hi;
+        }
+        var cnt = 16 - (addr & 15);
+        if (cnt > n - i) { cnt = n - i; }
+        if (((addr & 0xFFFF) + cnt) > 0x10000) { cnt = 0x10000 - (addr & 0xFFFF); }
+        var sum = cnt + ((addr >> 8) & 255) + (addr & 255);
+        var rec = ":" + util.hexn(cnt, 2) + util.hexn(addr & 0xFFFF, 4) + "00";
+        for (k in 0..cnt) { rec = rec + util.hex2(bytes[i + k]); sum = sum + bytes[i + k]; }
+        rec = rec + util.hexn((256 - (sum & 255)) & 255, 2);
+        out = out + rec + "\n";
+        i = i + cnt;
+    }
+    return out + ":00000001FF\n";
+}
+
+fn array_text(bytes, style: string, name: string) -> string {
+    var out = "";
+    if (style == "kc") { out = "// generated by KASM\nlet " + name + " = [\n"; }
+    else { out = "/* generated by KASM */\nunsigned char " + name + "[" + str(len(bytes)) + "] = {\n"; }
+    var line = "   ";
+    for (i in 0..len(bytes)) {
+        line = line + " 0x" + util.hex2(bytes[i]) + (i + 1 < len(bytes) ? "," : "");
+        if ((i + 1) % 12 == 0) { out = out + line + "\n"; line = "   "; }
+    }
+    if (line != "   ") { out = out + line + "\n"; }
+    return out + (style == "kc" ? "];\n" : "};\n");
+}
+
+fn hexdump(bytes, base: int) -> string {
+    var out = "";
+    var i = 0;
+    while (i < len(bytes)) {
+        var hx = ""; var asc = "";
+        for (k in 0..16) {
+            if (i + k < len(bytes)) {
+                let b = bytes[i + k];
+                hx = hx + util.hex2(b) + " ";
+                asc = asc + (b >= 32 && b < 127 ? chr(b) : ".");
+            } else { hx = hx + "   "; }
+            if (k == 7) { hx = hx + " "; }
+        }
+        out = out + util.hexn(base + i, 8) + "  " + hx + " |" + asc + "|\n";
+        i = i + 16;
+    }
+    return out;
+}
+
+fn listing_text(ctx, bin_base: bool) -> string {
+    var out = "";
+    for (e in ctx.listing) {
+        var base = 0;
+        if (bin_base) { let s = ctx.secs[e.sec]; base = s == null ? 0 : s.base; }
+        var off = e.off + base;
+        let bytes = e.bytes;
+        var first = "";
+        let nb = len(bytes) > 8 ? 8 : len(bytes);
+        for (k in 0..nb) { first = first + util.hex2(bytes[k]); }
+        if (e["size"] != null && len(bytes) == 0 && e.size > 0) { first = "<res " + str(e.size) + ">"; }
+        out = out + str(e.line).pad_left(5) + " " + util.hexn(off, 8) + " " + first.pad_right(17) + (e.src == null ? "" : e.src) + "\n";
+        var k = 8;
+        while (k < len(bytes) && k < 64) {
+            var more = "";
+            let lim = k + 8 > len(bytes) ? len(bytes) : k + 8;
+            for (j in k..lim) { more = more + util.hex2(bytes[j]); }
+            out = out + "      " + util.hexn(off + k, 8) + " " + more + "\n";
+            k = k + 8;
+        }
+        if (len(bytes) > 64) { out = out + "      ... (" + str(len(bytes) - 64) + " more bytes)\n"; }
+    }
+    return out;
+}
+
+fn map_text(ctx) -> string {
+    var out = "Sections\n  name                 address   size  align  flags\n";
+    for (n in ctx.order) {
+        let s = ctx.secs[n];
+        var fl = (s.flags.alloc ? "A" : "-") + (s.flags.write ? "W" : "-") + (s.flags.exec ? "X" : "-") + (s.flags.nobits ? " nobits" : "");
+        out = out + "  " + n.pad_right(18) + " " + util.hexn(s.base, 8) + " " + str(s.pos).pad_left(6) + "  " + str(s.align).pad_left(5) + "  " + fl + "\n";
+    }
+    out = out + "\nSymbols\n  address   scope  name\n";
+    let rows = [];
+    for (n in keys(ctx.syms)) {
+        let sy = ctx.syms[n];
+        if (sy.val == null || sy.kind == "extern" || util.starts_with(n, "..@")) { continue; }
+        if (sy.val.ext != null) { continue; }
+        rows.push([asm.sym_address(ctx, sy), n, sy.global ? "global" : "local", sy.kind]);
+    }
+    let sorted_rows = sort_rows(rows);
+    for (r in sorted_rows) { out = out + "  " + util.hexn(r[0], 8) + "  " + r[2].pad_right(6) + " " + r[1] + (r[3] == "equ" ? "  (constant)" : "") + "\n"; }
+    for (n in keys(ctx.syms)) { if (ctx.syms[n].kind == "extern") { out = out + "  " + "extern".pad_right(16) + " " + n + "\n"; } }
+    return out;
+}

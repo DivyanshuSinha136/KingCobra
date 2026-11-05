@@ -1,0 +1,214 @@
+// kasm_test.kc -- regression tests for KASM (run: kingcobra test kasm/tests/kasm_test.kc)
+// The instruction corpora (tests/insns*.txt) have golden encodings produced by GNU as (tests/insns*.hex, see tools/diff_gas.py).
+import std.fbin;
+import std.io;
+import std.system;
+import "../src/kasm.kc" as kasm;
+import "../../kcc/src/objin.kc" as objin;
+import "../../kcc/src/link.kc" as kcclink;
+import "../src/util.kc" as util;
+
+fn hex_of(src: string, o) -> string {
+    return util.hex_of(kasm.assemble(src, o).bytes).lower();
+}
+fn asm64(src: string) -> string { return hex_of("bits 64\n" + src + "\n", {}); }
+
+fn err_of(src: string) -> string {
+    try { kasm.assemble(src, {}); } catch (e) { return str(e.line) + ": " + e.message; }
+    return "";
+}
+
+fn corpus(name: string, bits: int) {
+    let src = io.lines("kasm/tests/" + name + ".txt");
+    let gold = io.lines("kasm/tests/" + name + ".hex");
+    for (i in 0..len(src)) {
+        let l = src[i];
+        if (l.trim() == "" || gold[i] == "-") { continue; }
+        var got = "";
+        try { got = hex_of("bits " + str(bits) + "\n" + l + "\n", {}); } catch (e) { got = "ERR " + str(e.message); }
+        assert_eq(name + ": " + l + " -> " + got, name + ": " + l + " -> " + gold[i]);
+    }
+}
+
+fn test_corpus_64() { corpus("insns64", 64); }
+fn test_corpus_32() { corpus("insns32", 32); }
+fn test_corpus_16() { corpus("insns16", 16); }
+fn test_corpus_avx_fma_bmi() { corpus("insns64_vex", 64); }
+fn test_corpus_x87() { corpus("insns_x87", 64); }
+
+fn test_basic_encodings() {
+    assert_eq(asm64("mov eax, 42\nret"), "b82a000000c3");
+    assert_eq(asm64("mov rax, 1"), "b801000000");                        // shortened to the 32-bit form
+    assert_eq(asm64("mov rax, -1"), "48c7c0ffffffff");
+    assert_eq(asm64("mov rax, qword 1"), "48b80100000000000000");       // explicit size keeps movabs
+    assert_eq(asm64("add rax, 5\nadd rax, 500"), "4883c0054805f4010000");
+    assert_eq(asm64("movabs rax, 0x1122334455667788"), "48b88877665544332211");
+}
+
+fn test_labels_and_jumps() {
+    assert_eq(asm64("a: jmp a"), "ebfe");
+    assert_eq(asm64("jmp b\nb: nop"), "eb0090");
+    assert_eq(asm64("jmp far_\ntimes 200 nop\nfar_: ret")[0..10], "e9c8000000");   // grows to rel32
+    assert_eq(asm64("jmp short a\na:"), "eb00");
+    assert_eq(asm64("a: jne a\n jne near a")[0..4], "75fe");
+    assert_eq(asm64("call f\nf: ret"), "e800000000c3");
+    assert_eq(asm64("x: nop\n.l: jmp .l\ny: nop\n.l: jmp .l"), "90ebfe90ebfe");   // local labels are scoped
+}
+
+fn test_data_directives() {
+    assert_eq(hex_of("db 'abc', 0, \"xy\"", {}), "616263007879");
+    assert_eq(hex_of("dw 0x1234, 'ab'\ndd 0xDEADBEEF, -1\ndq 1", {}), "34126162efbeadde" + "ffffffff0100000000000000");
+    assert_eq(hex_of("dd 1.5\ndq -2.0", {}), "0000c03f" + "00000000000000c0");
+    assert_eq(hex_of("times 3 db 7\nresb 2\ndb 1", {}), "070707000001");
+    assert_eq(hex_of("db 1\nalign 4\ndb 2", {}), "010f1f0002");
+    assert_eq(hex_of("db 1\nalign 4, 0xcc\ndb 2", {}), "01cccccc02");
+}
+
+fn test_expressions() {
+    assert_eq(asm64("mov eax, 2+3*4"), "b80e000000");
+    assert_eq(asm64("mov eax, (1<<4)|3"), "b813000000");
+    assert_eq(asm64("mov eax, ~0 & 0xff"), "b8ff000000");
+    assert_eq(asm64("mov eax, 7 % 4"), "b803000000");
+    assert_eq(asm64("mov eax, -7 // 2"), "b8fdffffff");
+    assert_eq(asm64("x equ 5\nmov eax, x*2+1"), "b80b000000");
+    assert_eq(asm64("msg: db 'hello'\nlen equ $ - msg\nmov ecx, len"), "68656c6c6fb905000000");
+    assert_eq(asm64("mov eax, 0x7fffffff\nmov eax, 0ffh\nmov eax, 101b\nmov eax, 1_000"), "b8ffffff7fb8ff000000b805000000b8e8030000");
+    assert_eq(asm64("mov al, 'A'"), "b041");
+}
+
+fn test_addressing() {
+    assert_eq(asm64("mov rax, [rax+rax]"), "488b0400");
+    assert_eq(asm64("mov eax, [rax*3]"), "8b0440");
+    assert_eq(asm64("mov eax, [rel lbl]\nlbl:"), "8b0500000000");
+    assert_eq(asm64("default rel\nmov eax, [lbl]\nlbl:"), "8b0500000000");
+    assert_eq(asm64("mov eax, [lbl]\nlbl:"), "8b042507000000");              // absolute by default (NASM compatible)
+    assert_eq(asm64("mov rax, [fs:0x28]"), "64488b042528000000");
+    assert_eq(asm64("mov eax, [rsp]
+mov eax, [r12]
+mov eax, [rbp]
+mov eax, [r13]"), "8b0424" + "418b0424" + "8b4500" + "418b4500");
+}
+
+fn test_preprocessor() {
+    assert_eq(asm64("%define N 3\nmov eax, N"), "b803000000");
+    assert_eq(asm64("%define sq(x) ((x)*(x))\nmov eax, sq(3+1)"), "b810000000");
+    assert_eq(asm64("%macro twice 1\n%1\n%1\n%endmacro\ntwice nop"), "9090");
+    assert_eq(asm64("%macro lp 2\n%%t: dec %1\njnz %%t\n%endmacro\nlp ecx, 0\nlp edx, 0"), "ffc975fcffca75fc");
+    assert_eq(asm64("%assign i 0\n%rep 3\nmov eax, i\n%assign i i+1\n%endrep"), "b800000000b801000000b802000000");
+    assert_eq(asm64("%if 1 > 2\nnop\n%elif 2 > 1\nint3\n%else\nhlt\n%endif"), "cc");
+    assert_eq(asm64("%ifdef FOO\nnop\n%else\nhlt\n%endif"), "f4");
+    assert_eq(hex_of("%ifdef FOO\nnop\n%endif\n", { defines: { FOO: 1 } }), "90");
+    assert_eq(asm64("%macro m 1-2 7\nmov eax, %1\nmov ebx, %2\n%endmacro\nm 1\nm 1, 2"), "b801000000bb07000000b801000000bb02000000");
+    assert_eq(asm64("mov eax, __LINE__"), "b802000000");
+}
+
+fn test_structs() {
+    let src = "struc point\n.x: resd 1\n.y: resd 1\n.tag: resb 1\nalignb 4\n.z: resd 1\nendstruc\nmov eax, point.y\nmov ebx, point_size\n" +
+              "istruc point\n at point.x, dd 7\n at point.y, dd 9\n at point.tag, db 'A'\n at point.z, dd 1\niend";
+    assert_eq(asm64(src), "b804000000" + "bb10000000" + "07000000" + "09000000" + "41000000" + "01000000");
+}
+
+fn test_modes() {
+    assert_eq(hex_of("bits 16\nmov ax, 5\nmov eax, 5", {}), "b80500" + "66b805000000");
+    assert_eq(hex_of("bits 32\nmov eax, 5\nmov ax, 5", {}), "b805000000" + "66b80500");
+    assert_eq(hex_of("mov eax, 5", { bits: 32 }), "b805000000");
+    let boot = kasm.assemble("bits 16\norg 0x7c00\nstart: jmp start\ntimes 510-($-$$) db 0\ndw 0xAA55\n", {}).bytes;
+    assert_eq(len(boot), 512);
+    assert_eq(boot[510], 0x55);
+    assert_eq(boot[511], 0xAA);
+    assert_eq(hex_of("bits 16\norg 0x100\nmov ax, lbl\nlbl:", {}), "b80301");
+}
+
+fn test_sections() {
+    let r = kasm.assemble("section .text\nnop\nsection .data\nd: dd 1\nsection .bss\nb: resd 4\nsection .text\nnop\n", {});
+    assert_eq(len(r.bytes), 2 + 4 + 0);
+    assert_eq(r.symbols["d"], 2 + 0);          // .data follows the 2 bytes of .text
+    let secs = r.sections;
+    assert_eq(secs[0].name, ".text");
+    assert_eq(secs[2].nobits, true);
+}
+
+fn test_errors() {
+    assert_eq(err_of("foo eax"), "1: unknown instruction 'foo'");
+    assert_eq(err_of("mov eax, [rax"), "1: missing ']'");
+    assert_eq(err_of("mov eax, undefined_sym"), "1: undefined symbol 'undefined_sym'");
+    assert_eq(err_of("l: nop\nl: nop"), "2: symbol 'l' is already defined (line 1)");
+    assert_eq(err_of("add [rax], 1"), "1: operation size not specified (use byte, word, dword, qword ...)");
+    assert_eq(err_of("mov eax, bl"), "1: invalid combination of opcode and operands: mov eax, bl (in 64-bit mode)");
+    assert_eq(err_of("bits 32\nmov rax, 1"), "2: register 'rax' needs 64-bit mode (use 'bits 64')");
+    assert_eq(err_of("jmp short x\ntimes 300 nop\nx:")[0..8], "1: short");
+    assert_eq(err_of("mov eax, 1/0"), "1: division by zero");
+    assert_eq(err_of("a: equ b\nb: equ a"), "1: undefined symbol 'b' (did you mean 'a'?)");
+    assert_eq(err_of("%error custom stop"), "1: custom stop");
+    assert_eq(err_of("%if 1\nnop"), "2: %if without %endif");
+    assert_eq(err_of("db 'unterminated"), "1: unterminated string");
+}
+
+fn test_warnings() {
+    let r = kasm.assemble("db 300\n", {});
+    assert_eq(len(r.warnings), 1);
+}
+
+fn test_elf_executable() {
+    // KASM writes the object; KCC's linker makes the executable from it
+    let src = "bits 64\nglobal _start\nsection .text\n_start: mov eax, 60\nxor edi, edi\nsyscall\nsection .data\nx: dq 1\nsection .bss\ny: resq 1\n";
+    let r = kasm.assemble(src, { format: "elf" });
+    let b = r.bytes;
+    assert_eq(b[0], 0x7F); assert_eq(b[1], 0x45); assert_eq(b[4], 2); assert_eq(b[16], 3);     // ELF, 64-bit, ET_DYN (PIE)
+    assert_eq(b[18], 0x3E);
+    let e = kasm.assemble(src, { format: "exe", target: "linux", entry: "_start" });
+    assert_eq(len(e.bytes), len(b));
+}
+
+fn test_object_then_kcc() {
+    let obj = kasm.assemble("bits 64\nglobal _start\n_start: mov eax, 60\nmov edi, 7\nsyscall\n", { format: "obj" });
+    let m = objin.load_elf_obj(fbin.from_bytes(obj.bytes), "t.o", "linux");
+    objin.pick_entry(m, "", "t.o");
+    assert_eq(m.entry_sym, "_start");
+    let img = fbin.to_bytes(kcclink.write(m, "exe", "t", "console"));
+    assert_eq(img[0], 0x7F); assert_eq(img[16], 3);
+    // raw binary: a function at offset 0 exported as main
+    let bin = kasm.assemble("bits 64\nmov eax, 42\nret\n", {}).bytes;
+    let m2 = objin.load_bin(fbin.from_bytes(bin), "r.bin", "linux", "main", 0);
+    objin.pick_entry(m2, "", "r.bin");
+    assert_eq(m2.entry_sym, null);
+    assert_eq(kcclink.write(m2, "exe", "r", "console") != null, true);
+    // a 32-bit absolute relocation cannot be linked position-independently: clear error
+    let bad = kasm.assemble("bits 64\nglobal f\nf: mov eax, f\nret\n", { format: "obj" });
+    var msg = "";
+    try { objin.load_elf_obj(fbin.from_bytes(bad.bytes), "bad.o", "linux"); } catch (e) { msg = e.message; }
+    assert_eq(msg.contains("position-independent"), true);
+}
+
+fn test_elf_object() {
+    let r = kasm.assemble("bits 64\nextern puts\nglobal f\nf: call puts\nret\n", { format: "elfobj" });
+    assert_eq(r.bytes[16], 1);          // ET_REL
+    assert_eq(r.bytes[0], 0x7F);
+}
+
+fn test_output_formats() {
+    let h = kasm.assemble("bits 64\nmov eax, 42\nret\n", { format: "hex" }).text;
+    assert_eq(h, ":020000040000FA\n:06000000B82A000000C355\n:00000001FF\n");
+    assert_eq(kasm.assemble("nop\nret", { format: "kc", name: "blob" }).text, "// generated by KASM\nlet blob = [\n    0x90, 0xC3\n];\n");
+    assert_eq(kasm.assemble("nop\nret", { format: "c", name: "blob" }).text, "/* generated by KASM */\nunsigned char blob[2] = {\n    0x90, 0xC3\n};\n");
+}
+
+fn test_listing_and_map() {
+    let r = kasm.assemble("start: mov eax, 1\nret\n", { listing: true });
+    assert_eq(r.listing.contains("B801000000"), true);
+    assert_eq(r.map.contains("start"), true);
+}
+
+fn test_code_helper() {
+    assert_eq(kasm.code("mov eax, 42\nret"), [0xB8, 0x2A, 0, 0, 0, 0xC3]);
+}
+
+fn test_relaxation_stress() {
+    // 120 forward / backward jumps over padding: sizes must converge and every target must land correctly
+    var s = "bits 64\n";
+    for (i in 0..40) { s = s + "l" + str(i) + ":\n jmp l" + str((i * 7 + 3) % 40) + "\n jne l" + str((i * 11 + 5) % 40) + "\n times " + str((i * 13) % 150) + " nop\n"; }
+    let r = kasm.assemble(s, {});
+    assert_eq(len(r.bytes) > 0, true);
+    let r2 = kasm.assemble(s, {});
+    assert_eq(r.bytes, r2.bytes);           // deterministic
+}

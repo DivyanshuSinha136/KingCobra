@@ -1,0 +1,815 @@
+// tables.kc -- the instruction forms.  Each mnemonic maps to an ordered list of "specs|encoding" strings; the first
+// form that fits the operands (and the size bookkeeping in encode.kc) wins, so shorter encodings come first.
+//
+// Operand specs (Intel-manual style):
+//   Eb Ew Ed Eq Ev   register or memory in ModRM.rm (v = current operand size)     Gb Gw Gd Gq Gv   register in ModRM.reg
+//   Mb Mw Md Mq Mt Mo My Mv M   memory only (M = any size)            Rd Rq Rv   register only in ModRM.rm
+//   Zb Zw Zd Zq Zv   register in the low 3 bits of the opcode        Ib Ibs Iw Id Iq Iz Iv   immediates (Ibs = sign-extended byte)
+//   Jb Jz   relative branch target     Ob Ov   moffs     Ap   far pointer    Mp   far memory pointer
+//   AL CL DX AX EAX RAX Av   fixed registers (Av = accumulator of the operand size)     1   the constant 1
+//   ES CS SS DS FS GS   fixed segment registers     Sw   segment register in ModRM.reg     Cd Dd   control / debug register
+//   Vx Vy   xmm / ymm in ModRM.reg     Ux Uy   xmm / ymm register only in ModRM.rm     Hx Hy   xmm / ymm in VEX.vvvv
+//   Wb Ww Wd Wq Wo Wy   xmm/ymm register or memory of that size in ModRM.rm     X0   the fixed register xmm0
+//   ST0 STi   x87 stack registers
+// Encoding tokens: hex bytes, /r /0../7, +r, ib iw id iq iz iv ap, cb cz, p66 pf2 pf3 (mandatory prefix), d64 rexw no64 x64
+//   dup o32max a16 a32 imm8=NN vex=L.pp.map.W
+// Author: Divyanshu Sinha (MIT License)
+import "util.kc" as util;
+
+fn h(v: int) -> string { return util.hex2(v); }
+
+const CCS = [["o", 0], ["no", 1], ["b", 2], ["c", 2], ["nae", 2], ["ae", 3], ["nb", 3], ["nc", 3], ["e", 4], ["z", 4],
+             ["ne", 5], ["nz", 5], ["be", 6], ["na", 6], ["a", 7], ["nbe", 7], ["s", 8], ["ns", 9], ["p", 10], ["pe", 10],
+             ["np", 11], ["po", 11], ["l", 12], ["nge", 12], ["ge", 13], ["nl", 13], ["le", 14], ["ng", 14], ["g", 15], ["nle", 15]];
+
+/// Add forms for one or more space-separated mnemonics.
+fn add(t, mns: string, specs: string, enc: string) {
+    for (mn in mns.split(" ")) {
+        if (mn == "") { continue; }
+        if (t[mn] == null) { t[mn] = []; }
+        t[mn].push(specs + "|" + enc);
+    }
+}
+
+fn build_int(t) {
+    // ALU group
+    let alu = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
+    for (n in 0..8) {
+        let b = n * 8;
+        add(t, alu[n], "Eb,Gb", h(b) + " /r");
+        add(t, alu[n], "Ev,Gv", h(b + 1) + " /r");
+        add(t, alu[n], "Gb,Eb", h(b + 2) + " /r");
+        add(t, alu[n], "Gv,Ev", h(b + 3) + " /r");
+        add(t, alu[n], "AL,Ib", h(b + 4) + " ib");
+        add(t, alu[n], "Ev,Ibs", "83 /" + str(n) + " ib");
+        add(t, alu[n], "Av,Iz", h(b + 5) + " iz");
+        add(t, alu[n], "Eb,Ib", "80 /" + str(n) + " ib");
+        add(t, alu[n], "Ev,Iz", "81 /" + str(n) + " iz");
+    }
+    // mov
+    add(t, "mov", "AL,Ob", "A0 ob");
+    add(t, "mov", "Av,Ov", "A1 ov");
+    add(t, "mov", "Ob,AL", "A2 ob");
+    add(t, "mov", "Ov,Av", "A3 ov");
+    add(t, "mov", "Eb,Gb", "88 /r");
+    add(t, "mov", "Ev,Gv", "89 /r");
+    add(t, "mov", "Gb,Eb", "8A /r");
+    add(t, "mov", "Gv,Ev", "8B /r");
+    add(t, "mov", "Ev,Sw", "8C /r");
+    add(t, "mov", "Sw,Ew", "8E /r");
+    add(t, "mov", "Sw,Ed", "8E /r");
+    add(t, "mov", "Zb,Ib", "B0 +r ib");
+    add(t, "mov", "Zv,Iv", "B8 +r iv");
+    add(t, "mov", "Eb,Ib", "C6 /0 ib");
+    add(t, "mov", "Ev,Iz", "C7 /0 iz");
+    add(t, "mov", "Rq,Cd", "0F 20 /r x64");
+    add(t, "mov", "Rd,Cd", "0F 20 /r no64");
+    add(t, "mov", "Cd,Rq", "0F 22 /r x64");
+    add(t, "mov", "Cd,Rd", "0F 22 /r no64");
+    add(t, "mov", "Rq,Dd", "0F 21 /r x64");
+    add(t, "mov", "Rd,Dd", "0F 21 /r no64");
+    add(t, "mov", "Dd,Rq", "0F 23 /r x64");
+    add(t, "mov", "Dd,Rd", "0F 23 /r no64");
+    add(t, "movabs", "AL,Oq", "A0 oq x64");
+    add(t, "movabs", "Av,Oq", "A1 oq x64");
+    add(t, "movabs", "Oq,AL", "A2 oq x64");
+    add(t, "movabs", "Oq,Av", "A3 oq x64");
+    add(t, "movabs", "Zq,Iq", "B8 +r iq rexw");
+    // test / xchg / lea / extension moves
+    add(t, "test", "Eb,Gb", "84 /r");
+    add(t, "test", "Ev,Gv", "85 /r");
+    add(t, "test", "Gb,Mb", "84 /r");
+    add(t, "test", "Gv,Mv", "85 /r");
+    add(t, "test", "AL,Ib", "A8 ib");
+    add(t, "test", "Av,Iz", "A9 iz");
+    add(t, "test", "Eb,Ib", "F6 /0 ib");
+    add(t, "test", "Ev,Iz", "F7 /0 iz");
+    add(t, "xchg", "Av,Zv", "90 +r");
+    add(t, "xchg", "Zv,Av", "90 +r");
+    add(t, "xchg", "Eb,Gb", "86 /r");
+    add(t, "xchg", "Ev,Gv", "87 /r");
+    add(t, "xchg", "Gb,Mb", "86 /r");
+    add(t, "xchg", "Gv,Mv", "87 /r");
+    add(t, "lea", "Gv,M", "8D /r");
+    add(t, "nop", "Ev", "0F 1F /0");
+    add(t, "movzx", "Gv,Eb", "0F B6 /r");
+    add(t, "movzx", "Gv,Ew", "0F B7 /r");
+    add(t, "movsx", "Gv,Eb", "0F BE /r");
+    add(t, "movsx", "Gv,Ew", "0F BF /r");
+    add(t, "movsx", "Gq,Ed", "63 /r rexw");
+    add(t, "movsxd", "Gq,Ed", "63 /r rexw");
+    add(t, "movsxd", "Gd,Ed", "63 /r");
+    // push / pop
+    add(t, "push", "Zv", "50 +r d64");
+    add(t, "push", "Ev", "FF /6 d64");
+    add(t, "push", "Ibs", "6A ib d64");
+    add(t, "push", "Iz", "68 iz d64");
+    add(t, "push", "FS", "0F A0");
+    add(t, "push", "GS", "0F A8");
+    add(t, "push", "ES", "06 no64");
+    add(t, "push", "CS", "0E no64");
+    add(t, "push", "SS", "16 no64");
+    add(t, "push", "DS", "1E no64");
+    add(t, "pop", "Zv", "58 +r d64");
+    add(t, "pop", "Ev", "8F /0 d64");
+    add(t, "pop", "FS", "0F A1");
+    add(t, "pop", "GS", "0F A9");
+    add(t, "pop", "ES", "07 no64");
+    add(t, "pop", "SS", "17 no64");
+    add(t, "pop", "DS", "1F no64");
+    // inc / dec / unary group
+    add(t, "inc", "Zv", "40 +r no64");
+    add(t, "dec", "Zv", "48 +r no64");
+    add(t, "inc", "Eb", "FE /0");
+    add(t, "inc", "Ev", "FF /0");
+    add(t, "dec", "Eb", "FE /1");
+    add(t, "dec", "Ev", "FF /1");
+    let un = ["not", "neg", "mul", "imul", "div", "idiv"];
+    let unx = [2, 3, 4, 5, 6, 7];
+    for (i in 0..6) {
+        add(t, un[i], "Eb", "F6 /" + str(unx[i]));
+        add(t, un[i], "Ev", "F7 /" + str(unx[i]));
+    }
+    add(t, "imul", "Gv,Ev", "0F AF /r");
+    add(t, "imul", "Gv,Ev,Ibs", "6B /r ib");
+    add(t, "imul", "Gv,Ev,Iz", "69 /r iz");
+    add(t, "imul", "Gv,Ibs", "6B /r ib dup");
+    add(t, "imul", "Gv,Iz", "69 /r iz dup");
+    // shifts and rotates
+    let sh = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"];
+    let shx = [0, 1, 2, 3, 4, 5, 4, 7];
+    for (i in 0..8) {
+        let e = "/" + str(shx[i]);
+        add(t, sh[i], "Eb,1", "D0 " + e);
+        add(t, sh[i], "Eb,CL", "D2 " + e);
+        add(t, sh[i], "Eb,Ib", "C0 " + e + " ib");
+        add(t, sh[i], "Ev,1", "D1 " + e);
+        add(t, sh[i], "Ev,CL", "D3 " + e);
+        add(t, sh[i], "Ev,Ib", "C1 " + e + " ib");
+    }
+    add(t, "shld", "Ev,Gv,Ib", "0F A4 /r ib");
+    add(t, "shld", "Ev,Gv,CL", "0F A5 /r");
+    add(t, "shrd", "Ev,Gv,Ib", "0F AC /r ib");
+    add(t, "shrd", "Ev,Gv,CL", "0F AD /r");
+    // bit ops
+    let bt = ["bt", "bts", "btr", "btc"];
+    let btop = [0xA3, 0xAB, 0xB3, 0xBB];
+    for (i in 0..4) {
+        add(t, bt[i], "Ev,Gv", "0F " + h(btop[i]) + " /r");
+        add(t, bt[i], "Ev,Ib", "0F BA /" + str(4 + i) + " ib");
+    }
+    add(t, "bsf", "Gv,Ev", "0F BC /r");
+    add(t, "bsr", "Gv,Ev", "0F BD /r");
+    add(t, "popcnt", "Gv,Ev", "pf3 0F B8 /r");
+    add(t, "lzcnt", "Gv,Ev", "pf3 0F BD /r");
+    add(t, "tzcnt", "Gv,Ev", "pf3 0F BC /r");
+    add(t, "bswap", "Zd", "0F C8 +r");
+    add(t, "bswap", "Zq", "0F C8 +r rexw");
+    add(t, "movbe", "Gv,Mv", "0F 38 F0 /r");
+    add(t, "movbe", "Mv,Gv", "0F 38 F1 /r");
+    add(t, "adcx", "Gv,Ev", "p66 0F 38 F6 /r");
+    add(t, "adox", "Gv,Ev", "pf3 0F 38 F6 /r");
+    add(t, "crc32", "Gd,Eb", "pf2 0F 38 F0 /r");
+    add(t, "crc32", "Gd,Ew", "p66 pf2 0F 38 F1 /r");
+    add(t, "crc32", "Gd,Ed", "pf2 0F 38 F1 /r");
+    add(t, "crc32", "Gq,Eb", "pf2 0F 38 F0 /r rexw");
+    add(t, "crc32", "Gq,Eq", "pf2 0F 38 F1 /r rexw");
+    // condition-code families
+    for (i in 0..len(CCS)) {
+        let cc = CCS[i][0];
+        let n = CCS[i][1];
+        add(t, "j" + cc, "Jb", h(0x70 + n) + " cb");
+        add(t, "j" + cc, "Jz", "0F " + h(0x80 + n) + " cz");
+        add(t, "cmov" + cc, "Gv,Ev", "0F " + h(0x40 + n) + " /r");
+        add(t, "set" + cc, "Eb", "0F " + h(0x90 + n) + " /0");
+    }
+    // control flow
+    add(t, "jmp", "Jb", "EB cb");
+    add(t, "jmp", "Jz", "E9 cz");
+    add(t, "jmp", "Ev", "FF /4 d64");
+    add(t, "jmp", "Mp", "FF /5");
+    add(t, "jmp", "Ap", "EA ap no64");
+    add(t, "call", "Jz", "E8 cz");
+    add(t, "call", "Ev", "FF /2 d64");
+    add(t, "call", "Mp", "FF /3");
+    add(t, "call", "Ap", "9A ap no64");
+    add(t, "ret retn", "", "C3 d64");
+    add(t, "ret retn", "Iw", "C2 iw d64");
+    add(t, "retf", "", "CB");
+    add(t, "retf", "Iw", "CA iw");
+    add(t, "loop", "Jb", "E2 cb");
+    add(t, "loope loopz", "Jb", "E1 cb");
+    add(t, "loopne loopnz", "Jb", "E0 cb");
+    add(t, "jcxz", "Jb", "E3 cb a16 no64");
+    add(t, "jecxz", "Jb", "E3 cb a32");
+    add(t, "jrcxz", "Jb", "E3 cb x64");
+    add(t, "int", "Ib", "CD ib");
+    add(t, "int3", "", "CC");
+    add(t, "int1 icebp", "", "F1");
+    add(t, "into", "", "CE no64");
+    add(t, "iret", "", "CF");
+    add(t, "iretd", "", "o32 CF");
+    add(t, "iretq", "", "CF rexw x64");
+    add(t, "iretw", "", "o16 CF");
+    add(t, "enter", "Iw,Ib", "C8 iw ib");
+    add(t, "leave", "", "C9 d64");
+    // single-byte / no-operand instructions
+    let simple = [["nop", "90"], ["hlt", "F4"], ["cli", "FA"], ["sti", "FB"], ["cld", "FC"], ["std", "FD"], ["clc", "F8"], ["stc", "F9"],
+        ["cmc", "F5"], ["lahf", "9F"], ["sahf", "9E"], ["xlat", "D7"], ["xlatb", "D7"], ["wait", "9B"], ["fwait", "9B"],
+        ["pushf pushfq", "9C d64"], ["popf popfq", "9D d64"], ["pushfd", "o32 9C no64"], ["popfd", "o32 9D no64"],
+        ["pushfw", "o16 9C"], ["popfw", "o16 9D"], ["pusha", "o16 60 no64"], ["pushad", "o32 60 no64"], ["popa", "o16 61 no64"], ["popad", "o32 61 no64"],
+        ["cbw", "o16 98"], ["cwde", "o32 98"], ["cdqe", "98 rexw x64"], ["cwd", "o16 99"], ["cdq", "o32 99"], ["cqo", "99 rexw x64"],
+        ["cpuid", "0F A2"], ["rdtsc", "0F 31"], ["rdtscp", "0F 01 F9"], ["rdmsr", "0F 32"], ["wrmsr", "0F 30"], ["rdpmc", "0F 33"],
+        ["syscall", "0F 05"], ["sysret sysretl", "0F 07"], ["sysretq", "0F 07 rexw x64"], ["sysenter", "0F 34"], ["sysexit", "0F 35"],
+        ["ud2", "0F 0B"], ["wbinvd", "0F 09"], ["invd", "0F 08"], ["clts", "0F 06"], ["swapgs", "0F 01 F8 x64"],
+        ["mfence", "0F AE F0"], ["lfence", "0F AE E8"], ["sfence", "0F AE F8"], ["pause", "pf3 90"],
+        ["xgetbv", "0F 01 D0"], ["xsetbv", "0F 01 D1"], ["monitor", "0F 01 C8"], ["mwait", "0F 01 C9"],
+        ["aaa", "37 no64"], ["aas", "3F no64"], ["daa", "27 no64"], ["das", "2F no64"], ["emms", "0F 77"], ["femms", "0F 0E"], ["rsm", "0F AA"], ["ud1", "0F B9"], ["getsec", "0F 37"],
+        ["lock", ""], ["cmpsb", "A6"], ["cmpsw", "o16 A7"], ["cmpsd", "o32 A7"], ["cmpsq", "A7 rexw x64"],
+        ["movsb", "A4"], ["movsw", "o16 A5"], ["movsd", "o32 A5"], ["movsq", "A5 rexw x64"],
+        ["stosb", "AA"], ["stosw", "o16 AB"], ["stosd", "o32 AB"], ["stosq", "AB rexw x64"],
+        ["lodsb", "AC"], ["lodsw", "o16 AD"], ["lodsd", "o32 AD"], ["lodsq", "AD rexw x64"],
+        ["scasb", "AE"], ["scasw", "o16 AF"], ["scasd", "o32 AF"], ["scasq", "AF rexw x64"],
+        ["insb", "6C"], ["insw", "o16 6D"], ["insd", "o32 6D"], ["outsb", "6E"], ["outsw", "o16 6F"], ["outsd", "o32 6F"]];
+    for (i in 0..len(simple)) {
+        if (simple[i][0] == "lock") { continue; }
+        add(t, simple[i][0], "", simple[i][1]);
+    }
+    // string instructions with operands (the operands only select the size)
+    add(t, "movs", "Mb,Mb", "A4");
+    add(t, "movs", "Mv,Mv", "A5");
+    add(t, "cmps", "Mb,Mb", "A6");
+    add(t, "cmps", "Mv,Mv", "A7");
+    add(t, "stos", "Mb", "AA");
+    add(t, "stos", "Mv", "AB");
+    add(t, "lods", "Mb", "AC");
+    add(t, "lods", "Mv", "AD");
+    add(t, "scas", "Mb", "AE");
+    add(t, "scas", "Mv", "AF");
+    // port I/O
+    add(t, "in", "AL,Ib", "E4 ib");
+    add(t, "in", "Av,Ib", "E5 ib o32max");
+    add(t, "in", "AL,DX", "EC");
+    add(t, "in", "Av,DX", "ED o32max");
+    add(t, "out", "Ib,AL", "E6 ib");
+    add(t, "out", "Ib,Av", "E7 ib o32max");
+    add(t, "out", "DX,AL", "EE");
+    add(t, "out", "DX,Av", "EF o32max");
+    // atomics
+    add(t, "cmpxchg", "Eb,Gb", "0F B0 /r");
+    add(t, "cmpxchg", "Ev,Gv", "0F B1 /r");
+    add(t, "xadd", "Eb,Gb", "0F C0 /r");
+    add(t, "xadd", "Ev,Gv", "0F C1 /r");
+    add(t, "cmpxchg8b", "Mq", "0F C7 /1");
+    add(t, "cmpxchg16b", "Mo", "0F C7 /1 rexw x64");
+    // system
+    add(t, "lgdt", "M", "0F 01 /2");
+    add(t, "lidt", "M", "0F 01 /3");
+    add(t, "sgdt", "M", "0F 01 /0");
+    add(t, "sidt", "M", "0F 01 /1");
+    add(t, "lldt", "Ew", "0F 00 /2");
+    add(t, "ltr", "Ew", "0F 00 /3");
+    add(t, "sldt", "Ev", "0F 00 /0");
+    add(t, "str", "Ev", "0F 00 /1");
+    add(t, "verr", "Ew", "0F 00 /4");
+    add(t, "verw", "Ew", "0F 00 /5");
+    add(t, "lmsw", "Ew", "0F 01 /6");
+    add(t, "smsw", "Ev", "0F 01 /4");
+    add(t, "invlpg", "M", "0F 01 /7");
+    add(t, "clflush", "M", "0F AE /7");
+    add(t, "clflushopt", "M", "p66 0F AE /7");
+    add(t, "clwb", "M", "p66 0F AE /6");
+    add(t, "prefetchnta", "M", "0F 18 /0");
+    add(t, "prefetcht0", "M", "0F 18 /1");
+    add(t, "prefetcht1", "M", "0F 18 /2");
+    add(t, "prefetcht2", "M", "0F 18 /3");
+    add(t, "prefetchw", "M", "0F 0D /1");
+    add(t, "lds", "Gv,M", "C5 /r no64");
+    add(t, "les", "Gv,M", "C4 /r no64");
+    add(t, "bound", "Gv,M", "62 /r no64");
+    add(t, "arpl", "Ew,Gw", "63 /r no64");
+    add(t, "aam", "", "D4 0A no64");
+    add(t, "aam", "Ib", "D4 ib no64");
+    add(t, "aad", "", "D5 0A no64");
+    add(t, "aad", "Ib", "D5 ib no64");
+    add(t, "lar", "Gv,Ew", "0F 02 /r");
+    add(t, "lsl", "Gv,Ew", "0F 03 /r");
+    add(t, "lfs", "Gv,M", "0F B4 /r");
+    add(t, "lgs", "Gv,M", "0F B5 /r");
+    add(t, "lss", "Gv,M", "0F B2 /r");
+    add(t, "rdrand", "Ev", "0F C7 /6");
+    add(t, "rdseed", "Ev", "0F C7 /7");
+    add(t, "rdfsbase", "Rd", "pf3 0F AE /0");
+    add(t, "rdfsbase", "Rq", "pf3 0F AE /0 rexw");
+    add(t, "rdgsbase", "Rd", "pf3 0F AE /1");
+    add(t, "rdgsbase", "Rq", "pf3 0F AE /1 rexw");
+    add(t, "wrfsbase", "Rd", "pf3 0F AE /2");
+    add(t, "wrfsbase", "Rq", "pf3 0F AE /2 rexw");
+    add(t, "wrgsbase", "Rd", "pf3 0F AE /3");
+    add(t, "wrgsbase", "Rq", "pf3 0F AE /3 rexw");
+    add(t, "fxsave", "M", "0F AE /0");
+    add(t, "fxrstor", "M", "0F AE /1");
+    add(t, "fxsave64", "M", "0F AE /0 rexw");
+    add(t, "fxrstor64", "M", "0F AE /1 rexw");
+    add(t, "ldmxcsr", "Md", "0F AE /2");
+    add(t, "stmxcsr", "Md", "0F AE /3");
+    add(t, "xsave", "M", "0F AE /4");
+    add(t, "xrstor", "M", "0F AE /5");
+    add(t, "xsaveopt", "M", "0F AE /6");
+    add(t, "xsave64", "M", "0F AE /4 rexw");
+    add(t, "xrstor64", "M", "0F AE /5 rexw");
+}
+
+// ---------------------------------------------------------------- SSE / SSE2 / SSE3 / SSSE3 / SSE4
+/// 66-prefixed integer-style operation  Vx,Wo
+fn sse66(t, name: string, map: string, op: int) { add(t, name, "Vx,Wo", "p66 " + map + h(op) + " /r"); }
+
+fn build_sse(t) {
+    // float arithmetic: ps pd ss sd
+    let ar = [["add", 0x58], ["mul", 0x59], ["sub", 0x5C], ["min", 0x5D], ["div", 0x5E], ["max", 0x5F], ["sqrt", 0x51]];
+    for (i in 0..len(ar)) {
+        let n = ar[i][0]; let o = h(ar[i][1]);
+        add(t, n + "ps", "Vx,Wo", "0F " + o + " /r");
+        add(t, n + "pd", "Vx,Wo", "p66 0F " + o + " /r");
+        add(t, n + "ss", "Vx,Wd", "pf3 0F " + o + " /r");
+        add(t, n + "sd", "Vx,Wq", "pf2 0F " + o + " /r");
+    }
+    add(t, "rsqrtps", "Vx,Wo", "0F 52 /r");   add(t, "rsqrtss", "Vx,Wd", "pf3 0F 52 /r");
+    add(t, "rcpps", "Vx,Wo", "0F 53 /r");     add(t, "rcpss", "Vx,Wd", "pf3 0F 53 /r");
+    let lg = [["and", 0x54], ["andn", 0x55], ["or", 0x56], ["xor", 0x57], ["unpckl", 0x14], ["unpckh", 0x15]];
+    for (i in 0..len(lg)) {
+        add(t, lg[i][0] + "ps", "Vx,Wo", "0F " + h(lg[i][1]) + " /r");
+        add(t, lg[i][0] + "pd", "Vx,Wo", "p66 0F " + h(lg[i][1]) + " /r");
+    }
+    add(t, "haddps", "Vx,Wo", "pf2 0F 7C /r");   add(t, "haddpd", "Vx,Wo", "p66 0F 7C /r");
+    add(t, "hsubps", "Vx,Wo", "pf2 0F 7D /r");   add(t, "hsubpd", "Vx,Wo", "p66 0F 7D /r");
+    add(t, "addsubps", "Vx,Wo", "pf2 0F D0 /r"); add(t, "addsubpd", "Vx,Wo", "p66 0F D0 /r");
+    // compares
+    add(t, "cmpps", "Vx,Wo,Ib", "0F C2 /r ib");
+    add(t, "cmppd", "Vx,Wo,Ib", "p66 0F C2 /r ib");
+    add(t, "cmpss", "Vx,Wd,Ib", "pf3 0F C2 /r ib");
+    add(t, "cmpsd", "Vx,Wq,Ib", "pf2 0F C2 /r ib");
+    let pr = ["eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord"];
+    for (i in 0..8) {
+        add(t, "cmp" + pr[i] + "ps", "Vx,Wo", "0F C2 /r imm8=" + str(i));
+        add(t, "cmp" + pr[i] + "pd", "Vx,Wo", "p66 0F C2 /r imm8=" + str(i));
+        add(t, "cmp" + pr[i] + "ss", "Vx,Wd", "pf3 0F C2 /r imm8=" + str(i));
+        add(t, "cmp" + pr[i] + "sd", "Vx,Wq", "pf2 0F C2 /r imm8=" + str(i));
+    }
+    add(t, "shufps", "Vx,Wo,Ib", "0F C6 /r ib");
+    add(t, "shufpd", "Vx,Wo,Ib", "p66 0F C6 /r ib");
+    add(t, "comiss", "Vx,Wd", "0F 2F /r");   add(t, "ucomiss", "Vx,Wd", "0F 2E /r");
+    add(t, "comisd", "Vx,Wq", "p66 0F 2F /r"); add(t, "ucomisd", "Vx,Wq", "p66 0F 2E /r");
+    // moves
+    add(t, "movaps", "Vx,Wo", "0F 28 /r");  add(t, "movaps", "Wo,Vx", "0F 29 /r");
+    add(t, "movups", "Vx,Wo", "0F 10 /r");  add(t, "movups", "Wo,Vx", "0F 11 /r");
+    add(t, "movapd", "Vx,Wo", "p66 0F 28 /r"); add(t, "movapd", "Wo,Vx", "p66 0F 29 /r");
+    add(t, "movupd", "Vx,Wo", "p66 0F 10 /r"); add(t, "movupd", "Wo,Vx", "p66 0F 11 /r");
+    add(t, "movss", "Vx,Wd", "pf3 0F 10 /r");  add(t, "movss", "Wd,Vx", "pf3 0F 11 /r");
+    add(t, "movsd", "Vx,Wq", "pf2 0F 10 /r");  add(t, "movsd", "Wq,Vx", "pf2 0F 11 /r");
+    add(t, "movlps", "Vx,Mq", "0F 12 /r");  add(t, "movlps", "Mq,Vx", "0F 13 /r");
+    add(t, "movhps", "Vx,Mq", "0F 16 /r");  add(t, "movhps", "Mq,Vx", "0F 17 /r");
+    add(t, "movlpd", "Vx,Mq", "p66 0F 12 /r"); add(t, "movlpd", "Mq,Vx", "p66 0F 13 /r");
+    add(t, "movhpd", "Vx,Mq", "p66 0F 16 /r"); add(t, "movhpd", "Mq,Vx", "p66 0F 17 /r");
+    add(t, "movlhps", "Vx,Ux", "0F 16 /r");  add(t, "movhlps", "Vx,Ux", "0F 12 /r");
+    add(t, "movmskps", "Gd,Ux", "0F 50 /r"); add(t, "movmskpd", "Gd,Ux", "p66 0F 50 /r");
+    add(t, "movmskps", "Gq,Ux", "0F 50 /r"); add(t, "movmskpd", "Gq,Ux", "p66 0F 50 /r");
+    add(t, "movntps", "Mo,Vx", "0F 2B /r");  add(t, "movntpd", "Mo,Vx", "p66 0F 2B /r");
+    add(t, "movntdq", "Mo,Vx", "p66 0F E7 /r"); add(t, "movntdqa", "Vx,Mo", "p66 0F 38 2A /r");
+    add(t, "movnti", "Md,Gd", "0F C3 /r");   add(t, "movnti", "Mq,Gq", "0F C3 /r rexw");
+    add(t, "movdqa", "Vx,Wo", "p66 0F 6F /r"); add(t, "movdqa", "Wo,Vx", "p66 0F 7F /r");
+    add(t, "movdqu", "Vx,Wo", "pf3 0F 6F /r"); add(t, "movdqu", "Wo,Vx", "pf3 0F 7F /r");
+    add(t, "lddqu", "Vx,Mo", "pf2 0F F0 /r");
+    add(t, "movddup", "Vx,Wq", "pf2 0F 12 /r"); add(t, "movshdup", "Vx,Wo", "pf3 0F 16 /r"); add(t, "movsldup", "Vx,Wo", "pf3 0F 12 /r");
+    add(t, "movd", "Vx,Ed", "p66 0F 6E /r");  add(t, "movd", "Ed,Vx", "p66 0F 7E /r");
+    add(t, "movq", "Vx,Wq", "pf3 0F 7E /r");  add(t, "movq", "Wq,Vx", "p66 0F D6 /r");
+    add(t, "movq", "Vx,Eq", "p66 0F 6E /r rexw"); add(t, "movq", "Eq,Vx", "p66 0F 7E /r rexw");
+    add(t, "maskmovdqu", "Vx,Ux", "p66 0F F7 /r");
+    // conversions
+    add(t, "cvtsi2ss", "Vx,Ed", "pf3 0F 2A /r"); add(t, "cvtsi2ss", "Vx,Eq", "pf3 0F 2A /r rexw");
+    add(t, "cvtsi2sd", "Vx,Ed", "pf2 0F 2A /r"); add(t, "cvtsi2sd", "Vx,Eq", "pf2 0F 2A /r rexw");
+    add(t, "cvttss2si", "Gd,Wd", "pf3 0F 2C /r"); add(t, "cvttss2si", "Gq,Wd", "pf3 0F 2C /r rexw");
+    add(t, "cvttsd2si", "Gd,Wq", "pf2 0F 2C /r"); add(t, "cvttsd2si", "Gq,Wq", "pf2 0F 2C /r rexw");
+    add(t, "cvtss2si", "Gd,Wd", "pf3 0F 2D /r");  add(t, "cvtss2si", "Gq,Wd", "pf3 0F 2D /r rexw");
+    add(t, "cvtsd2si", "Gd,Wq", "pf2 0F 2D /r");  add(t, "cvtsd2si", "Gq,Wq", "pf2 0F 2D /r rexw");
+    add(t, "cvtss2sd", "Vx,Wd", "pf3 0F 5A /r");  add(t, "cvtsd2ss", "Vx,Wq", "pf2 0F 5A /r");
+    add(t, "cvtps2pd", "Vx,Wq", "0F 5A /r");      add(t, "cvtpd2ps", "Vx,Wo", "p66 0F 5A /r");
+    add(t, "cvtdq2ps", "Vx,Wo", "0F 5B /r");      add(t, "cvtps2dq", "Vx,Wo", "p66 0F 5B /r");
+    add(t, "cvttps2dq", "Vx,Wo", "pf3 0F 5B /r"); add(t, "cvtdq2pd", "Vx,Wq", "pf3 0F E6 /r");
+    add(t, "cvtpd2dq", "Vx,Wo", "pf2 0F E6 /r");  add(t, "cvttpd2dq", "Vx,Wo", "p66 0F E6 /r");
+    // integer SSE2 (66 0F xx)
+    let i2 = [["paddb", 0xFC], ["paddw", 0xFD], ["paddd", 0xFE], ["paddq", 0xD4], ["psubb", 0xF8], ["psubw", 0xF9], ["psubd", 0xFA], ["psubq", 0xFB],
+        ["paddsb", 0xEC], ["paddsw", 0xED], ["paddusb", 0xDC], ["paddusw", 0xDD], ["psubsb", 0xE8], ["psubsw", 0xE9], ["psubusb", 0xD8], ["psubusw", 0xD9],
+        ["pmullw", 0xD5], ["pmulhw", 0xE5], ["pmulhuw", 0xE4], ["pmuludq", 0xF4], ["pmaddwd", 0xF5], ["pand", 0xDB], ["pandn", 0xDF], ["por", 0xEB], ["pxor", 0xEF],
+        ["pcmpeqb", 0x74], ["pcmpeqw", 0x75], ["pcmpeqd", 0x76], ["pcmpgtb", 0x64], ["pcmpgtw", 0x65], ["pcmpgtd", 0x66],
+        ["pavgb", 0xE0], ["pavgw", 0xE3], ["pmaxub", 0xDE], ["pminub", 0xDA], ["pmaxsw", 0xEE], ["pminsw", 0xEA], ["psadbw", 0xF6],
+        ["packsswb", 0x63], ["packssdw", 0x6B], ["packuswb", 0x67],
+        ["punpcklbw", 0x60], ["punpcklwd", 0x61], ["punpckldq", 0x62], ["punpcklqdq", 0x6C],
+        ["punpckhbw", 0x68], ["punpckhwd", 0x69], ["punpckhdq", 0x6A], ["punpckhqdq", 0x6D],
+        ["psllw", 0xF1], ["pslld", 0xF2], ["psllq", 0xF3], ["psrlw", 0xD1], ["psrld", 0xD2], ["psrlq", 0xD3], ["psraw", 0xE1], ["psrad", 0xE2]];
+    for (i in 0..len(i2)) { sse66(t, i2[i][0], "0F ", i2[i][1]); }
+    let sh = [["psllw", 0x71, 6], ["pslld", 0x72, 6], ["psllq", 0x73, 6], ["psrlw", 0x71, 2], ["psrld", 0x72, 2], ["psrlq", 0x73, 2],
+        ["psraw", 0x71, 4], ["psrad", 0x72, 4], ["psrldq", 0x73, 3], ["pslldq", 0x73, 7]];
+    for (i in 0..len(sh)) { add(t, sh[i][0], "Ux,Ib", "p66 0F " + h(sh[i][1]) + " /" + str(sh[i][2]) + " ib"); }
+    add(t, "pshufd", "Vx,Wo,Ib", "p66 0F 70 /r ib");
+    add(t, "pshufhw", "Vx,Wo,Ib", "pf3 0F 70 /r ib");
+    add(t, "pshuflw", "Vx,Wo,Ib", "pf2 0F 70 /r ib");
+    add(t, "pmovmskb", "Gd,Ux", "p66 0F D7 /r");
+    add(t, "pextrw", "Gd,Ux,Ib", "p66 0F C5 /r ib");
+    add(t, "pinsrw", "Vx,Ed,Ib", "p66 0F C4 /r ib");
+    add(t, "pinsrw", "Vx,Mw,Ib", "p66 0F C4 /r ib");
+    // SSSE3 / SSE4 : 66 0F 38 xx
+    let s38 = [["pshufb", 0x00], ["phaddw", 0x01], ["phaddd", 0x02], ["phaddsw", 0x03], ["pmaddubsw", 0x04], ["phsubw", 0x05], ["phsubd", 0x06],
+        ["phsubsw", 0x07], ["psignb", 0x08], ["psignw", 0x09], ["psignd", 0x0A], ["pmulhrsw", 0x0B], ["ptest", 0x17], ["pabsb", 0x1C], ["pabsw", 0x1D], ["pabsd", 0x1E],
+        ["pmuldq", 0x28], ["pcmpeqq", 0x29], ["packusdw", 0x2B], ["pcmpgtq", 0x37], ["pminsb", 0x38], ["pminsd", 0x39], ["pminuw", 0x3A], ["pminud", 0x3B],
+        ["pmaxsb", 0x3C], ["pmaxsd", 0x3D], ["pmaxuw", 0x3E], ["pmaxud", 0x3F], ["pmulld", 0x40], ["phminposuw", 0x41],
+        ["aesimc", 0xDB], ["aesenc", 0xDC], ["aesenclast", 0xDD], ["aesdec", 0xDE], ["aesdeclast", 0xDF]];
+    for (i in 0..len(s38)) { sse66(t, s38[i][0], "0F 38 ", s38[i][1]); }
+    let mx = [["bw", 0x20, "Wq"], ["bd", 0x21, "Wd"], ["bq", 0x22, "Ww"], ["wd", 0x23, "Wq"], ["wq", 0x24, "Wd"], ["dq", 0x25, "Wq"]];
+    for (i in 0..len(mx)) {
+        add(t, "pmovsx" + mx[i][0], "Vx," + mx[i][2], "p66 0F 38 " + h(mx[i][1]) + " /r");
+        add(t, "pmovzx" + mx[i][0], "Vx," + mx[i][2], "p66 0F 38 " + h(mx[i][1] + 0x10) + " /r");
+    }
+    add(t, "blendvps", "Vx,Wo,X0", "p66 0F 38 14 /r");
+    add(t, "blendvpd", "Vx,Wo,X0", "p66 0F 38 15 /r");
+    add(t, "pblendvb", "Vx,Wo,X0", "p66 0F 38 10 /r");
+    // 66 0F 3A xx with imm8
+    let s3a = [["roundps", 0x08, "Wo"], ["roundpd", 0x09, "Wo"], ["roundss", 0x0A, "Wd"], ["roundsd", 0x0B, "Wq"], ["blendps", 0x0C, "Wo"],
+        ["blendpd", 0x0D, "Wo"], ["pblendw", 0x0E, "Wo"], ["palignr", 0x0F, "Wo"], ["insertps", 0x21, "Wd"], ["dpps", 0x40, "Wo"], ["dppd", 0x41, "Wo"],
+        ["mpsadbw", 0x42, "Wo"], ["pclmulqdq", 0x44, "Wo"], ["pcmpestrm", 0x60, "Wo"], ["pcmpestri", 0x61, "Wo"], ["pcmpistrm", 0x62, "Wo"],
+        ["pcmpistri", 0x63, "Wo"], ["aeskeygenassist", 0xDF, "Wo"]];
+    for (i in 0..len(s3a)) { add(t, s3a[i][0], "Vx," + s3a[i][2] + ",Ib", "p66 0F 3A " + h(s3a[i][1]) + " /r ib"); }
+    add(t, "pextrb", "Ed,Vx,Ib", "p66 0F 3A 14 /r ib");  add(t, "pextrb", "Mb,Vx,Ib", "p66 0F 3A 14 /r ib");
+    add(t, "pextrw", "Ed,Vx,Ib", "p66 0F 3A 15 /r ib");  add(t, "pextrw", "Mw,Vx,Ib", "p66 0F 3A 15 /r ib");
+    add(t, "pextrd", "Ed,Vx,Ib", "p66 0F 3A 16 /r ib");  add(t, "pextrq", "Eq,Vx,Ib", "p66 0F 3A 16 /r ib rexw");
+    add(t, "extractps", "Ed,Vx,Ib", "p66 0F 3A 17 /r ib");
+    add(t, "pinsrb", "Vx,Ed,Ib", "p66 0F 3A 20 /r ib");  add(t, "pinsrb", "Vx,Mb,Ib", "p66 0F 3A 20 /r ib");
+    add(t, "pinsrd", "Vx,Ed,Ib", "p66 0F 3A 22 /r ib");  add(t, "pinsrq", "Vx,Eq,Ib", "p66 0F 3A 22 /r ib rexw");
+}
+
+
+// ---------------------------------------------------------------- AVX / AVX2 / FMA / BMI (VEX encoded)
+/// vex(t, mnemonic, specs, "L.pp.map.W", opcode-hex, extra tokens)
+fn vex(t, mn: string, specs: string, v: string, op: int, tail: string) {
+    add(t, mn, specs, "vex=" + v + " " + h(op) + " /r" + (tail == "" ? "" : " " + tail));
+}
+
+/// 128-bit and 256-bit register forms of a three-operand instruction  Vx,Hx,Wo / Vy,Hy,Wy
+fn vex3(t, mn: string, pp: string, map: string, op: int, w: string, tail: string) {
+    vex(t, mn, "Vx,Hx,Wo" + (tail == "ib" ? ",Ib" : ""), "128." + pp + "." + map + "." + w, op, tail);
+    vex(t, mn, "Vy,Hy,Wy" + (tail == "ib" ? ",Ib" : ""), "256." + pp + "." + map + "." + w, op, tail);
+}
+/// two-operand (no vvvv) forms
+fn vex2(t, mn: string, pp: string, map: string, op: int, w: string, tail: string) {
+    vex(t, mn, "Vx,Wo" + (tail == "ib" ? ",Ib" : ""), "128." + pp + "." + map + "." + w, op, tail);
+    vex(t, mn, "Vy,Wy" + (tail == "ib" ? ",Ib" : ""), "256." + pp + "." + map + "." + w, op, tail);
+}
+
+fn build_vex(t) {
+    let ar = [["add", 0x58], ["mul", 0x59], ["sub", 0x5C], ["min", 0x5D], ["div", 0x5E], ["max", 0x5F]];
+    for (i in 0..len(ar)) {
+        let n = ar[i][0]; let o = ar[i][1];
+        vex3(t, "v" + n + "ps", "0", "0f", o, "wig", "");
+        vex3(t, "v" + n + "pd", "66", "0f", o, "wig", "");
+        vex(t, "v" + n + "ss", "Vx,Hx,Wd", "128.f3.0f.wig", o, "");
+        vex(t, "v" + n + "sd", "Vx,Hx,Wq", "128.f2.0f.wig", o, "");
+    }
+    vex2(t, "vsqrtps", "0", "0f", 0x51, "wig", ""); vex2(t, "vsqrtpd", "66", "0f", 0x51, "wig", "");
+    vex(t, "vsqrtss", "Vx,Hx,Wd", "128.f3.0f.wig", 0x51, ""); vex(t, "vsqrtsd", "Vx,Hx,Wq", "128.f2.0f.wig", 0x51, "");
+    vex2(t, "vrsqrtps", "0", "0f", 0x52, "wig", ""); vex(t, "vrsqrtss", "Vx,Hx,Wd", "128.f3.0f.wig", 0x52, "");
+    vex2(t, "vrcpps", "0", "0f", 0x53, "wig", "");   vex(t, "vrcpss", "Vx,Hx,Wd", "128.f3.0f.wig", 0x53, "");
+    let lg = [["and", 0x54], ["andn", 0x55], ["or", 0x56], ["xor", 0x57], ["unpckl", 0x14], ["unpckh", 0x15]];
+    for (i in 0..len(lg)) {
+        vex3(t, "v" + lg[i][0] + "ps", "0", "0f", lg[i][1], "wig", "");
+        vex3(t, "v" + lg[i][0] + "pd", "66", "0f", lg[i][1], "wig", "");
+    }
+    vex3(t, "vhaddps", "f2", "0f", 0x7C, "wig", ""); vex3(t, "vhaddpd", "66", "0f", 0x7C, "wig", "");
+    vex3(t, "vhsubps", "f2", "0f", 0x7D, "wig", ""); vex3(t, "vhsubpd", "66", "0f", 0x7D, "wig", "");
+    vex3(t, "vaddsubps", "f2", "0f", 0xD0, "wig", ""); vex3(t, "vaddsubpd", "66", "0f", 0xD0, "wig", "");
+    vex3(t, "vcmpps", "0", "0f", 0xC2, "wig", "ib"); vex3(t, "vcmppd", "66", "0f", 0xC2, "wig", "ib");
+    vex(t, "vcmpss", "Vx,Hx,Wd,Ib", "128.f3.0f.wig", 0xC2, "ib"); vex(t, "vcmpsd", "Vx,Hx,Wq,Ib", "128.f2.0f.wig", 0xC2, "ib");
+    vex3(t, "vshufps", "0", "0f", 0xC6, "wig", "ib"); vex3(t, "vshufpd", "66", "0f", 0xC6, "wig", "ib");
+    vex(t, "vcomiss", "Vx,Wd", "128.0.0f.wig", 0x2F, ""); vex(t, "vucomiss", "Vx,Wd", "128.0.0f.wig", 0x2E, "");
+    vex(t, "vcomisd", "Vx,Wq", "128.66.0f.wig", 0x2F, ""); vex(t, "vucomisd", "Vx,Wq", "128.66.0f.wig", 0x2E, "");
+    // moves
+    let mv = [["vmovaps", "0", 0x28, 0x29], ["vmovups", "0", 0x10, 0x11], ["vmovapd", "66", 0x28, 0x29], ["vmovupd", "66", 0x10, 0x11],
+              ["vmovdqa", "66", 0x6F, 0x7F], ["vmovdqu", "f3", 0x6F, 0x7F]];
+    for (i in 0..len(mv)) {
+        vex2(t, mv[i][0], mv[i][1], "0f", mv[i][2], "wig", "");
+        vex(t, mv[i][0], "Wo,Vx", "128." + mv[i][1] + ".0f.wig", mv[i][3], "");
+        vex(t, mv[i][0], "Wy,Vy", "256." + mv[i][1] + ".0f.wig", mv[i][3], "");
+    }
+    vex(t, "vmovss", "Vx,Hx,Ux", "128.f3.0f.wig", 0x10, ""); vex(t, "vmovss", "Vx,Md", "128.f3.0f.wig", 0x10, ""); vex(t, "vmovss", "Md,Vx", "128.f3.0f.wig", 0x11, "");
+    vex(t, "vmovsd", "Vx,Hx,Ux", "128.f2.0f.wig", 0x10, ""); vex(t, "vmovsd", "Vx,Mq", "128.f2.0f.wig", 0x10, ""); vex(t, "vmovsd", "Mq,Vx", "128.f2.0f.wig", 0x11, "");
+    vex(t, "vmovd", "Vx,Ed", "128.66.0f.w0", 0x6E, ""); vex(t, "vmovd", "Ed,Vx", "128.66.0f.w0", 0x7E, "");
+    vex(t, "vmovq", "Vx,Wq", "128.f3.0f.wig", 0x7E, ""); vex(t, "vmovq", "Wq,Vx", "128.66.0f.wig", 0xD6, "");
+    vex(t, "vmovq", "Vx,Eq", "128.66.0f.w1", 0x6E, ""); vex(t, "vmovq", "Eq,Vx", "128.66.0f.w1", 0x7E, "");
+    vex(t, "vmovlps", "Vx,Hx,Mq", "128.0.0f.wig", 0x12, ""); vex(t, "vmovlps", "Mq,Vx", "128.0.0f.wig", 0x13, "");
+    vex(t, "vmovhps", "Vx,Hx,Mq", "128.0.0f.wig", 0x16, ""); vex(t, "vmovhps", "Mq,Vx", "128.0.0f.wig", 0x17, "");
+    vex(t, "vmovlpd", "Vx,Hx,Mq", "128.66.0f.wig", 0x12, ""); vex(t, "vmovlpd", "Mq,Vx", "128.66.0f.wig", 0x13, "");
+    vex(t, "vmovhpd", "Vx,Hx,Mq", "128.66.0f.wig", 0x16, ""); vex(t, "vmovhpd", "Mq,Vx", "128.66.0f.wig", 0x17, "");
+    vex(t, "vmovlhps", "Vx,Hx,Ux", "128.0.0f.wig", 0x16, ""); vex(t, "vmovhlps", "Vx,Hx,Ux", "128.0.0f.wig", 0x12, "");
+    vex(t, "vmovmskps", "Gd,Ux", "128.0.0f.wig", 0x50, ""); vex(t, "vmovmskps", "Gd,Uy", "256.0.0f.wig", 0x50, "");
+    vex(t, "vmovmskpd", "Gd,Ux", "128.66.0f.wig", 0x50, ""); vex(t, "vmovmskpd", "Gd,Uy", "256.66.0f.wig", 0x50, "");
+    vex(t, "vpmovmskb", "Gd,Ux", "128.66.0f.wig", 0xD7, ""); vex(t, "vpmovmskb", "Gd,Uy", "256.66.0f.wig", 0xD7, "");
+    vex(t, "vmovntps", "Mo,Vx", "128.0.0f.wig", 0x2B, ""); vex(t, "vmovntps", "My,Vy", "256.0.0f.wig", 0x2B, "");
+    vex(t, "vmovntpd", "Mo,Vx", "128.66.0f.wig", 0x2B, ""); vex(t, "vmovntpd", "My,Vy", "256.66.0f.wig", 0x2B, "");
+    vex(t, "vmovntdq", "Mo,Vx", "128.66.0f.wig", 0xE7, ""); vex(t, "vmovntdq", "My,Vy", "256.66.0f.wig", 0xE7, "");
+    vex(t, "vlddqu", "Vx,Mo", "128.f2.0f.wig", 0xF0, ""); vex(t, "vlddqu", "Vy,My", "256.f2.0f.wig", 0xF0, "");
+    vex(t, "vmovddup", "Vx,Wq", "128.f2.0f.wig", 0x12, ""); vex(t, "vmovddup", "Vy,Wy", "256.f2.0f.wig", 0x12, "");
+    vex2(t, "vmovshdup", "f3", "0f", 0x16, "wig", ""); vex2(t, "vmovsldup", "f3", "0f", 0x12, "wig", "");
+    // conversions
+    vex(t, "vcvtsi2ss", "Vx,Hx,Ed", "128.f3.0f.w0", 0x2A, ""); vex(t, "vcvtsi2ss", "Vx,Hx,Eq", "128.f3.0f.w1", 0x2A, "");
+    vex(t, "vcvtsi2sd", "Vx,Hx,Ed", "128.f2.0f.w0", 0x2A, ""); vex(t, "vcvtsi2sd", "Vx,Hx,Eq", "128.f2.0f.w1", 0x2A, "");
+    vex(t, "vcvttss2si", "Gd,Wd", "128.f3.0f.w0", 0x2C, ""); vex(t, "vcvttss2si", "Gq,Wd", "128.f3.0f.w1", 0x2C, "");
+    vex(t, "vcvttsd2si", "Gd,Wq", "128.f2.0f.w0", 0x2C, ""); vex(t, "vcvttsd2si", "Gq,Wq", "128.f2.0f.w1", 0x2C, "");
+    vex(t, "vcvtss2si", "Gd,Wd", "128.f3.0f.w0", 0x2D, ""); vex(t, "vcvtss2si", "Gq,Wd", "128.f3.0f.w1", 0x2D, "");
+    vex(t, "vcvtsd2si", "Gd,Wq", "128.f2.0f.w0", 0x2D, ""); vex(t, "vcvtsd2si", "Gq,Wq", "128.f2.0f.w1", 0x2D, "");
+    vex(t, "vcvtss2sd", "Vx,Hx,Wd", "128.f3.0f.wig", 0x5A, ""); vex(t, "vcvtsd2ss", "Vx,Hx,Wq", "128.f2.0f.wig", 0x5A, "");
+    vex(t, "vcvtps2pd", "Vx,Wq", "128.0.0f.wig", 0x5A, ""); vex(t, "vcvtps2pd", "Vy,Wo", "256.0.0f.wig", 0x5A, "");
+    vex2(t, "vcvtdq2ps", "0", "0f", 0x5B, "wig", ""); vex2(t, "vcvtps2dq", "66", "0f", 0x5B, "wig", ""); vex2(t, "vcvttps2dq", "f3", "0f", 0x5B, "wig", "");
+    vex(t, "vcvtdq2pd", "Vx,Wq", "128.f3.0f.wig", 0xE6, ""); vex(t, "vcvtdq2pd", "Vy,Wo", "256.f3.0f.wig", 0xE6, "");
+    // integer: 128-bit is AVX, 256-bit is AVX2
+    let i2 = ["paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "paddsb", "paddsw", "paddusb", "paddusw", "psubsb", "psubsw",
+        "psubusb", "psubusw", "pmullw", "pmulhw", "pmulhuw", "pmuludq", "pmaddwd", "pand", "pandn", "por", "pxor", "pcmpeqb", "pcmpeqw", "pcmpeqd",
+        "pcmpgtb", "pcmpgtw", "pcmpgtd", "pavgb", "pavgw", "pmaxub", "pminub", "pmaxsw", "pminsw", "psadbw", "packsswb", "packssdw", "packuswb",
+        "punpcklbw", "punpcklwd", "punpckldq", "punpcklqdq", "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq"];
+    for (n in i2) {
+        // opcodes come from the SSE table: reuse them
+        let raw = t[n][0];
+        let enc = raw.split("|")[1].split(" ");
+        let op = parse_hex(enc[len(enc) - 2]);
+        vex3(t, "v" + n, "66", "0f", op, "wig", "");
+    }
+    let shf = [["psllw", 0xF1, 0x71, 6], ["pslld", 0xF2, 0x72, 6], ["psllq", 0xF3, 0x73, 6], ["psrlw", 0xD1, 0x71, 2], ["psrld", 0xD2, 0x72, 2],
+               ["psrlq", 0xD3, 0x73, 2], ["psraw", 0xE1, 0x71, 4], ["psrad", 0xE2, 0x72, 4]];
+    for (i in 0..len(shf)) {
+        let n = "v" + shf[i][0];
+        vex(t, n, "Vx,Hx,Wo", "128.66.0f.wig", shf[i][1], ""); vex(t, n, "Vy,Hy,Wo", "256.66.0f.wig", shf[i][1], "");
+        add(t, n, "Hx,Ux,Ib", "vex=128.66.0f.wig " + h(shf[i][2]) + " /" + str(shf[i][3]) + " ib");
+        add(t, n, "Hy,Uy,Ib", "vex=256.66.0f.wig " + h(shf[i][2]) + " /" + str(shf[i][3]) + " ib");
+    }
+    add(t, "vpsrldq", "Hx,Ux,Ib", "vex=128.66.0f.wig 73 /3 ib"); add(t, "vpsrldq", "Hy,Uy,Ib", "vex=256.66.0f.wig 73 /3 ib");
+    add(t, "vpslldq", "Hx,Ux,Ib", "vex=128.66.0f.wig 73 /7 ib"); add(t, "vpslldq", "Hy,Uy,Ib", "vex=256.66.0f.wig 73 /7 ib");
+    vex2(t, "vpshufd", "66", "0f", 0x70, "wig", "ib"); vex2(t, "vpshufhw", "f3", "0f", 0x70, "wig", "ib"); vex2(t, "vpshuflw", "f2", "0f", 0x70, "wig", "ib");
+    let s38 = [["pshufb", 0x00], ["phaddw", 0x01], ["phaddd", 0x02], ["phaddsw", 0x03], ["pmaddubsw", 0x04], ["phsubw", 0x05], ["phsubd", 0x06],
+        ["phsubsw", 0x07], ["psignb", 0x08], ["psignw", 0x09], ["psignd", 0x0A], ["pmulhrsw", 0x0B], ["pmuldq", 0x28], ["pcmpeqq", 0x29], ["packusdw", 0x2B],
+        ["pcmpgtq", 0x37], ["pminsb", 0x38], ["pminsd", 0x39], ["pminuw", 0x3A], ["pminud", 0x3B], ["pmaxsb", 0x3C], ["pmaxsd", 0x3D], ["pmaxuw", 0x3E],
+        ["pmaxud", 0x3F], ["pmulld", 0x40]];
+    for (i in 0..len(s38)) { vex3(t, "v" + s38[i][0], "66", "0f38", s38[i][1], "wig", ""); }
+    vex2(t, "vpabsb", "66", "0f38", 0x1C, "wig", ""); vex2(t, "vpabsw", "66", "0f38", 0x1D, "wig", ""); vex2(t, "vpabsd", "66", "0f38", 0x1E, "wig", "");
+    vex2(t, "vptest", "66", "0f38", 0x17, "wig", "");
+    vex(t, "vphminposuw", "Vx,Wo", "128.66.0f38.wig", 0x41, "");
+    let aes = [["aesenc", 0xDC], ["aesenclast", 0xDD], ["aesdec", 0xDE], ["aesdeclast", 0xDF]];
+    for (i in 0..len(aes)) { vex(t, "v" + aes[i][0], "Vx,Hx,Wo", "128.66.0f38.wig", aes[i][1], ""); }
+    vex(t, "vaesimc", "Vx,Wo", "128.66.0f38.wig", 0xDB, "");
+    let mx = [["bw", 0x20, "Wq", "Wo"], ["bd", 0x21, "Wd", "Wq"], ["bq", 0x22, "Ww", "Wd"], ["wd", 0x23, "Wq", "Wo"], ["wq", 0x24, "Wd", "Wq"], ["dq", 0x25, "Wq", "Wo"]];
+    for (i in 0..len(mx)) {
+        vex(t, "vpmovsx" + mx[i][0], "Vx," + mx[i][2], "128.66.0f38.wig", mx[i][1], "");
+        vex(t, "vpmovsx" + mx[i][0], "Vy," + mx[i][3], "256.66.0f38.wig", mx[i][1], "");
+        vex(t, "vpmovzx" + mx[i][0], "Vx," + mx[i][2], "128.66.0f38.wig", mx[i][1] + 0x10, "");
+        vex(t, "vpmovzx" + mx[i][0], "Vy," + mx[i][3], "256.66.0f38.wig", mx[i][1] + 0x10, "");
+    }
+    vex2(t, "vroundps", "66", "0f3a", 0x08, "wig", "ib"); vex2(t, "vroundpd", "66", "0f3a", 0x09, "wig", "ib");
+    vex(t, "vroundss", "Vx,Hx,Wd,Ib", "128.66.0f3a.wig", 0x0A, "ib"); vex(t, "vroundsd", "Vx,Hx,Wq,Ib", "128.66.0f3a.wig", 0x0B, "ib");
+    vex3(t, "vblendps", "66", "0f3a", 0x0C, "wig", "ib"); vex3(t, "vblendpd", "66", "0f3a", 0x0D, "wig", "ib"); vex3(t, "vpblendw", "66", "0f3a", 0x0E, "wig", "ib");
+    vex3(t, "vpalignr", "66", "0f3a", 0x0F, "wig", "ib"); vex3(t, "vdpps", "66", "0f3a", 0x40, "wig", "ib"); vex(t, "vdppd", "Vx,Hx,Wo,Ib", "128.66.0f3a.wig", 0x41, "ib");
+    vex3(t, "vmpsadbw", "66", "0f3a", 0x42, "wig", "ib"); vex3(t, "vpclmulqdq", "66", "0f3a", 0x44, "wig", "ib");
+    vex(t, "vinsertps", "Vx,Hx,Wd,Ib", "128.66.0f3a.wig", 0x21, "ib");
+    let ps = [["vpcmpestrm", 0x60], ["vpcmpestri", 0x61], ["vpcmpistrm", 0x62], ["vpcmpistri", 0x63]];
+    for (i in 0..len(ps)) { vex(t, ps[i][0], "Vx,Wo,Ib", "128.66.0f3a.wig", ps[i][1], "ib"); }
+    vex(t, "vpextrb", "Ed,Vx,Ib", "128.66.0f3a.w0", 0x14, "ib"); vex(t, "vpextrw", "Ed,Vx,Ib", "128.66.0f3a.w0", 0x15, "ib");
+    vex(t, "vpextrd", "Ed,Vx,Ib", "128.66.0f3a.w0", 0x16, "ib"); vex(t, "vpextrq", "Eq,Vx,Ib", "128.66.0f3a.w1", 0x16, "ib");
+    vex(t, "vextractps", "Ed,Vx,Ib", "128.66.0f3a.wig", 0x17, "ib");
+    vex(t, "vpinsrb", "Vx,Hx,Ed,Ib", "128.66.0f3a.w0", 0x20, "ib"); vex(t, "vpinsrw", "Vx,Hx,Ed,Ib", "128.66.0f.w0", 0xC4, "ib");
+    vex(t, "vpinsrd", "Vx,Hx,Ed,Ib", "128.66.0f3a.w0", 0x22, "ib"); vex(t, "vpinsrq", "Vx,Hx,Eq,Ib", "128.66.0f3a.w1", 0x22, "ib");
+    vex(t, "vpextrw", "Gd,Ux,Ib", "128.66.0f.wig", 0xC5, "ib");
+    vex(t, "vblendvps", "Vx,Hx,Wo,Lx", "128.66.0f3a.w0", 0x4A, ""); vex(t, "vblendvps", "Vy,Hy,Wy,Ly", "256.66.0f3a.w0", 0x4A, "");
+    vex(t, "vblendvpd", "Vx,Hx,Wo,Lx", "128.66.0f3a.w0", 0x4B, ""); vex(t, "vblendvpd", "Vy,Hy,Wy,Ly", "256.66.0f3a.w0", 0x4B, "");
+    vex(t, "vpblendvb", "Vx,Hx,Wo,Lx", "128.66.0f3a.w0", 0x4C, ""); vex(t, "vpblendvb", "Vy,Hy,Wy,Ly", "256.66.0f3a.w0", 0x4C, "");
+    // AVX / AVX2 specials
+    add(t, "vzeroupper", "", "vex=128.0.0f.wig 77"); add(t, "vzeroall", "", "vex=256.0.0f.wig 77");
+    vex(t, "vbroadcastss", "Vx,Md", "128.66.0f38.w0", 0x18, ""); vex(t, "vbroadcastss", "Vy,Md", "256.66.0f38.w0", 0x18, "");
+    vex(t, "vbroadcastss", "Vx,Ux", "128.66.0f38.w0", 0x18, ""); vex(t, "vbroadcastss", "Vy,Ux", "256.66.0f38.w0", 0x18, "");
+    vex(t, "vbroadcastsd", "Vy,Mq", "256.66.0f38.w0", 0x19, ""); vex(t, "vbroadcastsd", "Vy,Ux", "256.66.0f38.w0", 0x19, "");
+    vex(t, "vbroadcastf128", "Vy,Mo", "256.66.0f38.w0", 0x1A, ""); vex(t, "vbroadcasti128", "Vy,Mo", "256.66.0f38.w0", 0x5A, "");
+    vex(t, "vpbroadcastb", "Vx,Wb", "128.66.0f38.w0", 0x78, ""); vex(t, "vpbroadcastb", "Vy,Wb", "256.66.0f38.w0", 0x78, "");
+    vex(t, "vpbroadcastw", "Vx,Ww", "128.66.0f38.w0", 0x79, ""); vex(t, "vpbroadcastw", "Vy,Ww", "256.66.0f38.w0", 0x79, "");
+    vex(t, "vpbroadcastd", "Vx,Wd", "128.66.0f38.w0", 0x58, ""); vex(t, "vpbroadcastd", "Vy,Wd", "256.66.0f38.w0", 0x58, "");
+    vex(t, "vpbroadcastq", "Vx,Wq", "128.66.0f38.w0", 0x59, ""); vex(t, "vpbroadcastq", "Vy,Wq", "256.66.0f38.w0", 0x59, "");
+    vex(t, "vinsertf128", "Vy,Hy,Wo,Ib", "256.66.0f3a.w0", 0x18, "ib"); vex(t, "vinserti128", "Vy,Hy,Wo,Ib", "256.66.0f3a.w0", 0x38, "ib");
+    vex(t, "vextractf128", "Wo,Vy,Ib", "256.66.0f3a.w0", 0x19, "ib"); vex(t, "vextracti128", "Wo,Vy,Ib", "256.66.0f3a.w0", 0x39, "ib");
+    vex(t, "vperm2f128", "Vy,Hy,Wy,Ib", "256.66.0f3a.w0", 0x06, "ib"); vex(t, "vperm2i128", "Vy,Hy,Wy,Ib", "256.66.0f3a.w0", 0x46, "ib");
+    vex(t, "vpermq", "Vy,Wy,Ib", "256.66.0f3a.w1", 0x00, "ib"); vex(t, "vpermpd", "Vy,Wy,Ib", "256.66.0f3a.w1", 0x01, "ib");
+    vex(t, "vpermd", "Vy,Hy,Wy", "256.66.0f38.w0", 0x36, ""); vex(t, "vpermps", "Vy,Hy,Wy", "256.66.0f38.w0", 0x16, "");
+    vex3(t, "vpermilps", "66", "0f38", 0x0C, "w0", ""); vex3(t, "vpermilpd", "66", "0f38", 0x0D, "w0", "");
+    vex2(t, "vpermilps", "66", "0f3a", 0x04, "w0", "ib"); vex2(t, "vpermilpd", "66", "0f3a", 0x05, "w0", "ib");
+    vex2(t, "vtestps", "66", "0f38", 0x0E, "w0", ""); vex2(t, "vtestpd", "66", "0f38", 0x0F, "w0", "");
+    vex3(t, "vpsllvd", "66", "0f38", 0x47, "w0", ""); vex3(t, "vpsllvq", "66", "0f38", 0x47, "w1", "");
+    vex3(t, "vpsrlvd", "66", "0f38", 0x45, "w0", ""); vex3(t, "vpsrlvq", "66", "0f38", 0x45, "w1", "");
+    vex3(t, "vpsravd", "66", "0f38", 0x46, "w0", "");
+    vex(t, "vcvtph2ps", "Vx,Wq", "128.66.0f38.w0", 0x13, ""); vex(t, "vcvtph2ps", "Vy,Wo", "256.66.0f38.w0", 0x13, "");
+    vex(t, "vcvtps2ph", "Wq,Vx,Ib", "128.66.0f3a.w0", 0x1D, "ib"); vex(t, "vcvtps2ph", "Wo,Vy,Ib", "256.66.0f3a.w0", 0x1D, "ib");
+    // FMA3
+    let fm = [["fmadd", 0x98], ["fmsub", 0x9A], ["fnmadd", 0x9C], ["fnmsub", 0x9E]];
+    let ord = [["132", 0x00], ["213", 0x10], ["231", 0x20]];
+    for (i in 0..len(fm)) { for (j in 0..3) {
+        let n = "v" + fm[i][0] + ord[j][0];
+        let o = fm[i][1] + ord[j][1];
+        vex3(t, n + "ps", "66", "0f38", o, "w0", ""); vex3(t, n + "pd", "66", "0f38", o, "w1", "");
+        vex(t, n + "ss", "Vx,Hx,Wd", "128.66.0f38.w0", o + 1, ""); vex(t, n + "sd", "Vx,Hx,Wq", "128.66.0f38.w1", o + 1, "");
+    } }
+    let fa = [["fmaddsub", 0x96], ["fmsubadd", 0x97]];
+    for (i in 0..2) { for (j in 0..3) {
+        let n = "v" + fa[i][0] + ord[j][0];
+        let o = fa[i][1] + ord[j][1];
+        vex3(t, n + "ps", "66", "0f38", o, "w0", ""); vex3(t, n + "pd", "66", "0f38", o, "w1", "");
+    } }
+    // BMI1 / BMI2 (general-purpose registers in VEX.vvvv)
+    add(t, "andn", "Gv,Hv,Ev", "vex=lz.0.0f38.wv F2 /r no16");
+    add(t, "bextr", "Gv,Ev,Hv", "vex=lz.0.0f38.wv F7 /r no16");
+    add(t, "bzhi", "Gv,Ev,Hv", "vex=lz.0.0f38.wv F5 /r no16");
+    add(t, "blsr", "Hv,Ev", "vex=lz.0.0f38.wv F3 /1 no16");
+    add(t, "blsmsk", "Hv,Ev", "vex=lz.0.0f38.wv F3 /2 no16");
+    add(t, "blsi", "Hv,Ev", "vex=lz.0.0f38.wv F3 /3 no16");
+    add(t, "pdep", "Gv,Hv,Ev", "vex=lz.f2.0f38.wv F5 /r no16");
+    add(t, "pext", "Gv,Hv,Ev", "vex=lz.f3.0f38.wv F5 /r no16");
+    add(t, "mulx", "Gv,Hv,Ev", "vex=lz.f2.0f38.wv F6 /r no16");
+    add(t, "rorx", "Gv,Ev,Ib", "vex=lz.f2.0f3a.wv F0 /r ib no16");
+    add(t, "sarx", "Gv,Ev,Hv", "vex=lz.f3.0f38.wv F7 /r no16");
+    add(t, "shlx", "Gv,Ev,Hv", "vex=lz.66.0f38.wv F7 /r no16");
+    add(t, "shrx", "Gv,Ev,Hv", "vex=lz.f2.0f38.wv F7 /r no16");
+}
+
+// ---------------------------------------------------------------- x87 floating point
+fn build_x87(t) {
+    let ar = [["add", 0], ["mul", 1], ["com", 2], ["comp", 3], ["sub", 4], ["subr", 5], ["div", 6], ["divr", 7]];
+    for (i in 0..8) {
+        let n = ar[i][0]; let e = "/" + str(ar[i][1]);
+        add(t, "f" + n, "Md", "D8 " + e);
+        add(t, "f" + n, "Mq", "DC " + e);
+        add(t, "fi" + n, "Md", "DA " + e);
+        add(t, "fi" + n, "Mw", "DE " + e);
+    }
+    // register forms: (name, st0,sti opcode, sti,st0 opcode, popping opcode)
+    let rf = [["add", 0xC0, 0xC0, 0xC0], ["mul", 0xC8, 0xC8, 0xC8], ["sub", 0xE0, 0xE8, 0xE8], ["subr", 0xE8, 0xE0, 0xE0], ["div", 0xF0, 0xF8, 0xF8], ["divr", 0xF8, 0xF0, 0xF0]];
+    for (i in 0..len(rf)) {
+        let n = "f" + rf[i][0];
+        add(t, n, "ST0,STi", "D8 " + h(rf[i][1]) + " +r");
+        add(t, n, "STi", "D8 " + h(rf[i][1]) + " +r");
+        add(t, n, "STi,ST0", "DC " + h(rf[i][2]) + " +r");
+        add(t, n + "p", "STi,ST0", "DE " + h(rf[i][3]) + " +r");
+        add(t, n + "p", "STi", "DE " + h(rf[i][3]) + " +r");
+        add(t, n + "p", "", "DE " + h(rf[i][3] + 1));
+    }
+    add(t, "fcom", "STi", "D8 D0 +r");  add(t, "fcom", "", "D8 D1");
+    add(t, "fcomp", "STi", "D8 D8 +r"); add(t, "fcomp", "", "D8 D9");
+    add(t, "fucom", "STi", "DD E0 +r"); add(t, "fucom", "", "DD E1");
+    add(t, "fucomp", "STi", "DD E8 +r"); add(t, "fucomp", "", "DD E9");
+    add(t, "fcomi", "ST0,STi", "DB F0 +r");  add(t, "fcomip", "ST0,STi", "DF F0 +r");
+    add(t, "fucomi", "ST0,STi", "DB E8 +r"); add(t, "fucomip", "ST0,STi", "DF E8 +r");
+    add(t, "fcomi", "STi", "DB F0 +r");  add(t, "fcomip", "STi", "DF F0 +r");
+    add(t, "fucomi", "STi", "DB E8 +r"); add(t, "fucomip", "STi", "DF E8 +r");
+    let cm = [["b", 0xC0], ["e", 0xC8], ["be", 0xD0], ["u", 0xD8]];
+    for (i in 0..4) {
+        add(t, "fcmov" + cm[i][0], "ST0,STi", "DA " + h(cm[i][1]) + " +r");
+        add(t, "fcmovn" + cm[i][0], "ST0,STi", "DB " + h(cm[i][1]) + " +r");
+    }
+    // loads and stores
+    add(t, "fld", "Md", "D9 /0"); add(t, "fld", "Mq", "DD /0"); add(t, "fld", "Mt", "DB /5"); add(t, "fld", "STi", "D9 C0 +r");
+    add(t, "fst", "Md", "D9 /2"); add(t, "fst", "Mq", "DD /2"); add(t, "fst", "STi", "DD D0 +r");
+    add(t, "fstp", "Md", "D9 /3"); add(t, "fstp", "Mq", "DD /3"); add(t, "fstp", "Mt", "DB /7"); add(t, "fstp", "STi", "DD D8 +r");
+    add(t, "fild", "Mw", "DF /0"); add(t, "fild", "Md", "DB /0"); add(t, "fild", "Mq", "DF /5");
+    add(t, "fist", "Mw", "DF /2"); add(t, "fist", "Md", "DB /2");
+    add(t, "fistp", "Mw", "DF /3"); add(t, "fistp", "Md", "DB /3"); add(t, "fistp", "Mq", "DF /7");
+    add(t, "fisttp", "Mw", "DF /1"); add(t, "fisttp", "Md", "DB /1"); add(t, "fisttp", "Mq", "DD /1");
+    add(t, "fbld", "Mt", "DF /4"); add(t, "fbstp", "Mt", "DF /6");
+    add(t, "fxch", "STi", "D9 C8 +r"); add(t, "fxch", "", "D9 C9");
+    add(t, "ffree", "STi", "DD C0 +r");
+    add(t, "fldcw", "Mw", "D9 /5"); add(t, "fnstcw", "Mw", "D9 /7"); add(t, "fstcw", "Mw", "9B D9 /7");
+    add(t, "fnstsw", "Mw", "DD /7"); add(t, "fstsw", "Mw", "9B DD /7");
+    add(t, "fnstsw", "AX", "DF E0"); add(t, "fstsw", "AX", "9B DF E0");
+    add(t, "fldenv", "M", "D9 /4"); add(t, "fnstenv", "M", "D9 /6"); add(t, "fstenv", "M", "9B D9 /6");
+    add(t, "frstor", "M", "DD /4"); add(t, "fnsave", "M", "DD /6"); add(t, "fsave", "M", "9B DD /6");
+    let z = [["fchs", "D9 E0"], ["fabs", "D9 E1"], ["ftst", "D9 E4"], ["fxam", "D9 E5"], ["fld1", "D9 E8"], ["fldl2t", "D9 E9"], ["fldl2e", "D9 EA"],
+        ["fldpi", "D9 EB"], ["fldlg2", "D9 EC"], ["fldln2", "D9 ED"], ["fldz", "D9 EE"], ["f2xm1", "D9 F0"], ["fyl2x", "D9 F1"], ["fptan", "D9 F2"],
+        ["fpatan", "D9 F3"], ["fxtract", "D9 F4"], ["fprem1", "D9 F5"], ["fdecstp", "D9 F6"], ["fincstp", "D9 F7"], ["fprem", "D9 F8"], ["fyl2xp1", "D9 F9"],
+        ["fsqrt", "D9 FA"], ["fsincos", "D9 FB"], ["frndint", "D9 FC"], ["fscale", "D9 FD"], ["fsin", "D9 FE"], ["fcos", "D9 FF"], ["fnop", "D9 D0"],
+        ["fucompp", "DA E9"], ["fcompp", "DE D9"], ["fninit", "DB E3"], ["finit", "9B DB E3"], ["fnclex", "DB E2"], ["fclex", "9B DB E2"]];
+    for (i in 0..len(z)) { add(t, z[i][0], "", z[i][1]); }
+}
+
+fn build() {
+    let t = {};
+    build_int(t);
+    build_sse(t);
+    build_vex(t);
+    build_x87(t);
+    return t;
+}
+
+
+// ---------------------------------------------------------------- lazy parsing
+var CACHE = {};
+
+fn parse_form(mn: string, raw: string) {
+    let parts = raw.split("|");
+    let specs = parts[0] == "" ? [] : parts[0].split(",");
+    let toks = parts[1] == "" ? [] : parts[1].split(" ");
+    let f = { mn: mn, specs: specs, opc: [], ext: -1, mp: 0, d64: false, rexw: false, no64: false, x64: false, dup: false,
+              o32max: false, a16: false, a32: false, modrm: false, plusr: false, imms: [], rel: "", imm8: -1, vex: null,
+              moffs: "", far: false, o16: false, o32: false, no16: false, vexl: 0, vexpp: 0, vexmap: 1, vexw: 0 };
+    for (tk in toks) {
+        if (tk == "") { continue; }
+        if (tk == "/r") { f.modrm = true; }
+        else if (tk[0] == "/") { f.modrm = true; f.ext = int(tk[1..2]); }
+        else if (tk == "+r") { f.plusr = true; }
+        else if (tk == "ib" || tk == "iw" || tk == "id" || tk == "iq" || tk == "iz" || tk == "iv") { f.imms.push(tk); }
+        else if (tk == "ap") { f.far = true; }
+        else if (tk == "ob" || tk == "ov" || tk == "oq") { f.moffs = tk; }
+        else if (tk == "cb" || tk == "cz") { f.rel = tk; }
+        else if (tk == "p66") { f.mp = 0x66; }
+        else if (tk == "pf2") { f.mp = 0xF2; }
+        else if (tk == "pf3") { f.mp = 0xF3; }
+        else if (tk == "d64") { f.d64 = true; }
+        else if (tk == "rexw") { f.rexw = true; }
+        else if (tk == "no64") { f.no64 = true; }
+        else if (tk == "x64") { f.x64 = true; }
+        else if (tk == "dup") { f.dup = true; }
+        else if (tk == "o32max") { f.o32max = true; }
+        else if (tk == "o16") { f.o16 = true; }
+        else if (tk == "o32") { f.o32 = true; }
+        else if (tk == "a16") { f.a16 = true; }
+        else if (tk == "a32") { f.a32 = true; }
+        else if (util.starts_with(tk, "imm8=")) { f.imm8 = int(tk[5..len(tk)]); }
+        else if (tk == "no16") { f.no16 = true; }
+        else if (util.starts_with(tk, "vex=")) { f.vex = tk[4..len(tk)]; parse_vex(f); }
+        else { f.opc.push(parse_hex(tk)); }
+    }
+    // does any spec depend on the operand size?
+    var uses_v = false;
+    for (s in specs) {
+        if (len(s) >= 2 && (s[1] == "v" || s == "Iz" || s == "Av" || s == "Zv")) { uses_v = true; }
+        if (s == "Iz" || s == "Iv" || s == "Av") { uses_v = true; }
+    }
+    f["usesv"] = uses_v;
+    let roles = [];
+    for (s in specs) { roles.push(role_of(s)); }
+    f["roles"] = roles;
+    return f;
+}
+
+fn parse_vex(f) {
+    let p = f.vex.split(".");
+    f.vexl = p[0] == "256" ? 1 : 0;
+    f.vexpp = p[1] == "66" ? 1 : (p[1] == "f3" ? 2 : (p[1] == "f2" ? 3 : 0));
+    f.vexmap = p[2] == "0f38" ? 2 : (p[2] == "0f3a" ? 3 : 1);
+    f.vexw = p[3] == "w1" ? 1 : (p[3] == "wv" ? 2 : 0);
+}
+
+const FIXED = ["AL", "CL", "DX", "AX", "EAX", "RAX", "Av", "1", "ES", "CS", "SS", "DS", "FS", "GS", "ST0", "X0"];
+
+/// Where an operand spec lives in the encoding: rm reg opc vvvv imm rel moffs far fix
+fn role_of(s: string) -> string {
+    if (s in FIXED) { return "fix"; }
+    if (s == "Sw" || s == "Cd" || s == "Dd") { return "reg"; }
+    if (s == "Ap") { return "far"; }
+    if (s == "STi") { return "opc"; }
+    if (s == "Lx" || s == "Ly") { return "is4"; }
+    let c = s[0];
+    if (c == "E" || c == "M" || c == "R" || c == "W" || c == "U" || c == "Q" || c == "N") { return "rm"; }
+    if (c == "G" || c == "V" || c == "P") { return "reg"; }
+    if (c == "Z") { return "opc"; }
+    if (c == "H") { return "vvvv"; }
+    if (c == "I") { return "imm"; }
+    if (c == "J") { return "rel"; }
+    if (c == "O") { return "moffs"; }
+    throw error("bad operand spec '" + s + "'");
+}
+
+fn parse_hex(tk: string) -> int {
+    var v = 0;
+    for (i in 0..len(tk)) {
+        let c = ord(tk[i]);
+        var d = 0;
+        if (c >= 48 && c <= 57) { d = c - 48; } else if (c >= 65 && c <= 70) { d = c - 55; } else if (c >= 97 && c <= 102) { d = c - 87; } else { throw error("bad table token '" + tk + "'"); }
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+/// Parsed forms of a mnemonic (cached), or null.
+fn forms(mn: string) -> any {
+    let c = CACHE[mn];
+    if (c != null) { return c; }
+    let raw = RAW[mn];
+    if (raw == null) { return null; }
+    let out = [];
+    for (r in raw) { out.push(parse_form(mn, r)); }
+    CACHE[mn] = out;
+    return out;
+}
+
+fn mnemonics() -> any { return keys(RAW); }
+
+const RAW = build();

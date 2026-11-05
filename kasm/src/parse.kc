@@ -1,0 +1,349 @@
+// parse.kc -- tokens of one logical line -> a statement.
+//   { kind: "empty"|"insn"|"dir", label, mn, ops, pfx, dir, args, times, line, col, file, src }
+// Operands:  { k:"reg", ... } | { k:"imm", ast, size, strict, short, near, far } |
+//            { k:"mem", size, seg, base, index, scale, disp, rel, abs, far } | { k:"farptr", seg, off }
+// Author: Divyanshu Sinha (MIT License)
+import "util.kc" as util;
+import "expr.kc" as ex;
+import "regs.kc" as regs;
+
+const PREFIXES = ["lock", "rep", "repe", "repz", "repne", "repnz", "bnd", "o16", "o32", "a16", "a32"];
+const SIZES = { byte: 1, word: 2, dword: 4, qword: 8, tword: 10, tbyte: 10, oword: 16, xmmword: 16, ymmword: 32 };
+const DATA_DIRS = ["db", "dw", "dd", "dq", "dt", "do", "dy"];
+const RES_DIRS = ["resb", "resw", "resd", "resq", "rest", "reso", "resy"];
+const DIRECTIVES = ["db", "dw", "dd", "dq", "dt", "do", "dy", "resb", "resw", "resd", "resq", "rest", "reso", "resy", "equ", "section", "segment",
+    "global", "globl", "extern", "weak", "align", "alignb", "org", "bits", "use16", "use32", "use64", "default", "incbin", "cpu", "times",
+    "struc", "endstruc", "istruc", "iend", "at", "absolute", "common", "type", "size"];
+const COLONLESS = ["equ", "db", "dw", "dd", "dq", "dt", "do", "dy", "resb", "resw", "resd", "resq", "rest", "reso", "resy", "times", "incbin", "struc"];
+
+fn is_member(list, x: string) -> bool { for (y in list) { if (y == x) { return true; } } return false; }
+
+fn dummy_ctx(line: int) { return { syms: {}, undef_refs: [], here: 0, sec: null, line: line, file: "" }; }
+
+/// Evaluate an AST that cannot refer to labels (scale factors); null when it is not a plain constant.
+fn try_const(ast, line: int) -> any {
+    if (ex.has_reg(ast)) { return null; }
+    let c = dummy_ctx(line);
+    try {
+        let v = ex.eval(c, ast);
+        if (v.undef || !ex.is_abs(v)) { return null; }
+        return v.v;
+    } catch (e) { return null; }
+}
+
+/// Split tokens on top-level commas.
+fn split_args(toks, start: int) -> any {
+    let groups = [];
+    var cur = [];
+    var depth = 0;
+    var i = start;
+    while (i < len(toks)) {
+        let t = toks[i];
+        if (t.t == "op" && (t.v == "(" || t.v == "[")) { depth = depth + 1; }
+        if (t.t == "op" && (t.v == ")" || t.v == "]")) { depth = depth - 1; }
+        if (t.t == "op" && t.v == "," && depth == 0) { groups.push(cur); cur = []; }
+        else { cur.push(t); }
+        i = i + 1;
+    }
+    if (len(cur) > 0 || len(groups) > 0) { groups.push(cur); }
+    return groups;
+}
+
+/// Optional "wrt ..plt" / "wrt ..got" after an expression.
+fn take_wrt(p, line: int) -> string {
+    let t = ex.peek(p);
+    if (t == null || t.t != "id" || t.v.lower() != "wrt") { return ""; }
+    p.i = p.i + 1;
+    let n = ex.peek(p);
+    if (n == null || n.t != "id") { util.fail("'wrt' needs ..plt, ..got or ..gotpcrel", line, t.col); }
+    p.i = p.i + 1;
+    let w = n.v.lower();
+    if (w == "..plt") { return "plt"; }
+    if (w == "..got" || w == "..gotpcrel") { return "got"; }
+    util.fail("unknown 'wrt' target " + n.v + " (use ..plt or ..got)", line, n.col);
+}
+
+// ---------------------------------------------------------------- memory operands
+fn lin(ps, node, sign: int, terms, disps, line: int) {
+    let t = node.t;
+    if (t == "bin" && node.op == "+") { lin(ps, node.l, sign, terms, disps, line); lin(ps, node.r, sign, terms, disps, line); return; }
+    if (t == "bin" && node.op == "-") { lin(ps, node.l, sign, terms, disps, line); lin(ps, node.r, -sign, terms, disps, line); return; }
+    if (t == "bin" && node.op == "*" && (ex.has_reg(node.l) || ex.has_reg(node.r))) {
+        var rn = node.l; var cn = node.r;
+        if (!ex.has_reg(node.l)) { rn = node.r; cn = node.l; }
+        if (rn.t != "reg") { util.fail("invalid scaled register expression", line, node.col); }
+        let k = try_const(cn, line);
+        if (k == null) { util.fail("the scale of an index register must be a constant", line, node.col); }
+        if (sign < 0) { util.fail("a register cannot be subtracted in an address", line, node.col); }
+        terms.push({ reg: rn.reg, scale: k, col: rn.col });
+        return;
+    }
+    if (t == "reg") {
+        if (sign < 0) { util.fail("a register cannot be subtracted in an address", line, node.col); }
+        terms.push({ reg: node.reg, scale: 1, col: node.col });
+        return;
+    }
+    if (ex.has_reg(node)) { util.fail("unsupported register expression in address", line, node.col == null ? 1 : node.col); }
+    disps.push({ sign: sign, node: node });
+}
+
+fn build_mem(ps, ast, size: int, seg, rel: bool, abs: bool, far: bool, line: int) {
+    let terms = [];
+    let disps = [];
+    lin(ps, ast, 1, terms, disps, line);
+    // merge equal registers ([rax+rax] stays base+index, [rax*2+rax] becomes [rax+rax*2])
+    let merged = [];
+    var dup_plain = false;
+    for (t in terms) {
+        var found = false;
+        for (m in merged) {
+            if (m.reg.name == t.reg.name) {
+                if (m.scale == 1 && t.scale == 1) { dup_plain = true; }
+                m.scale = m.scale + t.scale; found = true;
+            }
+        }
+        if (!found) { merged.push({ reg: t.reg, scale: t.scale, col: t.col }); }
+    }
+    var base = null; var index = null; var scale = 1;
+    for (m in merged) {
+        if (m.reg.cls != "r" && m.reg.cls != "ip") { util.fail("'" + m.reg.name + "' cannot be used in an address", line, m.col); }
+    }
+    if (len(merged) > 2) { util.fail("too many registers in address", line, merged[2].col); }
+    if (len(merged) == 1) {
+        let m = merged[0];
+        if (m.scale == 1) { base = m.reg; }
+        else if (m.scale == 2 && dup_plain) { base = m.reg; index = m.reg; scale = 1; }
+        else if (m.scale == 2 || m.scale == 4 || m.scale == 8) { index = m.reg; scale = m.scale; }
+        else if (m.scale == 3 || m.scale == 5 || m.scale == 9) { base = m.reg; index = m.reg; scale = m.scale - 1; }
+        else { util.fail("invalid scale " + str(m.scale), line, m.col); }
+    } else if (len(merged) == 2) {
+        let a = merged[0]; let b = merged[1];
+        if (a.scale == 1 && b.scale == 1) { base = a.reg; index = b.reg; }
+        else if (b.scale > 1 && a.scale == 1) { base = a.reg; index = b.reg; scale = b.scale; }
+        else if (a.scale > 1 && b.scale == 1) { base = b.reg; index = a.reg; scale = a.scale; }
+        else { util.fail("invalid address: two scaled registers", line, a.col); }
+        if (scale != 1 && scale != 2 && scale != 4 && scale != 8) { util.fail("invalid scale " + str(scale), line, a.col); }
+    }
+    if (base != null && base.cls == "ip" && index != null) { util.fail("rip cannot be combined with an index register", line, 1); }
+    var disp = null;
+    for (d in disps) {
+        if (disp == null) { disp = d.sign > 0 ? d.node : { t: "un", op: "-", e: d.node, col: d.node.col }; }
+        else { disp = { t: "bin", op: d.sign > 0 ? "+" : "-", l: disp, r: d.node, col: d.node.col }; }
+    }
+    return { k: "mem", size: size, seg: seg, base: base, index: index, scale: scale, disp: disp, rel: rel, abs: abs, far: far, wrt: "" };
+}
+
+// ---------------------------------------------------------------- operands
+fn parse_operand(ps, toks, line: int) -> any {
+    var size = 0; var strict = false; var short = false; var near = false; var far = false;
+    var i = 0;
+    while (i < len(toks) && toks[i].t == "id") {
+        let w = toks[i].v.lower();
+        if (SIZES[w] != null && !(i + 1 >= len(toks))) { size = SIZES[w]; i = i + 1; continue; }
+        if (w == "ptr" || w == "offset" || w == "nosplit") { i = i + 1; continue; }
+        if (w == "strict") { strict = true; i = i + 1; continue; }
+        if (w == "short") { short = true; i = i + 1; continue; }
+        if (w == "near") { near = true; i = i + 1; continue; }
+        if (w == "far") { far = true; i = i + 1; continue; }
+        break;
+    }
+    if (i >= len(toks)) { util.fail("operand expected", line, toks[len(toks) - 1].col); }
+    let rest = toks[i..len(toks)];
+    let t0 = rest[0];
+    // plain register (also st(n))
+    if (t0.t == "id" && t0["esc"] == null) {
+        let r = regs.lookup(t0.v);
+        if (r != null) {
+            if (len(rest) == 1) { return reg_op(r, t0.col); }
+            if (r.cls == "f" && r.name == "st" && len(rest) == 4 && rest[1].v == "(" && rest[2].t == "num" && rest[3].v == ")") {
+                return reg_op(regs.lookup("st" + str(rest[2].v)), t0.col);
+            }
+            // segment override  fs:[...]  or  fs:expr
+            if (r.cls == "s" && len(rest) >= 3 && rest[1].t == "op" && rest[1].v == ":") {
+                let inner = rest[2..len(rest)];
+                if (inner[0].t == "op" && inner[0].v == "[") { return parse_bracket(ps, inner, size, r, far, line); }
+                let p = ex.new_parser(inner, line, ps.scope);
+                let ast = ex.parse(p);
+                if (!ex.at_end(p)) { util.fail("unexpected text after operand", line, p.toks[p.i].col); }
+                return build_mem(ps, ast, size, r, false, false, far, line);
+            }
+        }
+    }
+    if (t0.t == "op" && t0.v == "[") { return parse_bracket(ps, rest, size, null, far, line); }
+    // expression (immediate / branch target / far pointer)
+    let p = ex.new_parser(rest, line, ps.scope);
+    let ast = ex.parse(p);
+    let wrt = take_wrt(p, line);
+    if (ex.at_end(p)) { return { k: "imm", ast: ast, size: size, strict: strict, short: short, near: near, far: far, wrt: wrt }; }
+    let t = ex.peek(p);
+    if (t.t == "op" && t.v == ":") {
+        p.i = p.i + 1;
+        let off = ex.parse(p);
+        if (!ex.at_end(p)) { util.fail("unexpected text after far pointer", line, p.toks[p.i].col); }
+        return { k: "farptr", seg: ast, off: off };
+    }
+    util.fail("unexpected '" + str(t.v) + "' after operand", line, t.col);
+}
+
+fn reg_op(r, col: int) {
+    return { k: "reg", n: r.n, sz: r.sz, cls: r.cls, name: r.name, rex: r.rex, hi: r.hi, col: col };
+}
+
+fn parse_bracket(ps, toks, size: int, seg, far: bool, line: int) -> any {
+    // toks[0] is '[' ; find the matching ']'
+    var depth = 0; var close = -1;
+    for (i in 0..len(toks)) {
+        if (toks[i].t == "op" && toks[i].v == "[") { depth = depth + 1; }
+        if (toks[i].t == "op" && toks[i].v == "]") { depth = depth - 1; if (depth == 0) { close = i; break; } }
+    }
+    if (close < 0) { util.fail("missing ']'", line, toks[0].col); }
+    if (close != len(toks) - 1) { util.fail("unexpected text after ']'", line, toks[close + 1].col); }
+    var inner = toks[1..close];
+    var rel = false; var abs = false;
+    var sg = seg;
+    var changed = true;
+    while (changed && len(inner) > 0) {
+        changed = false;
+        if (inner[0].t == "id") {
+            let w = inner[0].v.lower();
+            if ((w == "rel" || w == "abs" || w == "nosplit") && len(inner) > 1 && regs.lookup(w) == null) {
+                if (w == "rel") { rel = true; } else if (w == "abs") { abs = true; }
+                inner = inner[1..len(inner)]; changed = true; continue;
+            }
+            let r = regs.lookup(w);
+            if (r != null && r.cls == "s" && len(inner) > 2 && inner[1].t == "op" && inner[1].v == ":") {
+                sg = r; inner = inner[2..len(inner)]; changed = true; continue;
+            }
+        }
+    }
+    if (len(inner) == 0) { util.fail("empty address", line, toks[0].col); }
+    let p = ex.new_parser(inner, line, ps.scope);
+    let ast = ex.parse(p);
+    let wrt = take_wrt(p, line);
+    if (!ex.at_end(p)) { util.fail("unexpected '" + str(p.toks[p.i].v) + "' in address", line, p.toks[p.i].col); }
+    let m = build_mem(ps, ast, size, sg, rel, abs, far, line);
+    m["wrt"] = wrt;
+    return m;
+}
+
+// ---------------------------------------------------------------- statements
+/// ps = { scope } carries the last non-local label across lines.
+fn parse_line(ps, toks, line: int, file: string, src: string) -> any {
+    var st = { kind: "empty", label: null, mn: "", ops: [], pfx: { lock: false, rep: false, repne: false, o16: false, o32: false, a16: false, a32: false },
+               dir: "", args: [], times: null, pfxlen: 0, line: line, col: 1, file: file, src: src };
+    if (len(toks) == 0) { return st; }
+    var i = 0;
+    // label
+    if (toks[0].t == "id" && true) {
+        let nm = toks[0].v;
+        if (len(toks) >= 2 && toks[1].t == "op" && toks[1].v == ":" && regs.lookup(nm) == null) {
+            st.label = label_name(ps, nm); i = 2;
+        } else if (len(toks) >= 2 && toks[1].t == "id" && is_member(COLONLESS, toks[1].v.lower()) && regs.lookup(nm) == null) {
+            st.label = label_name(ps, nm); i = 1;
+        }
+    }
+    if (i >= len(toks)) { return st; }
+    st.col = toks[i].col;
+    // times
+    if (toks[i].t == "id" && toks[i].v.lower() == "times") {
+        i = i + 1;
+        let p = ex.new_parser(toks, line, ps.scope);
+        p.i = i;
+        st.times = ex.parse(p);
+        i = p.i;
+        if (i >= len(toks)) { util.fail("times needs an instruction or data", line, toks[len(toks) - 1].col); }
+    }
+    if (toks[i].t != "id") { util.fail("instruction or directive expected", line, toks[i].col); }
+    // prefixes
+    var mn = toks[i].v;
+    var lmn = mn.lower();
+    while (is_member(PREFIXES, lmn) && i + 1 < len(toks) && toks[i + 1].t == "id") {
+        if (lmn == "lock") { st.pfx.lock = true; }
+        else if (lmn == "rep" || lmn == "repe" || lmn == "repz") { st.pfx.rep = true; }
+        else if (lmn == "repne" || lmn == "repnz" || lmn == "bnd") { st.pfx.repne = true; }
+        else if (lmn == "o16") { st.pfx.o16 = true; } else if (lmn == "o32") { st.pfx.o32 = true; }
+        else if (lmn == "a16") { st.pfx.a16 = true; } else { st.pfx.a32 = true; }
+        i = i + 1;
+        mn = toks[i].v; lmn = mn.lower();
+    }
+    st.col = toks[i].col;
+    if (is_member(DIRECTIVES, lmn) && lmn != "times") {
+        st.kind = "dir";
+        st.dir = lmn;
+        parse_directive(ps, st, toks, i + 1, line);
+        return st;
+    }
+    st.kind = "insn";
+    st.mn = mn;
+    var pl = 0;
+    if (st.pfx.lock) { pl = pl + 1; }
+    if (st.pfx.rep || st.pfx.repne) { pl = pl + 1; }
+    st.pfxlen = pl;
+    let groups = split_args(toks, i + 1);
+    for (g in groups) {
+        if (len(g) == 0) { util.fail("empty operand", line, toks[i].col); }
+        st.ops.push(parse_operand(ps, g, line));
+    }
+    return st;
+}
+
+fn label_name(ps, nm: string) -> string {
+    if (nm[0] == "." && !(len(nm) > 1 && nm[1] == ".")) { return ps.scope + nm; }
+    if (!(len(nm) > 1 && nm[0] == "." && nm[1] == ".")) { ps.scope = nm; }
+    return nm;
+}
+
+fn expr_of(ps, g, line: int) -> any {
+    if (len(g) == 1 && g[0].t == "str") { return { t: "str", v: g[0].v, col: g[0].col }; }
+    let p = ex.new_parser(g, line, ps.scope);
+    let a = ex.parse(p);
+    if (!ex.at_end(p)) { util.fail("unexpected '" + str(p.toks[p.i].v) + "'", line, p.toks[p.i].col); }
+    return a;
+}
+
+fn parse_directive(ps, st, toks, start: int, line: int) {
+    let d = st.dir;
+    let groups = split_args(toks, start);
+    if (is_member(DATA_DIRS, d)) {
+        if (len(groups) == 0) { util.fail(d + " needs at least one value", line, st.col); }
+        for (g in groups) {
+            if (len(g) == 0) { util.fail("empty value", line, st.col); }
+            st.args.push(expr_of(ps, g, line));
+        }
+        return;
+    }
+    if (is_member(RES_DIRS, d) || d == "equ" || d == "align" || d == "alignb" || d == "org" || d == "bits" || d == "use16" || d == "use32" || d == "use64") {
+        if (d == "use16" || d == "use32" || d == "use64") { return; }
+        if (len(groups) == 0) { util.fail(d + " needs an argument", line, st.col); }
+        if (d == "align" || d == "alignb") {
+            for (g in groups) { st.args.push(expr_of(ps, g, line)); }
+            return;
+        }
+        if (len(groups) != 1) { util.fail(d + " takes one argument", line, st.col); }
+        st.args.push(expr_of(ps, groups[0], line));
+        return;
+    }
+    if (d == "struc" || d == "istruc") {
+        if (len(groups) != 1 || len(groups[0]) != 1 || groups[0][0].t != "id") { util.fail(d + " needs a name", line, st.col); }
+        st.args.push({ t: "sym", name: groups[0][0].v, col: groups[0][0].col });
+        if (d == "struc") { ps.scope = groups[0][0].v; }
+        return;
+    }
+    if (d == "at") {
+        var depth = 0; var comma = -1;
+        for (k in start..len(toks)) {
+            let t = toks[k];
+            if (t.t == "op" && (t.v == "(" || t.v == "[")) { depth = depth + 1; }
+            if (t.t == "op" && (t.v == ")" || t.v == "]")) { depth = depth - 1; }
+            if (t.t == "op" && t.v == "," && depth == 0) { comma = k; break; }
+        }
+        if (comma < 0 || comma == start) { util.fail("usage: at Struct.field, db ...", line, st.col); }
+        st.args.push(expr_of(ps, toks[start..comma], line));
+        st["sub"] = parse_line(ps, toks[comma + 1..len(toks)], line, st.file, st.src);
+        return;
+    }
+    // everything else keeps raw tokens
+    st["raw"] = groups;
+}
+
+fn ps_new() { return { scope: "" }; }

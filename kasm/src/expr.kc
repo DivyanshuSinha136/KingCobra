@@ -1,0 +1,282 @@
+// expr.kc -- expression parser and evaluator.
+//
+// An expression is parsed once into an AST and evaluated on every assembly pass.  A value is
+//   { v: int, sec: string|null, ext: string|null, pcsec: string|null, pcoff: int, undef: bool }
+// i.e. a constant `v` plus, optionally, the address of section `sec` (or extern symbol `ext`), minus
+// (when pcsec is set) the address of  pcsec + pcoff.  Plain constants have sec == ext == null.
+// Author: Divyanshu Sinha (MIT License)
+import "util.kc" as util;
+import "regs.kc" as regs;
+
+// ---------------------------------------------------------------- values
+fn konst(v: int) { return { v: v, sec: null, ext: null, pcsec: null, pcoff: 0, undef: false }; }
+fn is_abs(x) -> bool { return x.sec == null && x.ext == null && x.pcsec == null; }
+fn copy_val(x) { return { v: x.v, sec: x.sec, ext: x.ext, pcsec: x.pcsec, pcoff: x.pcoff, undef: x.undef }; }
+fn undef_val() { return { v: 0, sec: null, ext: null, pcsec: null, pcoff: 0, undef: true }; }
+
+// ---------------------------------------------------------------- parser
+/// p = { toks, i, scope, line }
+fn new_parser(toks, line: int, scope: string) { return { toks: toks, i: 0, scope: scope, line: line }; }
+
+fn peek(p) -> any { return p.i < len(p.toks) ? p.toks[p.i] : null; }
+fn at_op(p, op: string) -> bool { let t = peek(p); return t != null && t.t == "op" && t.v == op; }
+fn at_end(p) -> bool { return p.i >= len(p.toks); }
+
+fn qualify(p, name: string) -> string {
+    if (name[0] == "." && !(len(name) > 1 && name[1] == ".")) {
+        if (name == ".") { return name; }
+        return p.scope + name;
+    }
+    return name;
+}
+
+fn parse(p) -> any { return parse_lor(p); }
+
+fn bin(op: string, l, r, col: int) { return { t: "bin", op: op, l: l, r: r, col: col }; }
+
+fn parse_lor(p) -> any {
+    var l = parse_lxor(p);
+    while (at_op(p, "||")) { let c = peek(p).col; p.i = p.i + 1; l = bin("||", l, parse_lxor(p), c); }
+    return l;
+}
+fn parse_lxor(p) -> any {
+    var l = parse_land(p);
+    while (at_op(p, "^^")) { let c = peek(p).col; p.i = p.i + 1; l = bin("^^", l, parse_land(p), c); }
+    return l;
+}
+fn parse_land(p) -> any {
+    var l = parse_cmp(p);
+    while (at_op(p, "&&")) { let c = peek(p).col; p.i = p.i + 1; l = bin("&&", l, parse_cmp(p), c); }
+    return l;
+}
+fn parse_cmp(p) -> any {
+    var l = parse_or(p);
+    while (true) {
+        let t = peek(p);
+        if (t != null && t.t == "op" && (t.v == "==" || t.v == "=" || t.v == "!=" || t.v == "<>" || t.v == "<" || t.v == "<=" || t.v == ">" || t.v == ">=")) {
+            p.i = p.i + 1;
+            l = bin(t.v, l, parse_or(p), t.col);
+        } else { break; }
+    }
+    return l;
+}
+fn parse_or(p) -> any {
+    var l = parse_xor(p);
+    while (at_op(p, "|")) { let c = peek(p).col; p.i = p.i + 1; l = bin("|", l, parse_xor(p), c); }
+    return l;
+}
+fn parse_xor(p) -> any {
+    var l = parse_and(p);
+    while (at_op(p, "^")) { let c = peek(p).col; p.i = p.i + 1; l = bin("^", l, parse_and(p), c); }
+    return l;
+}
+fn parse_and(p) -> any {
+    var l = parse_shift(p);
+    while (at_op(p, "&")) { let c = peek(p).col; p.i = p.i + 1; l = bin("&", l, parse_shift(p), c); }
+    return l;
+}
+fn parse_shift(p) -> any {
+    var l = parse_add(p);
+    while (true) {
+        let t = peek(p);
+        if (t != null && t.t == "op" && (t.v == "<<" || t.v == ">>" || t.v == "<<<" || t.v == ">>>")) {
+            p.i = p.i + 1;
+            l = bin(t.v, l, parse_add(p), t.col);
+        } else { break; }
+    }
+    return l;
+}
+fn parse_add(p) -> any {
+    var l = parse_mul(p);
+    while (true) {
+        let t = peek(p);
+        if (t != null && t.t == "op" && (t.v == "+" || t.v == "-")) {
+            p.i = p.i + 1;
+            l = bin(t.v, l, parse_mul(p), t.col);
+        } else { break; }
+    }
+    return l;
+}
+fn parse_mul(p) -> any {
+    var l = parse_unary(p);
+    while (true) {
+        let t = peek(p);
+        if (t != null && t.t == "op" && (t.v == "*" || t.v == "/" || t.v == "//" || t.v == "%" || t.v == "%%")) {
+            p.i = p.i + 1;
+            l = bin(t.v, l, parse_unary(p), t.col);
+        } else { break; }
+    }
+    return l;
+}
+fn parse_unary(p) -> any {
+    let t = peek(p);
+    if (t == null) { util.fail("expression expected", p.line, 1); }
+    if (t.t == "op" && (t.v == "-" || t.v == "+" || t.v == "~" || t.v == "!")) {
+        p.i = p.i + 1;
+        let e = parse_unary(p);
+        if (t.v == "+") { return e; }
+        return { t: "un", op: t.v, e: e, col: t.col };
+    }
+    return parse_primary(p);
+}
+fn parse_primary(p) -> any {
+    let t = peek(p);
+    if (t == null) { util.fail("expression expected", p.line, 1); }
+    p.i = p.i + 1;
+    if (t.t == "num") { return { t: "num", v: t.v, col: t.col }; }
+    if (t.t == "flt") { return { t: "flt", v: t.v, col: t.col }; }
+    if (t.t == "str") { return { t: "str", v: t.v, col: t.col }; }
+    if (t.t == "op" && t.v == "(") {
+        let e = parse(p);
+        if (!at_op(p, ")")) { util.fail("missing ')'", p.line, t.col); }
+        p.i = p.i + 1;
+        return e;
+    }
+    if (t.t == "id") {
+        if (t.v == "$") { return { t: "here", col: t.col }; }
+        if (t.v == "$$") { return { t: "base", col: t.col }; }
+        if (t["esc"] == null) {
+            let r = regs.lookup(t.v);
+            if (r != null) { return { t: "reg", reg: r, col: t.col }; }
+        }
+        return { t: "sym", name: qualify(p, t.v), col: t.col };
+    }
+    util.fail("unexpected '" + str(t.v) + "' in expression", p.line, t.col);
+}
+
+// ---------------------------------------------------------------- evaluation
+fn str_to_int(s: string) -> int {
+    let bs = util.str_bytes(s);
+    var v = 0;
+    var i = len(bs) - 1;
+    if (len(bs) > 8) { i = 7; }
+    while (i >= 0) { v = (v << 8) | bs[i]; i = i - 1; }
+    return v;
+}
+
+fn need_abs(ctx, a, node) {
+    if (!is_abs(a)) { util.fail("expression is not a constant here (it involves a label or external symbol)", ctx.line, node.col); }
+}
+
+fn tdiv(a: int, b: int) -> int {
+    var neg = false;
+    var x = a; var y = b;
+    if (x < 0) { x = -x; neg = !neg; }
+    if (y < 0) { y = -y; neg = !neg; }
+    let q = idiv(x, y);
+    return neg ? -q : q;
+}
+
+fn shl(a: int, n: int) -> int { if (n >= 64) { return 0; } return a << n; }
+fn shr_logical(a: int, n: int) -> int { if (n >= 64) { return 0; } return a >>> n; }
+fn shr_arith(a: int, n: int) -> int { if (n >= 64) { return a < 0 ? -1 : 0; } return a >> n; }
+
+fn eval(ctx, node) -> any {
+    let t = node.t;
+    if (t == "num") { return konst(node.v); }
+    if (t == "str") { return konst(str_to_int(node.v)); }
+    if (t == "flt") { util.fail("a floating-point constant is only valid in dd/dq/dw data", ctx.line, node.col); }
+    if (t == "here") { return { v: ctx.here, sec: ctx.sec, ext: null, pcsec: null, pcoff: 0, undef: false }; }
+    if (t == "base") { return { v: 0, sec: ctx.sec, ext: null, pcsec: null, pcoff: 0, undef: false }; }
+    if (t == "reg") { util.fail("register '" + node.reg.name + "' cannot be used in an expression here", ctx.line, node.col); }
+    if (t == "sym") { return eval_sym(ctx, node); }
+    if (t == "un") {
+        let a = eval(ctx, node.e);
+        if (a.undef) { return undef_val(); }
+        need_abs(ctx, a, node);
+        if (node.op == "-") { return konst(-a.v); }
+        if (node.op == "~") { return konst(~a.v); }
+        return konst(a.v == 0 ? 1 : 0);
+    }
+    // binary
+    let a = eval(ctx, node.l);
+    let b = eval(ctx, node.r);
+    let op = node.op;
+    if (a.undef || b.undef) {
+        // keep going with zeros so that sizes can still be estimated; the caller sees undef
+        return undef_val();
+    }
+    if (op == "+") {
+        if (!is_abs(a) && !is_abs(b)) { util.fail("cannot add two relocatable values", ctx.line, node.col); }
+        if (is_abs(a)) { let r = copy_val(b); r.v = b.v + a.v; return r; }
+        let r = copy_val(a); r.v = a.v + b.v; return r;
+    }
+    if (op == "-") {
+        if (is_abs(b)) { let r = copy_val(a); r.v = a.v - b.v; return r; }
+        if (a.pcsec == null && b.pcsec == null && b.ext == null && b.sec != null) {
+            // (target) - (section address + offset)
+            if (a.sec != null && a.ext == null && a.sec == b.sec) { return konst(a.v - b.v); }
+            if (a.ext != null || a.sec != null) {
+                let r = copy_val(a); r.pcsec = b.sec; r.pcoff = b.v; return r;
+            }
+        }
+        if (a.ext != null && a.ext == b.ext && a.sec == null && b.sec == null && a.pcsec == null && b.pcsec == null) { return konst(a.v - b.v); }
+        util.fail("invalid operands for subtraction (a constant minus a label, or labels of different sections)", ctx.line, node.col);
+    }
+    need_abs(ctx, a, node);
+    need_abs(ctx, b, node);
+    let x = a.v;
+    let y = b.v;
+    if (op == "*") { return konst(x * y); }
+    if (op == "/" || op == "//") {
+        if (y == 0) { util.fail("division by zero", ctx.line, node.col); }
+        return konst(tdiv(x, y));
+    }
+    if (op == "%" || op == "%%") {
+        if (y == 0) { util.fail("division by zero", ctx.line, node.col); }
+        return konst(x - tdiv(x, y) * y);
+    }
+    if (op == "&") { return konst(x & y); }
+    if (op == "|") { return konst(x | y); }
+    if (op == "^") { return konst(x ^ y); }
+    if (op == "<<" || op == "<<<") { return konst(shl(x, y)); }
+    if (op == ">>") { return konst(shr_logical(x, y)); }
+    if (op == ">>>") { return konst(shr_arith(x, y)); }
+    if (op == "==" || op == "=") { return konst(x == y ? 1 : 0); }
+    if (op == "!=" || op == "<>") { return konst(x != y ? 1 : 0); }
+    if (op == "<") { return konst(x < y ? 1 : 0); }
+    if (op == "<=") { return konst(x <= y ? 1 : 0); }
+    if (op == ">") { return konst(x > y ? 1 : 0); }
+    if (op == ">=") { return konst(x >= y ? 1 : 0); }
+    if (op == "&&") { return konst((x != 0 && y != 0) ? 1 : 0); }
+    if (op == "||") { return konst((x != 0 || y != 0) ? 1 : 0); }
+    if (op == "^^") { return konst(((x != 0) != (y != 0)) ? 1 : 0); }
+    util.fail("unknown operator " + op, ctx.line, node.col);
+}
+
+fn eval_sym(ctx, node) -> any {
+    let s = ctx.syms[node.name];
+    if (s == null || s.val == null) {
+        ctx.undef_refs.push({ name: node.name, line: ctx.line, col: node.col, file: ctx.file });
+        return undef_val();
+    }
+    if (s.val.undef) {
+        ctx.undef_refs.push({ name: node.name, line: ctx.line, col: node.col, file: ctx.file });
+        return undef_val();
+    }
+    return copy_val(s.val);
+}
+
+/// Evaluate to a constant int (error if not constant / not defined yet).
+fn const_int(ctx, node) -> int {
+    let v = eval(ctx, node);
+    if (v.undef) {
+        util.fail("this expression must be a constant that is already defined", ctx.line, node.col == null ? 1 : node.col);
+    }
+    need_abs(ctx, v, node);
+    return v.v;
+}
+
+/// True when the AST mentions a register (used to tell memory expressions from immediates).
+fn has_reg(node) -> bool {
+    let t = node.t;
+    if (t == "reg") { return true; }
+    if (t == "un") { return has_reg(node.e); }
+    if (t == "bin") { return has_reg(node.l) || has_reg(node.r); }
+    return false;
+}
+
+/// Pure-constant AST fold with no symbols (preprocessor %if / %assign / %rep).
+fn fold_simple(ctx, node) -> int {
+    return const_int(ctx, node);
+}

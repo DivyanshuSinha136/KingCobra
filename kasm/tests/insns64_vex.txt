@@ -1,0 +1,150 @@
+vaddps xmm0, xmm1, xmm2
+vaddps ymm0, ymm1, ymm2
+vaddps ymm8, ymm9, ymmword ptr [rax]
+vaddpd xmm0, xmm1, xmmword ptr [rax+rcx*8]
+vaddss xmm0, xmm1, xmm2
+vaddsd xmm0, xmm1, qword ptr [rax]
+vsubps ymm1, ymm2, ymm3
+vmulps xmm15, xmm14, xmm13
+vdivsd xmm0, xmm1, xmm2
+vsqrtps ymm0, ymm1
+vsqrtss xmm0, xmm1, xmm2
+vmaxps ymm0, ymm1, ymm2
+vandps ymm0, ymm1, ymm2
+vxorps xmm0, xmm0, xmm0
+vxorps ymm10, ymm10, ymm10
+vorpd xmm1, xmm2, xmm3
+vunpcklps xmm0, xmm1, xmm2
+vhaddps ymm0, ymm1, ymm2
+vshufps ymm0, ymm1, ymm2, 0x1b
+vcmpps ymm0, ymm1, ymm2, 2
+vcomiss xmm0, xmm1
+vucomisd xmm0, qword ptr [rax]
+vmovaps xmm0, xmm1
+vmovaps ymm0, ymmword ptr [rax]
+vmovaps ymmword ptr [rax], ymm1
+vmovups xmm8, xmmword ptr [r9]
+vmovapd ymm0, ymm1
+vmovdqa ymm0, ymmword ptr [rsp+0x20]
+vmovdqu xmmword ptr [rax], xmm0
+vmovss xmm0, dword ptr [rax]
+vmovss dword ptr [rax], xmm1
+vmovss xmm0, xmm1, xmm2
+vmovsd xmm0, qword ptr [rax]
+vmovsd qword ptr [rax], xmm0
+vmovd xmm0, eax
+vmovd eax, xmm0
+vmovq xmm0, rax
+vmovq rax, xmm0
+vmovq xmm0, xmm1
+vmovq xmm0, qword ptr [rax]
+vmovq qword ptr [rax], xmm0
+vmovlps xmm0, xmm1, qword ptr [rax]
+vmovhps qword ptr [rax], xmm0
+vmovlhps xmm0, xmm1, xmm2
+vmovmskps eax, ymm0
+vpmovmskb eax, xmm0
+vmovntdq ymmword ptr [rax], ymm0
+vlddqu ymm0, ymmword ptr [rax]
+vmovddup ymm0, ymm1
+vcvtsi2sd xmm0, xmm1, eax
+vcvtsi2sd xmm0, xmm1, rax
+vcvtsi2ss xmm0, xmm1, dword ptr [rax]
+vcvttsd2si eax, xmm0
+vcvttsd2si rax, xmm0
+vcvtss2sd xmm0, xmm1, xmm2
+vcvtps2pd ymm0, xmm1
+vcvtdq2ps ymm0, ymm1
+vcvttps2dq ymm0, ymm1
+vpaddb xmm0, xmm1, xmm2
+vpaddd ymm0, ymm1, ymm2
+vpaddq ymm8, ymm9, ymmword ptr [rax]
+vpsubw xmm0, xmm1, xmm2
+vpand ymm0, ymm1, ymm2
+vpxor xmm0, xmm0, xmm0
+vpor ymm1, ymm2, ymm3
+vpcmpeqb ymm0, ymm1, ymm2
+vpcmpgtd xmm0, xmm1, xmm2
+vpmullw ymm0, ymm1, ymm2
+vpmaddwd xmm0, xmm1, xmm2
+vpunpcklbw ymm0, ymm1, ymm2
+vpackuswb xmm0, xmm1, xmm2
+vpsllw xmm0, xmm1, xmm2
+vpsllw xmm0, xmm1, 4
+vpsrld ymm0, ymm1, 3
+vpsrlq ymm0, ymm1, xmm2
+vpsraw xmm0, xmm1, 2
+vpslldq xmm0, xmm1, 4
+vpsrldq ymm0, ymm1, 8
+vpshufd ymm0, ymm1, 0x1b
+vpshufb ymm0, ymm1, ymm2
+vpshufb xmm0, xmm1, xmmword ptr [rax]
+vpabsd ymm0, ymm1
+vpminud ymm0, ymm1, ymm2
+vpmulld xmm0, xmm1, xmm2
+vptest ymm0, ymm1
+vpmovzxbw ymm0, xmm1
+vpmovsxdq ymm0, xmm1
+vpmovzxbd xmm0, dword ptr [rax]
+vroundps ymm0, ymm1, 1
+vroundsd xmm0, xmm1, xmm2, 9
+vblendps ymm0, ymm1, ymm2, 3
+vpblendw xmm0, xmm1, xmm2, 5
+vpalignr ymm0, ymm1, ymm2, 4
+vdpps xmm0, xmm1, xmm2, 0xff
+vpclmulqdq xmm0, xmm1, xmm2, 0x11
+vaesenc xmm0, xmm1, xmm2
+vpextrd eax, xmm0, 1
+vpextrq rax, xmm0, 1
+vpinsrd xmm0, xmm1, eax, 1
+vpinsrq xmm0, xmm1, rax, 1
+vpinsrb xmm0, xmm1, eax, 3
+vblendvps ymm0, ymm1, ymm2, ymm3
+vpblendvb xmm0, xmm1, xmm2, xmm3
+vzeroupper
+vzeroall
+vbroadcastss ymm0, dword ptr [rax]
+vbroadcastsd ymm0, qword ptr [rax]
+vbroadcastss xmm0, xmm1
+vbroadcastf128 ymm0, xmmword ptr [rax]
+vpbroadcastb ymm0, xmm1
+vpbroadcastd ymm0, xmm1
+vpbroadcastq ymm0, qword ptr [rax]
+vinsertf128 ymm0, ymm1, xmm2, 1
+vextractf128 xmm0, ymm1, 1
+vinserti128 ymm0, ymm1, xmmword ptr [rax], 1
+vextracti128 xmmword ptr [rax], ymm1, 1
+vperm2f128 ymm0, ymm1, ymm2, 0x20
+vperm2i128 ymm0, ymm1, ymm2, 0x31
+vpermq ymm0, ymm1, 0x1b
+vpermpd ymm0, ymm1, 0xd8
+vpermd ymm0, ymm1, ymm2
+vpermilps ymm0, ymm1, ymm2
+vpermilps ymm0, ymm1, 0x1b
+vtestps ymm0, ymm1
+vpsllvd ymm0, ymm1, ymm2
+vpsravd xmm0, xmm1, xmm2
+vfmadd132ps ymm0, ymm1, ymm2
+vfmadd213pd xmm0, xmm1, xmm2
+vfmadd231ss xmm0, xmm1, xmm2
+vfmadd231sd xmm0, xmm1, qword ptr [rax]
+vfmsub213ps ymm8, ymm9, ymm10
+vfnmadd231pd ymm0, ymm1, ymm2
+vfmaddsub213ps ymm0, ymm1, ymm2
+andn eax, ebx, ecx
+andn rax, rbx, rcx
+bextr eax, ebx, ecx
+bzhi rax, rbx, rcx
+blsr eax, ebx
+blsmsk rax, rbx
+blsi eax, dword ptr [rax]
+pdep rax, rbx, rcx
+pext eax, ebx, ecx
+mulx rax, rbx, rcx
+rorx eax, ebx, 5
+rorx rax, rbx, 5
+sarx eax, ebx, ecx
+shlx rax, rbx, rcx
+shrx r8, r9, r10
+vcvtph2ps ymm0, xmm1
+vcvtps2ph xmm0, ymm1, 0

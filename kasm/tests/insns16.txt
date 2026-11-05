@@ -1,0 +1,104 @@
+mov ax, 42
+mov ax, bx
+mov al, bl
+mov ax, word ptr [bx]
+mov ax, word ptr [bx+si]
+mov ax, word ptr [bx+di+8]
+mov ax, word ptr [bp+si]
+mov ax, word ptr [bp+di+0x1234]
+mov ax, word ptr [bp]
+mov ax, word ptr [si]
+mov ax, word ptr [di]
+mov ax, word ptr [0x1000]
+mov al, byte ptr [0x1000]
+mov word ptr [0x1000], ax
+mov byte ptr [bx], 5
+mov word ptr [bx], 5
+mov ds, ax
+mov es, bx
+mov ax, ds
+mov eax, ebx
+mov eax, 5
+mov eax, dword ptr [bx]
+mov eax, dword ptr [eax]
+mov eax, dword ptr [eax+ebx*4]
+add ax, 5
+add ax, 500
+add al, 5
+add ax, bx
+sub sp, 8
+xor ax, ax
+cmp ax, 0
+test ax, ax
+inc ax
+dec bx
+push ax
+push 5
+push 500
+push cs
+push ds
+pop ax
+pop ds
+pop es
+pop ss
+push eax
+pop ebx
+pusha
+popa
+pushf
+popf
+call ax
+call word ptr [bx]
+jmp ax
+jmp word ptr [bx]
+ret
+ret 8
+retf
+leave
+neg ax
+not ax
+mul bx
+imul ax, bx
+div cx
+shl ax, 1
+shl ax, 5
+shl ax, cl
+shr bx, 3
+int 0x10
+int 0x13
+int3
+iret
+cli
+sti
+hlt
+cld
+std
+cbw
+cwd
+cwde
+cdq
+lgdt [bx]
+lidt [bx]
+in al, 0x60
+in ax, dx
+out 0x80, al
+out dx, ax
+movsb
+movsw
+stosb
+rep stosw
+lodsb
+scasb
+xlat
+xchg ax, bx
+xchg ax, ax
+mov eax, cr0
+mov cr0, eax
+lodsw
+cmpsb
+loop $
+xor eax, eax
+mov bx, cs
+mov [bx+si], al
+push word ptr [bx]
+pop word ptr [bx]

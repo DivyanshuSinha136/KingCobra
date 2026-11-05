@@ -1,0 +1,177 @@
+// main.kc -- the `kasm` command line.
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.io;
+import std.system;
+import "kasm.kc" as kasm;
+import "util.kc" as util;
+
+const USAGE = "kasm " + kasm.VERSION + " -- the KingCobra x86 assembler (16/32/64-bit, Intel syntax)\n\n" +
+    "usage: kasm [options] input.kasm\n\n" +
+    "  -o FILE         output file (default: input name with the format's extension; '-' = stdout for text formats)\n" +
+    "  -f FORMAT       bin (default) | obj (relocatable .o) | hex | kc | c | hexdump     -- what KASM itself writes\n" +
+    "                  exe (elf) | so | dll | dylib                                      -- KASM writes the object, KCC links it\n" +
+    "                  (guessed from the -o extension when not given: .o .obj .hex .elf .exe .so .dll .bin .kc .h)\n" +
+    "  --target OS     linux | windows | macos: platform of exe/so/dll output (default: this machine; elf/so = linux, dll = windows)\n" +
+    "  -l LIB          library the code imports from (exe/so/dll)    --subsystem console|windows   Windows executables\n" +
+    "  the same two steps by hand:  kasm prog.kasm -o prog.o  &&  kcc prog.o -o prog      (raw code: kasm -o p.bin  &&  kcc p.bin -o p)\n" +
+    "  -l FILE         write a listing        -m FILE   write a section/symbol map\n" +
+    "  -b BITS         initial 'bits' mode: 16, 32 or 64 (default 64)\n" +
+    "  --org ADDR      load address of a flat binary (default 0)       --base ADDR   (ignored: kcc links position-independent images)\n" +
+    "  --entry SYMBOL  executable entry (default: main, else _start)               --name ID     array name for -f kc / c\n" +
+    "  -D NAME[=VAL]   define a preprocessor symbol                    -I DIR        add an include directory\n" +
+    "  -w              silence warnings            -Werror   treat warnings as errors\n" +
+    "  --check         assemble but write nothing  --version   print the version  -h  this help\n" +
+    "  -v, --verbose   print each stage as it starts (also: KASM_TRACE=1); shows where a crash happens\n";
+
+fn parse_num(s: string) -> any {
+    var t = s.trim();
+    if (util.starts_with(t, "0x") || util.starts_with(t, "0X")) {
+        var v = 0;
+        for (i in 2..len(t)) {
+            let c = ord(t[i]);
+            var d = -1;
+            if (c >= 48 && c <= 57) { d = c - 48; } else if (c >= 97 && c <= 102) { d = c - 87; } else if (c >= 65 && c <= 70) { d = c - 55; }
+            if (d < 0) { return null; }
+            v = v * 16 + d;
+        }
+        return v;
+    }
+    for (i in 0..len(t)) { let c = ord(t[i]); if (c < 48 || c > 57) { return null; } }
+    if (len(t) == 0) { return null; }
+    return int(t);
+}
+
+fn die(msg: string) { println("kasm: " + msg); system.exit(2); }
+
+fn show_error(e, input: string) {
+    let errs = e["all"] == null ? [e] : e["all"];
+    var shown = 0;
+    for (x in errs) {
+        if (shown >= 20) { println("kasm: (" + str(len(errs) - 20) + " more errors not shown)"); break; }
+        shown = shown + 1;
+        let f = x["file"] == null ? input : x["file"];
+        if (x.line > 0) {
+            println(f + ":" + str(x.line) + ":" + str(x.col) + ": error: " + x.message);
+            let src = x["src"];
+            if (src != null && x.col >= 1) {
+                println("  " + str(x.line) + " | " + src);
+                println("  " + " ".repeat(len(str(x.line))) + " | " + " ".repeat(x.col - 1) + "^");
+            }
+        } else { println("kasm: error: " + x.message); }
+    }
+}
+
+fn guess_format(out: string) -> string {
+    let e = system.extension(out).lower();
+    if (e == ".o" || e == ".obj") { return "elfobj"; }
+    if (e == ".exe") { return "exe"; }
+    if (e == ".so") { return "so"; }
+    if (e == ".dll") { return "dll"; }
+    if (e == ".dylib") { return "dylib"; }
+    if (e == ".hex" || e == ".ihx") { return "hex"; }
+    if (e == ".elf") { return "elf"; }
+    if (e == ".kc") { return "kc"; }
+    if (e == ".h" || e == ".c") { return "c"; }
+    if (e == ".txt" || e == ".dump") { return "hexdump"; }
+    return "bin";
+}
+
+fn default_ext(fmt: string) -> string {
+    if (fmt == "elfobj") { return ".o"; }
+    if (fmt == "hex") { return ".hex"; }
+    if (fmt == "elf") { return ""; }
+    if (fmt == "exe") { return system.os() == "windows" ? ".exe" : ""; }
+    if (fmt == "so") { return ".so"; }
+    if (fmt == "dll") { return ".dll"; }
+    if (fmt == "dylib") { return ".dylib"; }
+    if (fmt == "obj") { return ".o"; }
+    if (fmt == "kc") { return ".code.kc"; }
+    if (fmt == "c") { return ".h"; }
+    if (fmt == "hexdump") { return ".txt"; }
+    return ".bin";
+}
+
+fn run_cli() {
+    let args = system.args();
+    util.trace("args: " + str(len(args)));
+    var input = ""; var output = ""; var fmt = ""; var listing = ""; var mapfile = "";
+    var bits = 64; var org = 0; var base = 0x400000; var entry = ""; var name = "code";
+    var target = ""; var libs = []; var subsystem = "console"; var defines = {}; var includes = []; var quiet = false; var werror = false; var check = false;
+    var i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        let more = i + 1 < len(args);
+        if (a == "-h" || a == "--help") { print(USAGE); return; }
+        else if (a == "--version") { println("kasm " + kasm.VERSION); return; }
+        else if (a == "-o" && more) { output = args[i + 1]; i = i + 2; }
+        else if (a == "-f" && more) { fmt = args[i + 1]; i = i + 2; }
+        else if (a == "-l" && more) { listing = args[i + 1]; i = i + 2; }
+        else if (a == "-m" && more) { mapfile = args[i + 1]; i = i + 2; }
+        else if ((a == "-b" || a == "--bits") && more) { let v = parse_num(args[i + 1]); if (v != 16 && v != 32 && v != 64) { die("bits must be 16, 32 or 64"); } bits = v; i = i + 2; }
+        else if (a == "--org" && more) { let v = parse_num(args[i + 1]); if (v == null) { die("bad --org value"); } org = v; i = i + 2; }
+        else if (a == "--base" && more) { let v = parse_num(args[i + 1]); if (v == null) { die("bad --base value"); } base = v; i = i + 2; }
+        else if (a == "--entry" && more) { entry = args[i + 1]; i = i + 2; }
+        else if (a == "--target" && more) { target = args[i + 1]; if (target != "linux" && target != "windows" && target != "macos") { die("--target must be linux, windows or macos"); } i = i + 2; }
+        else if (a == "-l" && more) { libs.push(args[i + 1]); i = i + 2; }
+        else if (a == "--subsystem" && more) { subsystem = args[i + 1]; i = i + 2; }
+        else if (a == "--name" && more) { name = args[i + 1]; i = i + 2; }
+        else if (a == "-D" && more) {
+            let d = args[i + 1]; let eq = d.index_of("=");
+            if (eq < 0) { defines[d] = 1; } else { let v = parse_num(d[eq + 1..len(d)]); defines[d[0..eq]] = v == null ? d[eq + 1..len(d)] : v; }
+            i = i + 2;
+        }
+        else if (util.starts_with(a, "-D") && len(a) > 2) { defines[a[2..len(a)]] = 1; i = i + 1; }
+        else if (a == "-I" && more) { includes.push(args[i + 1]); i = i + 2; }
+        else if (a == "-v" || a == "--verbose") { util.set_trace(true); i = i + 1; }
+        else if (a == "-w") { quiet = true; i = i + 1; }
+        else if (a == "-Werror") { werror = true; i = i + 1; }
+        else if (a == "--check") { check = true; i = i + 1; }
+        else if (util.starts_with(a, "-") && len(a) > 1) { die("unknown option " + a + " (try --help)"); }
+        else { input = a; i = i + 1; }
+    }
+    if (input == "") { print(USAGE); system.exit(2); }
+    if (fmt == "") { fmt = output != "" && output != "-" ? guess_format(output) : "bin"; }
+    if (output == "") { output = system.stem(input) + default_ext(fmt); }
+    var res = null;
+    try {
+        res = kasm.assemble_file(input, { format: fmt, bits: bits, org: org, base: base, entry: entry, name: name, listing: listing != "", target: target, libs: libs, subsystem: subsystem, out_name: system.basename(output),
+                                          includes: includes, defines: defines });
+    } catch (e) {
+        if (e != null && e["kind"] == "compile") { show_error(e, input); system.exit(1); }
+        var msg = "unexpected failure";
+        if (e != null && e["message"] != null) { msg = str(e["message"]); }
+        println("kasm: internal error: " + msg);
+        system.exit(1);
+    }
+    if (!quiet) {
+        for (w in res.warnings) { println((w.file == "" ? input : w.file) + ":" + str(w.line) + ": warning: " + w.message); }
+    }
+    if (werror && len(res.warnings) > 0) { println("kasm: " + str(len(res.warnings)) + " warning(s) treated as errors (-Werror)"); system.exit(1); }
+    if (check) { println("kasm: " + input + ": ok (" + str(len(res.bytes)) + " bytes)"); return; }
+    let textual = res.text != "";
+    if (output == "-") {
+        if (!textual) { die("binary output cannot go to stdout; give -o FILE"); }
+        print(res.text);
+    } else {
+        util.trace("write " + output);
+        if (textual) { io.write_file(output, res.text); } else { fbin.save(fbin.from_bytes(res.bytes), output); }
+        if (!io.exists(output)) { die("internal error: '" + output + "' was not created (blocked by antivirus, a locked file or a bad path?)"); }
+        if ((fmt == "elf" || fmt == "exe") && (target == "" ? system.os() != "windows" : target != "windows")) { system.chmod(output, 493); }
+        println("kasm: wrote " + output + " (" + str(len(res.bytes)) + " bytes, " + fmt + ")");
+    }
+    if (listing != "") { io.write_file(listing, res.listing); }
+    if (mapfile != "") { io.write_file(mapfile, res.map); }
+}
+
+fn main() {
+    // never fail silently: report anything that escapes the driver
+    try { run_cli(); }
+    catch (e) {
+        var msg = "unexpected failure";
+        if (e != null && e["message"] != null) { msg = str(e["message"]); } else if (e != null) { msg = str(e); }
+        println("kasm: internal error: " + msg);
+        println("kasm: re-run with --verbose to see which stage failed");
+        system.exit(1);
+    }
+}

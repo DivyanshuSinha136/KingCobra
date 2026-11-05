@@ -1,0 +1,128 @@
+// kasm.kc -- KASM, the KingCobra assembler: public API.
+//   import "kasm/src/kasm.kc" as kasm;
+//   let r = kasm.assemble("bits 64\nmov eax, 42\nret\n", {});     // r.bytes == [0xB8, 0x2A, 0, 0, 0, 0xC3]
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.io;
+import std.system;
+import std.rhex;
+import "util.kc" as util;
+import "lexer.kc" as lexer;
+import "parse.kc" as parse;
+import "asm.kc" as asm;
+import "pre.kc" as pre;
+import "out.kc" as out;
+import "../../kcc/src/objin.kc" as objin;
+import "../../kcc/src/link.kc" as kcclink;
+
+const VERSION = "1.0.0";
+
+fn opt(o, key: string, dflt) -> any {
+    if (o == null) { return dflt; }
+    let v = o[key];
+    return v == null ? dflt : v;
+}
+
+fn defaults(o) -> any {
+    return { format: opt(o, "format", "bin"), bits: opt(o, "bits", 64), org: opt(o, "org", 0), listing: opt(o, "listing", false),
+             includes: opt(o, "includes", []), defines: opt(o, "defines", {}), base_dir: opt(o, "base_dir", "."), file: opt(o, "file", "<string>"),
+             entry: opt(o, "entry", ""), target: opt(o, "target", ""), out_name: opt(o, "out_name", "a.out"), subsystem: opt(o, "subsystem", "console"), libs: opt(o, "libs", []), base: opt(o, "base", 0x400000), name: opt(o, "name", "code") };
+}
+
+/// KASM only writes object code; the final executable / library is made by KCC's linkers from that object.
+/// kind: "exe" | "shared".  Returns the file's bytes.
+fn link_with_kcc(ctx, opts, kind: string) -> any {
+    let obj = out.build_elf_obj(ctx, opts);                       // ELF64 .o, in memory
+    var target = opts.target;
+    if (target == "") { target = (opts.format == "elf" || opts.format == "elf64" || opts.format == "so") ? "linux" : (system.os() == "windows" ? "windows" : (system.os() == "macos" ? "macos" : "linux")); }
+    if (opts.format == "dll") { target = "windows"; }
+    if (opts.format == "dylib") { target = "macos"; }
+    util.trace("kcc: read object, target " + target);
+    let mod = objin.load_elf_obj(obj, opts.file, target);
+    for (l in opts.libs) { if (!mod.libs.contains(l)) { mod.libs.push(l); } }
+    if (len(opts.libs) > 0) { for (u in mod.undef) { mod.import_lib[u] = opts.libs[0]; } }
+    if (kind == "exe") { objin.pick_entry(mod, opts.entry, opts.file); }
+    util.trace("kcc: link " + mod.fmt + " " + kind);
+    let img = kcclink.write(mod, kind, opts.out_name, opts.subsystem);
+    if (img == null) { throw { kind: "compile", message: "no linker for target '" + target + "'", line: 0, col: 0 }; }
+    return fbin.to_bytes(img);
+}
+
+fn parse_source(ctx, text: string, file: string, opts) -> any {
+    let pst = pre.new_pre(opts);
+    let items = pre.process(pst, text, file);
+    for (w in pst.warnings) { ctx.pre_warnings.push(w); }
+    let ps = parse.ps_new();
+    let stmts = [];
+    for (it in items) {
+        try { stmts.push(parse.parse_line(ps, it.toks, it.line, it.file, it.text)); }
+        catch (e) { if (e != null && e["kind"] == "compile") { e["file"] = it.file; e["src"] = it.text; } throw e; }
+    }
+    return stmts;
+}
+
+/// Assemble `source`.  Options (all optional): format ("bin" "hex" "obj"/"elfobj" "exe"/"elf" "so" "dll" "kc" "c" "hexdump"; exe/so/dll are linked by KCC from the object KASM writes), target ("linux" "windows" "macos"), libs, subsystem, bits (16|32|64), org,
+/// base (ELF load address), entry (ELF entry symbol), listing (bool), includes ([dirs]), defines ({NAME: value}),
+/// base_dir, file (name used in diagnostics), name (array name for the kc/c formats).
+/// Returns { bytes, text, symbols, warnings, listing, map, sections, ctx }.
+fn assemble(source: string, o) -> any {
+    let opts = defaults(o);
+    let ctx = asm.new_ctx(opts);
+    ctx.file = opts.file;
+    var stmts = [];
+    util.trace("preprocess + parse " + opts.file);
+    try { stmts = parse_source(ctx, source, opts.file, opts); }
+    catch (e) { if (e != null && e["kind"] == "compile" && e["file"] == null) { e["file"] = opts.file; } throw e; }
+    util.trace("assemble " + str(len(stmts)) + " statements (bits=" + str(opts.bits) + ")");
+    asm.assemble_stmts(ctx, stmts);
+    util.trace("layout / encode output (format=" + opts.format + ")");
+    let fmt = opts.format;
+    var bytes = [];
+    var text = "";
+    if (fmt == "elf" || fmt == "elf64" || fmt == "exe") {
+        bytes = link_with_kcc(ctx, opts, "exe");
+    } else if (fmt == "so" || fmt == "dll" || fmt == "dylib") {
+        bytes = link_with_kcc(ctx, opts, "shared");
+    } else if (fmt == "elfobj" || fmt == "obj" || fmt == "o") {
+        bytes = fbin.to_bytes(out.build_elf_obj(ctx, opts));
+    } else if (fmt == "bin" || fmt == "hex" || fmt == "kc" || fmt == "c" || fmt == "hexdump") {
+        asm.layout_bin(ctx);
+        asm.resolve_relocs(ctx);
+        bytes = asm.image_bin(ctx);
+        if (fmt == "hex") { text = out.intel_hex(bytes, ctx.org, 0); }
+        else if (fmt == "kc" || fmt == "c") { text = out.array_text(bytes, fmt, opts.name); }
+        else if (fmt == "hexdump") { text = out.hexdump(bytes, ctx.org); }
+    } else { throw { kind: "compile", message: "unknown output format '" + fmt + "' (use bin, hex, obj, exe, so, dll, kc, c or hexdump)", line: 0, col: 0 }; }
+    util.trace("output built: " + str(len(bytes)) + " bytes");
+    let secs = [];
+    for (n in ctx.order) { let s = ctx.secs[n]; secs.push({ name: n, base: s.base, size: s.pos, align: s.align, exec: s.flags.exec, write: s.flags.write, nobits: s.flags.nobits }); }
+    return { bytes: bytes, text: text, symbols: asm.symbols_of(ctx), warnings: ctx.warnings, sections: secs,
+             listing: opts.listing ? out.listing_text(ctx, true) : "", map: out.map_text(ctx), ctx: ctx };
+}
+
+/// Assemble a file (relative %include / incbin paths resolve next to it).
+fn assemble_file(path: string, o) -> any {
+    if (!io.exists(path)) { throw { kind: "compile", message: "cannot open '" + path + "'", line: 0, col: 0 }; }
+    var opts = o == null ? {} : o;
+    util.trace("read " + path);
+    opts["file"] = path;
+    opts["base_dir"] = system.dirname(path);
+    return assemble(io.read_file(path), opts);
+}
+
+/// Assemble 64-bit position-independent code and return it as an array of bytes (for std.rhex).
+fn code(source: string) -> any {
+    return assemble("bits 64\n" + source + "\n", {}).bytes;
+}
+
+/// Assemble 64-bit code and run it in-process through std.rhex (x86-64 hosts only), returning rax.
+/// The preprocessor symbol WIN is defined on Windows so one source can handle both calling conventions
+/// (SysV passes arguments in rdi, rsi, rdx, rcx, r8, r9; Microsoft x64 in rcx, rdx, r8, r9).
+fn run(source: string, args) -> any {
+    let defs = {};
+    if (system.platform() == "windows") { defs["WIN"] = 1; }
+    let bytes = assemble("bits 64\n" + source + "\n", { defines: defs }).bytes;
+    var result = 0;
+    unsafe { result = rhex.exec_args(bytes, args == null ? [] : args); }
+    return result;
+}

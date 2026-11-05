@@ -1,0 +1,210 @@
+// lexer.kc -- one source line -> tokens.
+//   token: { t: "id"|"num"|"flt"|"str"|"op", v, col, end }       (col is 1-based, in bytes)
+// Comments start with ';'.  Numbers: 42 0x2A 2Ah 0b101 101b 0o17 17q 1_000 'A' ; floats: 1.5 2e-3
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import "util.kc" as util;
+
+fn is_digit(c: int) -> bool { return c >= 48 && c <= 57; }
+fn is_alpha(c: int) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95; }
+fn is_alnum(c: int) -> bool { return is_alpha(c) || is_digit(c); }
+fn is_idstart(c: int) -> bool { return is_alpha(c) || c == 46 || c == 63 || c == 64; }       // . ? @
+fn is_idchar(c: int) -> bool { return is_alnum(c) || c == 46 || c == 63 || c == 64 || c == 36 || c == 35 || c == 126; }  // . ? @ $ # ~
+fn is_space(c: int) -> bool { return c == 32 || c == 9 || c == 13 || c == 12 || c == 11; }
+
+fn hexval(c: int) -> int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+/// True when bytes[a..b) is a non-empty run of valid digits of `radix` (underscores allowed).
+fn digits_ok(bs, a: int, b: int, radix: int) -> bool {
+    if (a >= b) { return false; }
+    var seen = false;
+    for (i in a..b) {
+        let c = bs[i];
+        if (c == 95) { continue; }
+        let d = hexval(c);
+        if (d < 0 || d >= radix) { return false; }
+        seen = true;
+    }
+    return seen;
+}
+
+/// Accumulate digits with 64-bit wrap-around (0xFFFFFFFFFFFFFFFF is the bit pattern -1).
+fn accum(bs, a: int, b: int, radix: int) -> int {
+    var v = 0;
+    for (i in a..b) {
+        if (bs[i] == 95) { continue; }
+        v = v * radix + hexval(bs[i]);
+    }
+    return v;
+}
+
+/// Decode a number word (letters/digits/underscore only). Returns the int or null when it is not a number.
+fn number_word(bs, a: int, b: int) -> any {
+    let n = b - a;
+    if (n >= 2 && bs[a] == 48) {
+        let p = bs[a + 1];
+        if ((p == 120 || p == 88) && digits_ok(bs, a + 2, b, 16)) { return accum(bs, a + 2, b, 16); }
+        if ((p == 98 || p == 66) && digits_ok(bs, a + 2, b, 2)) { return accum(bs, a + 2, b, 2); }
+        if ((p == 111 || p == 79) && digits_ok(bs, a + 2, b, 8)) { return accum(bs, a + 2, b, 8); }
+        if ((p == 100 || p == 68) && digits_ok(bs, a + 2, b, 10)) { return accum(bs, a + 2, b, 10); }
+    }
+    if (n >= 2) {
+        let last = bs[b - 1];
+        if ((last == 104 || last == 72) && digits_ok(bs, a, b - 1, 16)) { return accum(bs, a, b - 1, 16); }
+        if ((last == 98 || last == 66) && digits_ok(bs, a, b - 1, 2)) { return accum(bs, a, b - 1, 2); }
+        if ((last == 113 || last == 81 || last == 111 || last == 79) && digits_ok(bs, a, b - 1, 8)) { return accum(bs, a, b - 1, 8); }
+        if ((last == 100 || last == 68) && digits_ok(bs, a, b - 1, 10)) { return accum(bs, a, b - 1, 10); }
+    }
+    if (digits_ok(bs, a, b, 10)) { return accum(bs, a, b, 10); }
+    return null;
+}
+
+fn unescape(s: string, line: int, col: int) -> string {
+    var out = "";
+    var i = 0;
+    let n = len(s);
+    while (i < n) {
+        let c = s[i];
+        if (c != "\\") { out = out + c; i = i + 1; continue; }
+        i = i + 1;
+        if (i >= n) { util.fail("bad escape at end of string", line, col); }
+        let e = s[i];
+        if (e == "n") { out = out + "\n"; }
+        else if (e == "t") { out = out + "\t"; }
+        else if (e == "r") { out = out + "\r"; }
+        else if (e == "0") { out = out + "\0"; }
+        else if (e == "a") { out = out + chr(7); }
+        else if (e == "b") { out = out + chr(8); }
+        else if (e == "e") { out = out + chr(27); }
+        else if (e == "f") { out = out + chr(12); }
+        else if (e == "v") { out = out + chr(11); }
+        else if (e == "x") {
+            var v = 0; var k = 0;
+            while (k < 2 && i + 1 < n && hexval(ord(s[i + 1])) >= 0) { v = v * 16 + hexval(ord(s[i + 1])); i = i + 1; k = k + 1; }
+            out = out + chr_byte(v);
+        } else { out = out + e; }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A one-byte string holding byte value v (0..255); strings are byte arrays, so this also works for v >= 0x80.
+fn chr_byte(v: int) -> string {
+    if (v < 128) { return chr(v); }
+    let s = fbin.buffer();
+    fbin.write_u8(s, v);
+    fbin.seek(s, 0);
+    return fbin.read_string(s, 1);
+}
+
+fn tokenize(line: string, lineno: int) -> any {
+    let bs = util.str_bytes(line);
+    let n = len(bs);
+    let toks = [];
+    var i = 0;
+    while (i < n) {
+        let c = bs[i];
+        if (is_space(c)) { i = i + 1; continue; }
+        if (c == 59) { break; }                                    // ; comment
+        let col = i + 1;
+        if (is_digit(c)) {
+            var j = i;
+            while (j < n && is_alnum(bs[j])) { j = j + 1; }
+            // float?  digits '.' digits [e[+-]digits]   or   digitsE[+-]digits
+            var is_float = false;
+            var k = j;
+            let all_dec = digits_ok(bs, i, j, 10);
+            if (all_dec && k < n && bs[k] == 46 && k + 1 < n && is_digit(bs[k + 1])) {
+                k = k + 1;
+                while (k < n && is_digit(bs[k])) { k = k + 1; }
+                if (k < n && (bs[k] == 101 || bs[k] == 69)) {
+                    var m = k + 1;
+                    if (m < n && (bs[m] == 43 || bs[m] == 45)) { m = m + 1; }
+                    if (m < n && is_digit(bs[m])) { while (m < n && is_digit(bs[m])) { m = m + 1; } k = m; }
+                }
+                is_float = true;
+            } else if (j - i >= 2 && (bs[j - 1] == 101 || bs[j - 1] == 69) && digits_ok(bs, i, j - 1, 10) && j < n && (bs[j] == 43 || bs[j] == 45) && j + 1 < n && is_digit(bs[j + 1])) {
+                k = j + 1;
+                while (k < n && is_digit(bs[k])) { k = k + 1; }
+                is_float = true;
+            }
+            if (is_float) {
+                toks.push({ t: "flt", v: float(line[i..k]), col: col, end: k + 1 });
+                i = k;
+                continue;
+            }
+            let v = number_word(bs, i, j);
+            if (v == null) {
+                // 1e5 style (no sign) is also a float
+                if (j - i >= 3 && !digits_ok(bs, i, j, 10)) {
+                    var e = i; while (e < j && is_digit(bs[e])) { e = e + 1; }
+                    if (e > i && e < j && (bs[e] == 101 || bs[e] == 69) && digits_ok(bs, e + 1, j, 10)) {
+                        toks.push({ t: "flt", v: float(line[i..j]), col: col, end: j + 1 });
+                        i = j;
+                        continue;
+                    }
+                }
+                util.fail("bad number '" + line[i..j] + "'", lineno, col);
+            }
+            toks.push({ t: "num", v: v, col: col, end: j + 1 });
+            i = j;
+            continue;
+        }
+        if (c == 36) {                                              // $  $$  $ident
+            if (i + 1 < n && bs[i + 1] == 36) { toks.push({ t: "id", v: "$$", col: col, end: i + 3 }); i = i + 2; continue; }
+            if (i + 1 < n && is_idstart(bs[i + 1]) && bs[i + 1] != 46) {
+                var j = i + 1;
+                while (j < n && is_idchar(bs[j])) { j = j + 1; }
+                toks.push({ t: "id", v: line[i + 1..j], col: col, end: j + 1, esc: true });
+                i = j;
+                continue;
+            }
+            toks.push({ t: "id", v: "$", col: col, end: i + 2 });
+            i = i + 1;
+            continue;
+        }
+        if (is_idstart(c)) {
+            var j = i + 1;
+            while (j < n && is_idchar(bs[j])) { j = j + 1; }
+            toks.push({ t: "id", v: line[i..j], col: col, end: j + 1 });
+            i = j;
+            continue;
+        }
+        if (c == 39 || c == 34 || c == 96) {                        // ' " `
+            var j = i + 1;
+            while (j < n && bs[j] != c) {
+                if (c == 96 && bs[j] == 92 && j + 1 < n) { j = j + 1; }
+                j = j + 1;
+            }
+            if (j >= n) { util.fail("unterminated string", lineno, col); }
+            var body = line[i + 1..j];
+            if (c == 96) { body = unescape(body, lineno, col); }
+            toks.push({ t: "str", v: body, col: col, end: j + 2, q: c });
+            i = j + 1;
+            continue;
+        }
+        // operators
+        var op = "";
+        if (i + 2 < n) {
+            let t3 = line[i..i + 3];
+            if (t3 == ">>>" || t3 == "<<<") { op = t3; }
+        }
+        if (op == "" && i + 1 < n) {
+            let t2 = line[i..i + 2];
+            if (t2 == "<<" || t2 == ">>" || t2 == "//" || t2 == "%%" || t2 == "<=" || t2 == ">=" || t2 == "==" || t2 == "!=" || t2 == "<>" || t2 == "&&" || t2 == "||" || t2 == "^^") { op = t2; }
+        }
+        if (op == "") {
+            let t1 = line[i..i + 1];
+            if (t1 == "+" || t1 == "-" || t1 == "*" || t1 == "/" || t1 == "%" || t1 == "&" || t1 == "|" || t1 == "^" || t1 == "~" || t1 == "!" || t1 == "<" || t1 == ">" || t1 == "=" || t1 == "(" || t1 == ")" || t1 == "[" || t1 == "]" || t1 == "," || t1 == ":" || t1 == "{" || t1 == "}" || t1 == "?" || t1 == "#") { op = t1; }
+        }
+        if (op == "") { util.fail("unexpected character '" + line[i..i + 1] + "'", lineno, col); }
+        toks.push({ t: "op", v: op, col: col, end: col + len(op) });
+        i = i + len(op);
+    }
+    return toks;
+}

@@ -1,0 +1,23 @@
+; calls_libc.kasm -- an object file linked with the C library:
+;   kasm calls_libc.kasm -f elfobj -o calls_libc.o && gcc -no-pie calls_libc.o -o calls_libc && ./calls_libc
+bits 64
+default rel
+extern printf
+global main
+
+section .rodata
+fmt:    db "%d squared is %d", 10, 0
+
+section .text
+main:
+    push    rbp
+    mov     rbp, rsp
+    mov     esi, 12
+    mov     edx, esi
+    imul    edx, edx
+    lea     rdi, [fmt]
+    xor     eax, eax
+    call    printf wrt ..plt
+    xor     eax, eax
+    pop     rbp
+    ret

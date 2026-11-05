@@ -1,0 +1,20 @@
+; hello.kasm -- Linux x86-64, no libc, no linker:    kasm hello.kasm -f elf -o hello && ./hello
+bits 64
+default rel
+
+global _start
+
+section .rodata
+msg:     db "Hello from KASM!", 10
+msg_len  equ $ - msg
+
+section .text
+_start:
+    mov     eax, 1              ; write
+    mov     edi, 1              ; stdout
+    lea     rsi, [msg]
+    mov     edx, msg_len
+    syscall
+    xor     edi, edi            ; exit(0)
+    mov     eax, 60
+    syscall

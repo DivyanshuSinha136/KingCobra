@@ -1,0 +1,20 @@
+// dump.kc -- assemble every line of a file separately and print one hex string per line (used by tools/diff_gas.py)
+import std.io;
+import std.system;
+import "../src/kasm.kc" as kasm;
+import "../src/util.kc" as util;
+
+fn main() {
+    let args = system.args();
+    let bits = int(args[1]);
+    let lines = io.lines(args[0]);
+    for (l in lines) {
+        if (l.trim() == "") { println(""); continue; }
+        try {
+            let r = kasm.assemble("bits " + str(bits) + "\n" + l + "\n", {});
+            println(util.hex_of(r.bytes).lower());
+        } catch (e) {
+            println("ERR " + str(e.message));
+        }
+    }
+}

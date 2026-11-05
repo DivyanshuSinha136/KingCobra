@@ -1,0 +1,126 @@
+mov eax, 42
+mov eax, ebx
+mov ax, bx
+mov al, bl
+mov eax, dword ptr [ebx]
+mov eax, dword ptr [ebx+ecx*4+8]
+mov eax, dword ptr [esp]
+mov eax, dword ptr [esp+4]
+mov eax, dword ptr [ebp]
+mov eax, dword ptr [ebp+8]
+mov eax, dword ptr [0x1000]
+mov al, byte ptr [0x1000]
+mov dword ptr [0x1000], eax
+mov byte ptr [0x1000], al
+mov dword ptr [eax], 5
+mov word ptr [eax], 5
+mov ds, ax
+mov ax, ds
+mov eax, cr0
+mov cr3, eax
+mov eax, dr0
+lea eax, [ebx+ecx*2]
+add eax, 5
+add eax, 500
+add ax, 5
+add al, 5
+add dword ptr [eax], 5
+add eax, ebx
+sub esp, 8
+xor eax, eax
+cmp eax, 0
+test eax, eax
+inc eax
+dec ebx
+inc ax
+dec cl
+push eax
+push 5
+push 0x12345678
+push dword ptr [eax]
+push cs
+push ds
+push es
+push ss
+push fs
+pop eax
+pop ds
+pop es
+pop ss
+push ax
+pop bx
+pushad
+popad
+pushfd
+popfd
+call eax
+call dword ptr [eax]
+jmp eax
+jmp dword ptr [eax*4+0x1000]
+ret
+ret 8
+leave
+neg eax
+not eax
+mul ebx
+imul eax, ebx
+imul eax, ebx, 5
+div ecx
+shl eax, 1
+shl eax, 5
+shl eax, cl
+shr ax, 3
+shld eax, ebx, 4
+bt eax, 3
+bsf eax, ebx
+bswap eax
+movzx eax, bl
+movzx eax, word ptr [eax]
+movsx eax, bl
+cmove eax, ebx
+sete al
+int 0x80
+int3
+into
+iret
+iretd
+cpuid
+rdtsc
+cli
+sti
+hlt
+cwde
+cdq
+cwd
+cbw
+lgdt [eax]
+lidt [eax]
+in al, 0x60
+out 0x80, al
+in eax, dx
+movsb
+movsd
+stosd
+rep movsd
+lodsb
+scasb
+xlat
+lock add dword ptr [eax], 1
+cmpxchg dword ptr [eax], ecx
+xadd dword ptr [eax], ebx
+xchg eax, ebx
+xchg ax, bx
+enter 16, 0
+movaps xmm0, xmm1
+movdqa xmm0, xmmword ptr [eax]
+addps xmm0, xmm1
+cvtsi2sd xmm0, eax
+pxor xmm0, xmm0
+lds eax, [ebx]
+les eax, [ebx]
+aaa
+aas
+daa
+das
+arpl ax, bx
+bound eax, [ebx]

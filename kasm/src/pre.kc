@@ -1,0 +1,412 @@
+// pre.kc -- the preprocessor: %define / %assign / %macro / %rep / %if / %include, producing a flat list of logical lines.
+//   process(pst, text, file) -> [ { toks, text, file, line } ]
+// Author: Divyanshu Sinha (MIT License)
+import std.io;
+import std.system;
+import "util.kc" as util;
+import "lexer.kc" as lexer;
+import "expr.kc" as ex;
+import "parse.kc" as parse;
+
+const MAX_DEPTH = 64;
+
+fn new_pre(opts) -> any {
+    let pst = { defs: {}, macros: {}, includes: opts.includes, base_dir: opts.base_dir, uniq: 0, warnings: [], depth: 0, exit_rep: false };
+    pst.defs["__KASM__"] = { params: null, body: [{ t: "num", v: 1, col: 1, end: 2 }] };
+    pst.defs["__KASM_MAJOR__"] = { params: null, body: [{ t: "num", v: 1, col: 1, end: 2 }] };
+    for (k in keys(opts.defines)) {
+        let v = opts.defines[k];
+        var body = [];
+        if (typeof(v) == "int") { body = [{ t: "num", v: v, col: 1, end: 2 }]; }
+        else if (v == true) { body = [{ t: "num", v: 1, col: 1, end: 2 }]; }
+        else { body = lexer.tokenize(str(v), 0); }
+        pst.defs[k] = { params: null, body: body };
+    }
+    return pst;
+}
+
+fn fail_at(file: string, line: int, col: int, msg: string, src: string) {
+    throw { kind: "compile", message: msg, line: line, col: col, file: file, src: src };
+}
+
+fn split_lines(text: string, file: string) -> any {
+    let raw = text.split("\n");
+    let out = [];
+    var i = 0;
+    while (i < len(raw)) {
+        var l = raw[i];
+        let ln = i + 1;
+        if (len(l) > 0 && l[len(l) - 1] == "\r") { l = l[0..len(l) - 1]; }
+        while (len(l) > 0 && l[len(l) - 1] == "\\" && i + 1 < len(raw)) {
+            i = i + 1;
+            var nx = raw[i];
+            if (len(nx) > 0 && nx[len(nx) - 1] == "\r") { nx = nx[0..len(nx) - 1]; }
+            l = l[0..len(l) - 1] + nx;
+        }
+        out.push({ text: l, file: file, line: ln });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn strip_comment(s: string) -> string {
+    var q = "";
+    for (i in 0..len(s)) {
+        let c = s[i];
+        if (q != "") { if (c == q) { q = ""; } continue; }
+        if (c == "'" || c == "\"" || c == "`") { q = c; continue; }
+        if (c == ";") { return s[0..i]; }
+    }
+    return s;
+}
+
+/// "%name rest" -> [name, rest]  (null when the line is not a preprocessor directive)
+fn directive_of(text: string) -> any {
+    let t = strip_comment(text).trim();
+    if (len(t) < 2 || t[0] != "%") { return null; }
+    let c = ord(t[1]);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122))) { return null; }
+    var j = 1;
+    while (j < len(t) && lexer.is_alnum(ord(t[j]))) { j = j + 1; }
+    return [t[1..j].lower(), t[j..len(t)].trim()];
+}
+
+// ---------------------------------------------------------------- define expansion on tokens
+fn expand_toks(pst, toks, active, file: string, line: int) -> any {
+    let out = [];
+    var i = 0;
+    while (i < len(toks)) {
+        let t = toks[i];
+        if (t.t == "id") {
+            if (t.v == "__LINE__") { out.push({ t: "num", v: line, col: t.col, end: t.end }); i = i + 1; continue; }
+            if (t.v == "__FILE__") { out.push({ t: "str", v: file, col: t.col, end: t.end, q: 34 }); i = i + 1; continue; }
+            let d = pst.defs[t.v];
+            if (d != null && !(t.v in active)) {
+                if (d.params == null) {
+                    let sub = expand_toks(pst, d.body, active.concat([t.v]), file, line);
+                    for (x in sub) { out.push({ t: x.t, v: x.v, col: t.col, end: t.end, q: x["q"], esc: x["esc"] }); }
+                    i = i + 1;
+                    continue;
+                }
+                if (i + 1 < len(toks) && toks[i + 1].t == "op" && toks[i + 1].v == "(") {
+                    // collect arguments
+                    var depth = 0; var j = i + 1;
+                    var args = []; var cur = [];
+                    while (j < len(toks)) {
+                        let u = toks[j];
+                        if (u.t == "op" && u.v == "(") { depth = depth + 1; if (depth > 1) { cur.push(u); } }
+                        else if (u.t == "op" && u.v == ")") { depth = depth - 1; if (depth == 0) { break; } cur.push(u); }
+                        else if (u.t == "op" && u.v == "," && depth == 1) { args.push(cur); cur = []; }
+                        else { cur.push(u); }
+                        j = j + 1;
+                    }
+                    if (j >= len(toks)) { fail_at(file, line, t.col, "unterminated macro call '" + t.v + "('", ""); }
+                    args.push(cur);
+                    if (len(d.params) == 0 && len(args) == 1 && len(args[0]) == 0) { args = []; }
+                    if (len(args) != len(d.params)) { fail_at(file, line, t.col, "macro '" + t.v + "' takes " + str(len(d.params)) + " argument(s), got " + str(len(args)), ""); }
+                    let body = [];
+                    for (x in d.body) {
+                        var rep = false;
+                        if (x.t == "id") {
+                            for (k in 0..len(d.params)) { if (d.params[k] == x.v) { for (a in args[k]) { body.push(a); } rep = true; } }
+                        }
+                        if (!rep) { body.push(x); }
+                    }
+                    let sub = expand_toks(pst, body, active.concat([t.v]), file, line);
+                    for (x in sub) { out.push(x); }
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(t);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn eval_const(pst, toks, file: string, line: int, text: string) -> int {
+    let ex_toks = expand_toks(pst, toks, [], file, line);
+    if (len(ex_toks) == 0) { fail_at(file, line, 1, "expression expected", text); }
+    let p = ex.new_parser(ex_toks, line, "");
+    var ast = null;
+    try { ast = ex.parse(p); } catch (e) { if (e["kind"] == "compile") { e["file"] = file; e["src"] = text; } throw e; }
+    if (!ex.at_end(p)) { fail_at(file, line, p.toks[p.i].col, "unexpected text in preprocessor expression", text); }
+    let ctx = parse.dummy_ctx(line);
+    ctx.file = file;
+    var v = null;
+    try { v = ex.eval(ctx, ast); } catch (e) { if (e["kind"] == "compile") { e["file"] = file; e["src"] = text; } throw e; }
+    if (v.undef || !ex.is_abs(v)) { fail_at(file, line, 1, "a preprocessor expression must be a constant made of numbers and %define/%assign names", text); }
+    return v.v;
+}
+
+// ---------------------------------------------------------------- macros
+fn parse_macro_header(pst, rest: string, item) -> any {
+    let toks = lexer.tokenize(rest, item.line);
+    if (len(toks) < 2 || toks[0].t != "id") { fail_at(item.file, item.line, 1, "%macro needs a name and an argument count", item.text); }
+    let name = toks[0].v;
+    var mn = 0; var mx = 0;
+    var i = 1;
+    if (toks[1].t == "num") {
+        mn = toks[1].v; mx = mn; i = 2;
+        if (i + 1 < len(toks) && toks[i].t == "op" && toks[i].v == "-") {
+            if (toks[i + 1].t == "num") { mx = toks[i + 1].v; }
+            else if (toks[i + 1].t == "op" && toks[i + 1].v == "*") { mx = -1; }
+            i = i + 2;
+        }
+    } else { fail_at(item.file, item.line, toks[1].col, "%macro needs a numeric argument count", item.text); }
+    // defaults: remaining comma separated text
+    let defaults = [];
+    if (i < len(toks)) {
+        let rest_text = rest[toks[i].col - 1..len(rest)];
+        for (g in rest_text.split(",")) { defaults.push(g.trim()); }
+    }
+    return { name: name, min: mn, max: mx, defaults: defaults, body: [] };
+}
+
+fn call_args(text: string, toks, k: int) -> any {
+    let groups = parse.split_args(toks, k + 1);
+    let out = [];
+    for (g in groups) {
+        if (len(g) == 0) { out.push(""); continue; }
+        out.push(text[g[0].col - 1..g[len(g) - 1].end - 1]);
+    }
+    return out;
+}
+
+fn subst_body(m, line_text: string, args, uniq: int) -> string {
+    var out = "";
+    var i = 0;
+    let n = len(line_text);
+    while (i < n) {
+        let c = line_text[i];
+        if (c == "%" && i + 1 < n) {
+            let d = line_text[i + 1];
+            if (d == "%" && i + 2 < n && lexer.is_alpha(ord(line_text[i + 2]))) {
+                var j = i + 2;
+                while (j < n && lexer.is_alnum(ord(line_text[j]))) { j = j + 1; }
+                out = out + "..@" + str(uniq) + "." + line_text[i + 2..j];
+                i = j;
+                continue;
+            }
+            if (lexer.is_digit(ord(d))) {
+                var j = i + 1;
+                while (j < n && lexer.is_digit(ord(line_text[j]))) { j = j + 1; }
+                let k = int(line_text[i + 1..j]);
+                if (k == 0) { out = out + str(len(args)); }
+                else if (k <= len(args)) { out = out + args[k - 1]; }
+                else if (k <= len(m.defaults) + m.min) { var di = k - m.min - 1; out = out + (di >= 0 && di < len(m.defaults) ? m.defaults[di] : ""); }
+                i = j;
+                continue;
+            }
+        }
+        out = out + c;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn find_macro(pst, name: string, nargs: int) -> any {
+    let l = pst.macros[name];
+    if (l == null) { return null; }
+    for (m in l) { if (nargs >= m.min && (m.max < 0 || nargs <= m.max)) { return m; } }
+    return null;
+}
+
+// ---------------------------------------------------------------- the main loop
+fn read_include(pst, name: string, from_file: string, item) -> any {
+    var path = system.path_join(system.dirname(from_file), name);
+    if (!io.exists(path)) { path = name; }
+    if (!io.exists(path)) { path = system.path_join(pst.base_dir, name); }
+    if (!io.exists(path)) { for (d in pst.includes) { let p = system.path_join(d, name); if (io.exists(p)) { path = p; break; } } }
+    if (!io.exists(path)) { fail_at(item.file, item.line, 1, "cannot open include file '" + name + "'", item.text); }
+    return { path: path, text: io.read_file(path) };
+}
+
+fn cond_active(stack) -> bool {
+    for (c in stack) { if (!c.on) { return false; } }
+    return true;
+}
+
+fn expand_lines(pst, items, out) {
+    pst.depth = pst.depth + 1;
+    if (pst.depth > MAX_DEPTH) { fail_at(items[0].file, items[0].line, 1, "preprocessor nesting too deep (recursive macro or include?)", ""); }
+    let stack = [];
+    var i = 0;
+    while (i < len(items)) {
+        let item = items[i];
+        i = i + 1;
+        let dv = directive_of(item.text);
+        if (dv != null) {
+            let name = dv[0]; let rest = dv[1];
+            // conditionals are processed even in skipped regions (nesting)
+            if (name == "if" || name == "ifdef" || name == "ifndef" || name == "ifidn" || name == "ifidni" || name == "ifnidn" || name == "ifnidni" || name == "ifmacro" || name == "ifnum" || name == "ifstr" || name == "ifid" || name == "ifnmacro") {
+                if (!cond_active(stack)) { stack.push({ on: false, taken: true }); continue; }
+                var r = false;
+                if (name == "if") { r = eval_const(pst, lexer.tokenize(rest, item.line), item.file, item.line, item.text) != 0; }
+                else if (name == "ifdef") { r = pst.defs[rest] != null || pst.macros[rest] != null; }
+                else if (name == "ifndef") { r = pst.defs[rest] == null && pst.macros[rest] == null; }
+                else if (name == "ifmacro") { r = pst.macros[rest] != null; }
+                else if (name == "ifnmacro") { r = pst.macros[rest] == null; }
+                else if (name == "ifnum" || name == "ifstr" || name == "ifid") {
+                    let tk = expand_toks(pst, lexer.tokenize(rest, item.line), [], item.file, item.line);
+                    let want = name == "ifnum" ? "num" : (name == "ifstr" ? "str" : "id");
+                    r = len(tk) == 1 && tk[0].t == want;
+                } else {
+                    let parts = rest.split(",");
+                    if (len(parts) != 2) { fail_at(item.file, item.line, 1, "%" + name + " needs two comma separated values", item.text); }
+                    var a = parts[0].trim(); var b = parts[1].trim();
+                    if (name == "ifidni" || name == "ifnidni") { a = a.lower(); b = b.lower(); }
+                    r = (a == b);
+                    if (name == "ifnidn" || name == "ifnidni") { r = !r; }
+                }
+                stack.push({ on: r, taken: r });
+                continue;
+            }
+            if (name == "elif" || name == "elifdef" || name == "elifndef") {
+                if (len(stack) == 0) { fail_at(item.file, item.line, 1, "%" + name + " without %if", item.text); }
+                let top = stack[len(stack) - 1];
+                let parent_on = cond_active(stack[0..len(stack) - 1]);
+                if (!parent_on || top.taken) { top.on = false; continue; }
+                var r = false;
+                if (name == "elif") { r = eval_const(pst, lexer.tokenize(rest, item.line), item.file, item.line, item.text) != 0; }
+                else if (name == "elifdef") { r = pst.defs[rest] != null; } else { r = pst.defs[rest] == null; }
+                top.on = r; top.taken = r;
+                continue;
+            }
+            if (name == "else") {
+                if (len(stack) == 0) { fail_at(item.file, item.line, 1, "%else without %if", item.text); }
+                let top = stack[len(stack) - 1];
+                let parent_on = cond_active(stack[0..len(stack) - 1]);
+                top.on = parent_on && !top.taken;
+                top.taken = true;
+                continue;
+            }
+            if (name == "endif") {
+                if (len(stack) == 0) { fail_at(item.file, item.line, 1, "%endif without %if", item.text); }
+                stack.pop();
+                continue;
+            }
+            if (!cond_active(stack)) {
+                if (name == "macro" || name == "rep") { }       // body lines are skipped line by line below
+                // still need to skip whole macro / rep bodies so their %endmacro does not confuse us
+                if (name == "macro") { while (i < len(items) && (directive_of(items[i].text) == null || directive_of(items[i].text)[0] != "endmacro")) { i = i + 1; } i = i + 1; }
+                continue;
+            }
+            if (name == "define" || name == "xdefine" || name == "idefine") {
+                let toks = lexer.tokenize(rest, item.line);
+                if (len(toks) == 0 || toks[0].t != "id") { fail_at(item.file, item.line, 1, "%define needs a name", item.text); }
+                let nm = toks[0].v;
+                var params = null; var bi = 1;
+                if (len(toks) > 1 && toks[1].t == "op" && toks[1].v == "(" && toks[1].col == toks[0].end) {
+                    params = [];
+                    var j = 2;
+                    while (j < len(toks) && !(toks[j].t == "op" && toks[j].v == ")")) {
+                        if (toks[j].t == "id") { params.push(toks[j].v); }
+                        j = j + 1;
+                    }
+                    bi = j + 1;
+                }
+                var body = toks[bi..len(toks)];
+                if (name == "xdefine") { body = expand_toks(pst, body, [], item.file, item.line); }
+                pst.defs[nm] = { params: params, body: body };
+                continue;
+            }
+            if (name == "undef") { pst.defs[rest] = null; continue; }
+            if (name == "assign") {
+                let toks = lexer.tokenize(rest, item.line);
+                if (len(toks) < 2 || toks[0].t != "id") { fail_at(item.file, item.line, 1, "%assign needs a name and a value", item.text); }
+                let v = eval_const(pst, toks[1..len(toks)], item.file, item.line, item.text);
+                pst.defs[toks[0].v] = { params: null, body: [{ t: "num", v: v, col: 1, end: 2 }] };
+                continue;
+            }
+            if (name == "strlen") {
+                let toks = lexer.tokenize(rest, item.line);
+                if (len(toks) != 2 || toks[1].t != "str") { fail_at(item.file, item.line, 1, "usage: %strlen name \"text\"", item.text); }
+                pst.defs[toks[0].v] = { params: null, body: [{ t: "num", v: len(toks[1].v), col: 1, end: 2 }] };
+                continue;
+            }
+            if (name == "error") { fail_at(item.file, item.line, 1, rest, item.text); }
+            if (name == "warning") { pst.warnings.push({ message: rest, line: item.line, file: item.file }); continue; }
+            if (name == "include") {
+                let toks = lexer.tokenize(rest, item.line);
+                if (len(toks) != 1 || toks[0].t != "str") { fail_at(item.file, item.line, 1, "%include needs a quoted file name", item.text); }
+                let inc = read_include(pst, toks[0].v, item.file, item);
+                expand_lines(pst, split_lines(inc.text, inc.path), out);
+                continue;
+            }
+            if (name == "macro") {
+                let m = parse_macro_header(pst, rest, item);
+                var closed = false;
+                while (i < len(items)) {
+                    let it2 = items[i];
+                    i = i + 1;
+                    let d2 = directive_of(it2.text);
+                    if (d2 != null && d2[0] == "endmacro") { closed = true; break; }
+                    m.body.push(it2);
+                }
+                if (!closed) { fail_at(item.file, item.line, 1, "%macro '" + m.name + "' has no %endmacro", item.text); }
+                if (pst.macros[m.name] == null) { pst.macros[m.name] = []; }
+                pst.macros[m.name].push(m);
+                continue;
+            }
+            if (name == "rep") {
+                let n = eval_const(pst, lexer.tokenize(rest, item.line), item.file, item.line, item.text);
+                let body = [];
+                var depth = 1;
+                while (i < len(items)) {
+                    let it2 = items[i];
+                    i = i + 1;
+                    let d2 = directive_of(it2.text);
+                    if (d2 != null && d2[0] == "rep") { depth = depth + 1; }
+                    if (d2 != null && d2[0] == "endrep") { depth = depth - 1; if (depth == 0) { break; } }
+                    body.push(it2);
+                }
+                if (depth != 0) { fail_at(item.file, item.line, 1, "%rep has no %endrep", item.text); }
+                if (n < 0 || n > 1000000) { fail_at(item.file, item.line, 1, "bad %rep count", item.text); }
+                for (k in 0..n) {
+                    let before = len(out);
+                    expand_lines(pst, body, out);
+                    if (pst.exit_rep) { pst.exit_rep = false; break; }
+                }
+                continue;
+            }
+            if (name == "exitrep") { pst.exit_rep = true; break; }
+            if (name == "endrep" || name == "endmacro") { fail_at(item.file, item.line, 1, "%" + name + " without a matching start", item.text); }
+            fail_at(item.file, item.line, 1, "unknown preprocessor directive %" + name, item.text);
+        }
+        if (!cond_active(stack)) { continue; }
+        // ordinary line
+        var toks = [];
+        try { toks = lexer.tokenize(item.text, item.line); }
+        catch (e) { if (e["kind"] == "compile") { e["file"] = item.file; e["src"] = item.text; } throw e; }
+        // macro invocation?
+        var k = 0;
+        if (len(toks) >= 2 && toks[0].t == "id" && toks[1].t == "op" && toks[1].v == ":") { k = 2; }
+        if (k < len(toks) && toks[k].t == "id" && pst.macros[toks[k].v] != null) {
+            let args = call_args(item.text, toks, k);
+            var m = find_macro(pst, toks[k].v, len(args));
+            if (m == null && len(args) == 1 && args[0] == "") { m = find_macro(pst, toks[k].v, 0); if (m != null) { args.clear(); } }
+            if (m == null) { fail_at(item.file, item.line, toks[k].col, "no macro '" + toks[k].v + "' takes " + str(len(args)) + " argument(s)", item.text); }
+            if (k == 2) { out.push({ toks: toks[0..2], text: item.text, file: item.file, line: item.line }); }
+            pst.uniq = pst.uniq + 1;
+            let lines = [];
+            for (b in m.body) {
+                lines.push({ text: subst_body(m, b.text, args, pst.uniq), file: item.file, line: item.line });
+            }
+            expand_lines(pst, lines, out);
+            continue;
+        }
+        let ex_toks = expand_toks(pst, toks, [], item.file, item.line);
+        out.push({ toks: ex_toks, text: item.text, file: item.file, line: item.line });
+    }
+    if (len(stack) > 0) { fail_at(items[0].file, items[len(items) - 1].line, 1, "%if without %endif", ""); }
+    pst.depth = pst.depth - 1;
+}
+
+fn process(pst, text: string, file: string) -> any {
+    let out = [];
+    pst.depth = 0;
+    expand_lines(pst, split_lines(text, file), out);
+    return out;
+}

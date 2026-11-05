@@ -1,0 +1,66 @@
+// regs.kc -- register tables.  A register is { k:"reg", n, sz, cls, name, rex, hi }
+//   cls: "r" general, "x" xmm, "y" ymm, "m" mmx, "s" segment, "c" control, "d" debug, "f" x87, "ip" rip/eip
+//   sz : size in bytes (1,2,4,8,16,32,10 for x87)
+//   rex: needs a REX prefix to be addressable (spl bpl sil dil);  hi: ah ch dh bh (cannot be used with REX)
+// Author: Divyanshu Sinha (MIT License)
+
+fn mk(name: string, n: int, sz: int, cls: string, rex: bool = false, hi: bool = false) {
+    return { k: "reg", n: n, sz: sz, cls: cls, name: name, rex: rex, hi: hi };
+}
+
+fn build() {
+    let t = {};
+    let g64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"];
+    let g32 = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
+    let g16 = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+    let g8 = ["al", "cl", "dl", "bl"];
+    let g8h = ["ah", "ch", "dh", "bh"];
+    let g8x = ["spl", "bpl", "sil", "dil"];
+    for (i in 0..8) {
+        t[g64[i]] = mk(g64[i], i, 8, "r");
+        t[g32[i]] = mk(g32[i], i, 4, "r");
+        t[g16[i]] = mk(g16[i], i, 2, "r");
+    }
+    for (i in 0..4) {
+        t[g8[i]] = mk(g8[i], i, 1, "r");
+        t[g8h[i]] = mk(g8h[i], i + 4, 1, "r", false, true);
+        t[g8x[i]] = mk(g8x[i], i + 4, 1, "r", true);
+    }
+    for (i in 8..16) {
+        let s = str(i);
+        t["r" + s] = mk("r" + s, i, 8, "r");
+        t["r" + s + "d"] = mk("r" + s + "d", i, 4, "r");
+        t["r" + s + "w"] = mk("r" + s + "w", i, 2, "r");
+        t["r" + s + "b"] = mk("r" + s + "b", i, 1, "r");
+        t["r" + s + "l"] = mk("r" + s + "l", i, 1, "r");
+    }
+    for (i in 0..16) {
+        t["xmm" + str(i)] = mk("xmm" + str(i), i, 16, "x");
+        t["ymm" + str(i)] = mk("ymm" + str(i), i, 32, "y");
+        t["cr" + str(i)] = mk("cr" + str(i), i, 8, "c");
+        t["dr" + str(i)] = mk("dr" + str(i), i, 8, "d");
+    }
+    for (i in 0..8) {
+        t["mm" + str(i)] = mk("mm" + str(i), i, 8, "m");
+        t["st" + str(i)] = mk("st" + str(i), i, 10, "f");
+    }
+    t["st"] = mk("st", 0, 10, "f");
+    let sg = ["es", "cs", "ss", "ds", "fs", "gs"];
+    for (i in 0..6) { t[sg[i]] = mk(sg[i], i, 2, "s"); }
+    t["rip"] = mk("rip", 16, 8, "ip");
+    t["eip"] = mk("eip", 16, 4, "ip");
+    return t;
+}
+
+const REGS = build();
+
+fn lookup(name: string) {
+    return REGS[name.lower()];
+}
+
+fn names() { return keys(REGS); }
+
+/// 32-bit alias of a 64-bit general register (used by the mov r64, imm32 shortening).
+fn as_dword(r) {
+    return { k: "reg", n: r.n, sz: 4, cls: "r", name: "e" + r.name, rex: false, hi: false };
+}

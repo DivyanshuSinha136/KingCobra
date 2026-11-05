@@ -1,0 +1,581 @@
+// asm.kc -- the assembler driver: multi-pass assembly over parsed statements, sections, symbols, data directives,
+// layout and relocation resolution.
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.io;
+import std.system;
+import "util.kc" as util;
+import "expr.kc" as ex;
+import "parse.kc" as parse;
+import "encode.kc" as enc;
+import "regs.kc" as regs;
+import "tables.kc" as tb;
+
+const MAX_PASSES = 64;
+
+// ---------------------------------------------------------------- context
+fn new_ctx(opts) -> any {
+    return { mode: opts.bits, init_mode: opts.bits, secs: {}, order: [], cur: null, sec: null, here: 0, syms: {}, undef_refs: [], floors: {},
+             default_rel: false, org: opts.org, line: 0, file: "", warnings: [], errors: [], pass: 0, changed: false, pfxlen: 0,
+             fmt: opts.format, listing: [], want_list: opts.listing, files: {}, includes: opts.includes, base_dir: opts.base_dir,
+             entry: opts.entry, pre_warnings: [], struc: null, istruc: null, final: false, strict_undef: false };
+}
+
+fn warn(ctx, msg: string) {
+    ctx.warnings.push({ message: msg, line: ctx.line, file: ctx.file });
+}
+
+fn flags_for(name: string) -> any {
+    var f = { exec: false, write: false, alloc: true, nobits: false };
+    let n = name.lower();
+    if (util.starts_with(n, ".text") || util.starts_with(n, ".init") || util.starts_with(n, ".fini") || n == "code" || n == "text") { f.exec = true; }
+    else if (util.starts_with(n, ".bss") || util.starts_with(n, ".tbss") || n == "bss") { f.write = true; f.nobits = true; }
+    else if (util.starts_with(n, ".data") || n == "data") { f.write = true; }
+    else if (util.starts_with(n, ".rodata") || n == "rodata") { }
+    else { f.write = true; }
+    return f;
+}
+
+fn get_section(ctx, name: string) -> any {
+    var s = ctx.secs[name];
+    if (s == null) {
+        s = { name: name, flags: flags_for(name), align: 1, buf: fbin.buffer(), pos: 0, relocs: [], base: 0, idx: len(ctx.order), bytes: null, user_align: 0, size_prev: -1, foff: 0 };
+        ctx.secs[name] = s;
+        ctx.order.push(name);
+    }
+    return s;
+}
+
+fn reset_pass(ctx) {
+    ctx.mode = ctx.init_mode;
+    ctx.default_rel = false;
+    ctx.changed = false;
+    ctx.undef_refs = [];
+    ctx.warnings = ctx.pre_warnings.concat([]);
+    ctx.listing = [];
+    ctx.errors = [];
+    ctx.struc = null;
+    ctx.istruc = null;
+    for (n in ctx.order) {
+        let s = ctx.secs[n];
+        s.buf = fbin.buffer();
+        s.pos = 0;
+        s.relocs = [];
+    }
+    ctx.cur = null;
+    ctx.sec = null;
+    select_section(ctx, ".text");
+}
+
+fn select_section(ctx, name: string) {
+    let s = get_section(ctx, name);
+    ctx.cur = s;
+    ctx.sec = name;
+    ctx.here = s.pos;
+}
+
+// ---------------------------------------------------------------- emission
+fn cur_sec(ctx) -> any {
+    if (ctx.cur == null) { select_section(ctx, ".text"); }
+    return ctx.cur;
+}
+
+fn emit_bytes(ctx, arr) {
+    let s = cur_sec(ctx);
+    if (s.flags.nobits) { util.fail("cannot place initialised data or code in the uninitialised section '" + s.name + "'", ctx.line, 1); }
+    fbin.write_bytes(s.buf, arr);
+    s.pos = s.pos + len(arr);
+    ctx.here = s.pos;
+}
+
+fn emit_fill(ctx, n: int, byte: int) {
+    let s = cur_sec(ctx);
+    if (n <= 0) { return; }
+    if (!s.flags.nobits) { fbin.seek(s.buf, 0, "end"); fbin.fill(s.buf, byte, n); }
+    s.pos = s.pos + n;
+    ctx.here = s.pos;
+}
+
+const NOPS = [[], [0x90], [0x66, 0x90], [0x0F, 0x1F, 0x00], [0x0F, 0x1F, 0x40, 0x00], [0x0F, 0x1F, 0x44, 0x00, 0x00],
+    [0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00], [0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00], [0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]];
+
+fn emit_nops(ctx, n: int) {
+    var left = n;
+    let out = [];
+    while (left > 0) {
+        let k = left > 9 ? 9 : left;
+        for (b in NOPS[k]) { out.push(b); }
+        left = left - k;
+    }
+    emit_bytes(ctx, out);
+}
+
+fn le_bytes(v: int, n: int) -> any {
+    let out = [];
+    var x = v;
+    for (i in 0..n) { out.push(x & 0xFF); x = x >>> 8; }
+    return out;
+}
+
+fn add_reloc(ctx, soff: int, size: int, rel: bool, val, pcend: int, call: bool) {
+    let s = cur_sec(ctx);
+    s.relocs.push({ soff: soff, size: size, rel: rel, sg: false, val: val, pcend: pcend, call: call, line: ctx.line, file: ctx.file, sec: s.name });
+}
+
+// ---------------------------------------------------------------- symbols
+fn same_val(a, b) -> bool {
+    if (a == null || b == null) { return false; }
+    return a.v == b.v && a.sec == b.sec && a.ext == b.ext && a.pcsec == b.pcsec && a.pcoff == b.pcoff && a.undef == b.undef;
+}
+
+fn define_sym(ctx, name: string, val, kind: string) {
+    var s = ctx.syms[name];
+    if (s == null) {
+        s = { name: name, kind: kind, val: null, global: false, defpass: -1, line: ctx.line, file: ctx.file, ext: false };
+        ctx.syms[name] = s;
+    }
+    if (s.kind == "extern") { util.fail("'" + name + "' was declared extern and cannot be defined", ctx.line, 1); }
+    if (s.defpass == ctx.pass) { util.fail("symbol '" + name + "' is already defined (line " + str(s.line) + ")", ctx.line, 1); }
+    if (!same_val(s.val, val)) { ctx.changed = true; }
+    s.val = val;
+    s.kind = kind;
+    s.defpass = ctx.pass;
+    s.line = ctx.line;
+    s.file = ctx.file;
+}
+
+fn define_label(ctx, name: string) {
+    if (ctx.struc != null) {
+        define_sym(ctx, name, ex.konst(ctx.struc.off), "equ");
+        return;
+    }
+    let s = cur_sec(ctx);
+    define_sym(ctx, name, { v: s.pos, sec: s.name, ext: null, pcsec: null, pcoff: 0, undef: false }, "label");
+}
+
+// ---------------------------------------------------------------- directives
+fn const_of(ctx, ast, what: string) -> int {
+    let v = ex.eval(ctx, ast);
+    if (v.undef) { return 0; }
+    if (!ex.is_abs(v)) { util.fail(what + " must be a constant", ctx.line, ast.col == null ? 1 : ast.col); }
+    return v.v;
+}
+
+fn file_bytes(ctx, name: string) -> any {
+    let c = ctx.files[name];
+    if (c != null) { return c; }
+    var path = name;
+    if (!io.exists(path)) { path = system.path_join(ctx.base_dir, name); }
+    if (!io.exists(path)) { for (d in ctx.includes) { let p = system.path_join(d, name); if (io.exists(p)) { path = p; break; } } }
+    if (!io.exists(path)) { util.fail("cannot open '" + name + "'", ctx.line, 1); }
+    let s = fbin.load(path);
+    let b = fbin.to_bytes(s);
+    ctx.files[name] = b;
+    return b;
+}
+
+fn data_size(d: string) -> int {
+    if (d == "db" || d == "resb") { return 1; }
+    if (d == "dw" || d == "resw") { return 2; }
+    if (d == "dd" || d == "resd") { return 4; }
+    if (d == "dq" || d == "resq") { return 8; }
+    if (d == "dt" || d == "rest") { return 10; }
+    if (d == "do" || d == "reso") { return 16; }
+    return 32;
+}
+
+fn float_node(node) -> any {
+    if (node.t == "flt") { return node.v; }
+    if (node.t == "un" && node.op == "-" && node.e.t == "flt") { return -node.e.v; }
+    return null;
+}
+
+fn do_data(ctx, st, d: string) {
+    let sz = data_size(d);
+    if (sz > 8) { util.fail("'" + d + "' is not supported by this assembler", ctx.line, st.col); }
+    let start = cur_sec(ctx).pos;
+    for (node in st.args) {
+        if (node.t == "str") {
+            let bs = util.str_bytes(node.v);
+            let out = [];
+            for (b in bs) { out.push(b); }
+            if (sz > 1) { while (len(out) % sz != 0) { out.push(0); } }
+            emit_bytes(ctx, out);
+            continue;
+        }
+        let f = float_node(node);
+        if (f != null) {
+            if (sz == 4) { emit_bytes(ctx, le_bytes(util.f32_bits(f), 4)); }
+            else if (sz == 8) { emit_bytes(ctx, le_bytes(util.f64_bits(f), 8)); }
+            else { util.fail("floating-point constants need dd or dq", ctx.line, node.col); }
+            continue;
+        }
+        let v = ex.eval(ctx, node);
+        let pos = cur_sec(ctx).pos;
+        if (v.undef) { emit_bytes(ctx, le_bytes(0, sz)); continue; }
+        if (!ex.is_abs(v)) {
+            if (v.ext == null && v.pcsec == ctx.sec && v.sec == ctx.sec) { }
+            emit_bytes(ctx, le_bytes(v.v, sz));
+            add_reloc(ctx, pos, sz, false, v, 0, false);
+            continue;
+        }
+        if (sz < 8 && !enc.fits_su(v.v, sz * 8)) { warn(ctx, "value " + str(v.v) + " does not fit in " + str(sz) + " byte(s); truncated"); }
+        emit_bytes(ctx, le_bytes(v.v, sz));
+    }
+}
+
+fn parse_global_args(ctx, st) -> any {
+    let out = [];
+    for (g in st.raw) {
+        if (len(g) == 0 || g[0].t != "id") { util.fail("symbol name expected", ctx.line, st.col); }
+        var kind = "";
+        if (len(g) == 3 && g[1].t == "op" && g[1].v == ":" && g[2].t == "id") { kind = g[2].v.lower(); }
+        else if (len(g) != 1) { util.fail("bad symbol declaration", ctx.line, g[0].col); }
+        var nm = g[0].v;
+        out.push({ name: nm, kind: kind });
+    }
+    return out;
+}
+
+fn do_section(ctx, st) {
+    if (len(st.raw) == 0 || len(st.raw[0]) == 0 || st.raw[0][0].t != "id") { util.fail("section name expected", ctx.line, st.col); }
+    let toks = st.raw[0];
+    // section arguments are space separated:  section .name flag flag align=16
+    let all = [];
+    for (g in st.raw) { for (t in g) { all.push(t); } }
+    let name = all[0].v;
+    let s = get_section(ctx, name);
+    var i = 1;
+    while (i < len(all)) {
+        let t = all[i];
+        if (t.t != "id") { i = i + 1; continue; }
+        let w = t.v.lower();
+        if (w == "exec" || w == "code") { s.flags.exec = true; }
+        else if (w == "noexec") { s.flags.exec = false; }
+        else if (w == "write") { s.flags.write = true; }
+        else if (w == "nowrite") { s.flags.write = false; }
+        else if (w == "alloc") { s.flags.alloc = true; }
+        else if (w == "noalloc") { s.flags.alloc = false; }
+        else if (w == "nobits") { s.flags.nobits = true; }
+        else if (w == "progbits") { s.flags.nobits = false; }
+        else if (w == "align" && i + 2 < len(all) && all[i + 1].v == "=" && all[i + 2].t == "num") {
+            let a = all[i + 2].v;
+            if (!util.is_pow2(a)) { util.fail("section alignment must be a power of two", ctx.line, t.col); }
+            s.user_align = a; if (a > s.align) { s.align = a; }
+            i = i + 2;
+        }
+        i = i + 1;
+    }
+    select_section(ctx, name);
+}
+
+fn do_directive(ctx, st) {
+    let d = st.dir;
+    if (d == "equ") {
+        if (st.label == null) { util.fail("equ needs a label: 'name equ value'", ctx.line, st.col); }
+        let v = ex.eval(ctx, st.args[0]);
+        define_sym(ctx, st.label, v, "equ");
+        return;
+    }
+    if (d == "db" || d == "dw" || d == "dd" || d == "dq" || d == "dt" || d == "do" || d == "dy") { do_data(ctx, st, d); return; }
+    if (util.starts_with(d, "res")) {
+        let n = const_of(ctx, st.args[0], "the count of " + d);
+        if (n < 0) { util.fail("negative count", ctx.line, st.col); }
+        if (ctx.struc != null) { ctx.struc.off = ctx.struc.off + n * data_size(d); return; }
+        emit_fill(ctx, n * data_size(d), 0);
+        return;
+    }
+    if (d == "align" || d == "alignb") {
+        let a = const_of(ctx, st.args[0], "alignment");
+        if (!util.is_pow2(a)) { util.fail("alignment must be a power of two", ctx.line, st.col); }
+        if (ctx.struc != null) { ctx.struc.off = util.align_up(ctx.struc.off, a); return; }
+        let s = cur_sec(ctx);
+        if (a > s.align) { s.align = a; }
+        let pad = (a - (s.pos % a)) % a;
+        if (len(st.args) > 1) { emit_fill(ctx, pad, const_of(ctx, st.args[1], "fill byte") & 0xFF); }
+        else if (s.flags.exec && d == "align") { emit_nops(ctx, pad); }
+        else { emit_fill(ctx, pad, 0); }
+        return;
+    }
+    if (d == "org") { ctx.org = const_of(ctx, st.args[0], "org"); return; }
+    if (d == "bits" || d == "use16" || d == "use32" || d == "use64") {
+        var b = 0;
+        if (d == "bits") { b = const_of(ctx, st.args[0], "bits"); } else { b = int(d[3..5]); }
+        if (b != 16 && b != 32 && b != 64) { util.fail("bits must be 16, 32 or 64", ctx.line, st.col); }
+        ctx.mode = b;
+        return;
+    }
+    if (d == "default") {
+        for (g in st.raw) { for (t in g) {
+            if (t.t == "id") { let w = t.v.lower(); if (w == "rel") { ctx.default_rel = true; } else if (w == "abs") { ctx.default_rel = false; } }
+        } }
+        return;
+    }
+    if (d == "section" || d == "segment") { do_section(ctx, st); return; }
+    if (d == "global" || d == "globl" || d == "weak") {
+        for (g in parse_global_args(ctx, st)) {
+            var s = ctx.syms[g.name];
+            if (s == null) { s = { name: g.name, kind: "decl", val: null, global: true, defpass: -1, line: ctx.line, file: ctx.file, ext: false }; ctx.syms[g.name] = s; }
+            s.global = true;
+            if (d == "weak") { s["weak"] = true; }
+            if (g.kind != "") { s["type"] = g.kind; }
+        }
+        return;
+    }
+    if (d == "extern") {
+        for (g in parse_global_args(ctx, st)) {
+            ctx.syms[g.name] = { name: g.name, kind: "extern", val: { v: 0, sec: null, ext: g.name, pcsec: null, pcoff: 0, undef: false }, global: true, defpass: ctx.pass, line: ctx.line, file: ctx.file, ext: true };
+        }
+        return;
+    }
+    if (d == "incbin") {
+        if (len(st.raw) == 0 || len(st.raw[0]) != 1 || st.raw[0][0].t != "str") { util.fail("incbin needs a file name string", ctx.line, st.col); }
+        let b = file_bytes(ctx, st.raw[0][0].v);
+        var skip = 0; var cnt = len(b);
+        let ps = parse.ps_new();
+        if (len(st.raw) > 1) { skip = const_of(ctx, parse.expr_of(ps, st.raw[1], ctx.line), "incbin offset"); cnt = len(b) - skip; }
+        if (len(st.raw) > 2) { cnt = const_of(ctx, parse.expr_of(ps, st.raw[2], ctx.line), "incbin length"); }
+        if (skip < 0 || skip > len(b)) { util.fail("incbin offset beyond end of file", ctx.line, st.col); }
+        if (skip + cnt > len(b)) { cnt = len(b) - skip; }
+        emit_bytes(ctx, b[skip..skip + cnt]);
+        return;
+    }
+    if (d == "struc") {
+        if (ctx.struc != null) { util.fail("struc cannot be nested", ctx.line, st.col); }
+        ctx.struc = { name: st.args[0].name, off: 0 };
+        return;
+    }
+    if (d == "endstruc") {
+        if (ctx.struc == null) { util.fail("endstruc without struc", ctx.line, st.col); }
+        let nm = ctx.struc.name;
+        let sz = ctx.struc.off;
+        ctx.struc = null;
+        define_sym(ctx, nm + "_size", ex.konst(sz), "equ");
+        define_sym(ctx, nm, ex.konst(0), "equ");
+        return;
+    }
+    if (d == "istruc") {
+        let sz = ctx.syms[st.args[0].name + "_size"];
+        if (sz == null || sz.val == null) { util.fail("unknown structure '" + st.args[0].name + "'", ctx.line, st.col); }
+        ctx.istruc = { start: cur_sec(ctx).pos, size: sz.val.v, name: st.args[0].name };
+        return;
+    }
+    if (d == "at") {
+        if (ctx.istruc == null) { util.fail("'at' is only valid between istruc and iend", ctx.line, st.col); }
+        let off = const_of(ctx, st.args[0], "the field offset");
+        let target = ctx.istruc.start + off;
+        let s = cur_sec(ctx);
+        if (target < s.pos) { util.fail("structure data overlaps the previous field", ctx.line, st.col); }
+        emit_fill(ctx, target - s.pos, 0);
+        exec_sub(ctx, st["sub"]);
+        return;
+    }
+    if (d == "iend") {
+        if (ctx.istruc == null) { util.fail("iend without istruc", ctx.line, st.col); }
+        let s = cur_sec(ctx);
+        let target = ctx.istruc.start + ctx.istruc.size;
+        if (target < s.pos) { util.fail("structure data is larger than the structure", ctx.line, st.col); }
+        emit_fill(ctx, target - s.pos, 0);
+        ctx.istruc = null;
+        return;
+    }
+    if (d == "cpu" || d == "type" || d == "size") { return; }
+    util.fail("directive '" + d + "' is not supported", ctx.line, st.col);
+}
+
+// ---------------------------------------------------------------- one statement
+fn exec_insn(ctx, st, site: string) {
+    let res = enc.encode(ctx, st, site);
+    let s = cur_sec(ctx);
+    if (s.flags.nobits) { util.fail("cannot place code in the uninitialised section '" + s.name + "'", ctx.line, st.col); }
+    if (!s.flags.exec && !ctx.warned_exec) { }
+    let pos = s.pos;
+    emit_bytes(ctx, res.bytes);
+    for (r in res.relocs) {
+        let v = r.val;
+        s.relocs.push({ soff: pos + r.off, size: r.size, rel: r.rel, sg: r.sg, val: v, pcend: pos + (r["end"] == null ? 0 : r["end"]), call: r["call"] == true, wrt: r["wrt"] == null ? "" : r["wrt"], line: ctx.line, file: ctx.file, sec: s.name });
+    }
+    if (ctx.want_list) { ctx.listing.push({ line: st.line, file: st.file, sec: s.name, off: pos, bytes: res.bytes, src: st.src }); }
+}
+
+fn exec_sub(ctx, sub) {
+    var count = 1;
+    if (sub.times != null) { count = const_of(ctx, sub.times, "the repeat count of times"); }
+    for (k in 0..count) {
+        if (sub.kind == "dir") { do_directive(ctx, sub); } else { util.fail("only data directives are allowed after 'at'", ctx.line, sub.col); }
+    }
+}
+
+fn exec_stmt(ctx, st, id: int) {
+    ctx.line = st.line;
+    ctx.file = st.file;
+    ctx.pfxlen = st.pfxlen == null ? 0 : st.pfxlen;
+    if (st.kind == "empty" && st.label == null) { return; }
+    let is_equ = st.kind == "dir" && st.dir == "equ";
+    let before = ctx.cur == null ? 0 : ctx.cur.pos;
+    let before_sec = ctx.cur;
+    if (st.label != null && !is_equ) { cur_sec(ctx); define_label(ctx, st.label); }
+    if (st.kind == "empty") {
+        if (ctx.want_list) { ctx.listing.push({ line: st.line, file: st.file, sec: ctx.sec, off: ctx.here, bytes: [], src: st.src }); }
+        return;
+    }
+    var count = 1;
+    if (st.times != null) {
+        count = const_of(ctx, st.times, "the repeat count of times");
+        if (count < 0) { util.fail("negative times count", ctx.line, st.col); }
+    }
+    for (k in 0..count) {
+        let site = str(id) + "#" + str(k);
+        if (st.kind == "insn") { exec_insn(ctx, st, site); }
+        else {
+            do_directive(ctx, st);
+        }
+    }
+    if (st.kind == "dir" && ctx.want_list) {
+        let s = cur_sec(ctx);
+        var bytes = [];
+        if (before_sec != null && s.name != before_sec.name) {
+            ctx.listing.push({ line: st.line, file: st.file, sec: s.name, off: s.pos, bytes: [], src: st.src });
+        } else {
+            if (!s.flags.nobits && s.pos > before) { bytes = fbin.to_bytes(s.buf, before, s.pos - before); }
+            ctx.listing.push({ line: st.line, file: st.file, sec: s.name, off: before, bytes: bytes, src: st.src, size: s.pos - before });
+        }
+    }
+}
+
+// ---------------------------------------------------------------- passes
+fn run_pass(ctx, stmts) {
+    ctx.pass = ctx.pass + 1;
+    reset_pass(ctx);
+    for (i in 0..len(stmts)) {
+        let st = stmts[i];
+        if (ctx.struc != null && st.kind == "dir" && st.dir == "endstruc") { }
+        try {
+            exec_stmt(ctx, st, i);
+        } catch (e) {
+            if (e != null && e["kind"] == "compile") {
+                ctx.errors.push({ message: e.message, line: e.line, col: e.col, file: st.file, src: st.src });
+            } else {
+                var m = "internal error";
+                if (e != null && e["message"] != null) { m = str(e["message"]); }
+                ctx.errors.push({ message: "internal error: " + m, line: st.line, col: st.col, file: st.file, src: st.src });
+            }
+        }
+    }
+    // end of pass: remember the final sizes
+    for (n in ctx.order) { let s = ctx.secs[n]; if (s.size_prev != s.pos) { ctx.changed = true; } s["size_prev"] = s.pos; }
+}
+
+fn raise_errors(ctx, errs) {
+    let first = errs[0];
+    throw { kind: "compile", message: first.message, line: first.line, col: first.col, file: first.file, src: first.src, all: errs };
+}
+
+fn assemble_stmts(ctx, stmts) {
+    var pass = 0;
+    while (pass < MAX_PASSES) {
+        pass = pass + 1;
+        run_pass(ctx, stmts);
+        if (len(ctx.errors) > 0) { raise_errors(ctx, ctx.errors); }
+        if (!ctx.changed && ctx.pass > 1) {
+            if (len(ctx.undef_refs) > 0) {
+                let errs = [];
+                let seen = {};
+                let names = keys(ctx.syms);
+                for (u in ctx.undef_refs) {
+                    let key = u.file + ":" + str(u.line) + ":" + u.name;
+                    if (seen[key] != null) { continue; }
+                    seen[key] = true;
+                    let sg = util.suggest(u.name, names);
+                    errs.push({ message: "undefined symbol '" + u.name + "'" + (sg != "" ? " (did you mean '" + sg + "'?)" : ""), line: u.line, col: u.col, file: u.file, src: null });
+                }
+                raise_errors(ctx, errs);
+            }
+            return;
+        }
+    }
+    throw { kind: "compile", message: "assembly did not converge after " + str(MAX_PASSES) + " passes (label values keep changing)", line: 0, col: 0 };
+}
+
+// ---------------------------------------------------------------- layout and relocation
+fn layout_bin(ctx) {
+    var cursor = ctx.org;
+    // initialised sections in order of appearance, then uninitialised ones (virtual, not in the image)
+    for (pass in 0..2) {
+        for (n in ctx.order) {
+            let s = ctx.secs[n];
+            if ((pass == 0) == s.flags.nobits) { continue; }
+            cursor = util.align_up(cursor - ctx.org, s.align) + ctx.org;
+            s.base = cursor;
+            cursor = cursor + s.pos;
+        }
+    }
+}
+
+fn sec_base(ctx, name: string) -> int {
+    let s = ctx.secs[name];
+    return s == null ? 0 : s.base;
+}
+
+fn reloc_value(ctx, r) -> int {
+    let v = r.val;
+    var x = v.v;
+    if (v.sec != null) { x = x + sec_base(ctx, v.sec); }
+    else if (v.ext != null) { throw { kind: "compile", message: "unresolved external symbol '" + v.ext + "' (externals need an object file output: -f elfobj)", line: r.line, col: 1, file: r.file }; }
+    if (v.pcsec != null) { x = x - (sec_base(ctx, v.pcsec) + v.pcoff); }
+    if (r.rel) { x = x - (sec_base(ctx, r.sec) + r.pcend); }
+    return x;
+}
+
+/// Bytes of every section with all relocations applied.
+fn resolve_relocs(ctx) {
+    for (n in ctx.order) {
+        let s = ctx.secs[n];
+        if (s.flags.nobits) { s.bytes = []; continue; }
+        s.bytes = fbin.to_bytes(s.buf, 0, s.pos);
+    }
+    for (n in ctx.order) {
+        let s = ctx.secs[n];
+        for (r in s.relocs) {
+            let x = reloc_value(ctx, r);
+            if (r.size < 8) {
+                let ok = r.rel || r.sg ? enc.fits_s(x, r.size * 8) : enc.fits_su(x, r.size * 8);
+                if (!ok) { throw { kind: "compile", message: "relocation does not fit: value " + str(x) + " in " + str(r.size) + " byte(s)", line: r.line, col: 1, file: r.file }; }
+            }
+            var y = x;
+            for (i in 0..r.size) { s.bytes[r.soff + i] = y & 0xFF; y = y >> 8; }
+        }
+    }
+}
+
+fn sym_address(ctx, s) -> int {
+    let v = s.val;
+    if (v.sec != null) { return v.v + sec_base(ctx, v.sec); }
+    return v.v;
+}
+
+/// The flat image: every initialised section laid out from `org`.
+fn image_bin(ctx) -> any {
+    let out = [];
+    var cursor = ctx.org;
+    for (n in ctx.order) {
+        let s = ctx.secs[n];
+        if (s.flags.nobits) { continue; }
+        while (cursor < s.base) { out.push(0); cursor = cursor + 1; }
+        for (b in s.bytes) { out.push(b); }
+        cursor = cursor + len(s.bytes);
+    }
+    return out;
+}
+
+fn symbols_of(ctx) -> any {
+    let out = {};
+    for (n in keys(ctx.syms)) {
+        let s = ctx.syms[n];
+        if (s.val == null || s.kind == "extern") { continue; }
+        if (s.val.sec == null && s.val.ext != null) { continue; }
+        out[n] = sym_address(ctx, s);
+    }
+    return out;
+}

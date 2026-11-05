@@ -1,0 +1,20 @@
+// kasm_rhex.kc -- assemble machine code and run it in-process with std.rhex.
+// Run from the project root:   kingcobra kasm/examples/kasm_rhex.kc
+import std.system;
+import "../src/kasm.kc" as kasm;
+import "../src/util.kc" as util;
+
+fn main() {
+    // The same source works on every x86-64 OS: %ifdef WIN picks the argument registers of the host ABI.
+    let add_src = "%ifdef WIN\n lea eax, [rcx + rdx]\n%else\n lea eax, [rdi + rsi]\n%endif\n ret";
+    println("add(19, 23)  =", kasm.run(add_src, [19, 23]));
+
+    // popcount via the POPCNT instruction
+    let pop_src = "%ifdef WIN\n popcnt rax, rcx\n%else\n popcnt rax, rdi\n%endif\n ret";
+    println("popcnt(255)  =", kasm.run(pop_src, [255]));
+
+    // look at the bytes
+    let r = kasm.assemble("bits 64\nloop_top: dec ecx\n jnz loop_top\n ret\n", { listing: true });
+    println(util.hex_of(r.bytes));
+    print(r.listing);
+}
