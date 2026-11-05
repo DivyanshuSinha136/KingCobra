@@ -2,11 +2,11 @@
 
 ## Supported versions
 
-KingCobra is pre-1.0. Security fixes go into the **latest release** and `main`.
+Security fixes go into the **latest release** and `main`.
 
 | Version | Supported |
 |---|---|
-| Latest release (0.10.x) | ✅ |
+| Latest release (1.0.x) | ✅ |
 | Older releases | ❌ — please upgrade |
 
 ## Reporting a vulnerability

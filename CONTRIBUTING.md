@@ -65,7 +65,7 @@ make test-kasm                    # kasm assembler tests
 
 ## Compatibility rules
 
-KingCobra is pre-1.0. A **minor** release may change behavior, but every change must be listed under **Changed** in the changelog with a migration note. A **patch** release only fixes bugs. Read [docs/STABILITY.md](docs/STABILITY.md) before changing syntax, the memory model, exit statuses, or error-object shape.
+KingCobra follows semantic versioning from 1.0. A **patch** release only fixes bugs, a **minor** release adds features without breaking the stable surface, and anything breaking needs a **major** release and a **Changed** entry in the changelog with a migration note. Read [docs/STABILITY.md](docs/STABILITY.md) before changing behavior.
 
 ## Commit messages
 

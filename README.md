@@ -87,32 +87,58 @@ make test                         # runs every example end-to-end
 
 ### Install
 
+The release page has a build for each kind of device, and the installers pick the right one for yours and verify its
+SHA-256 checksum. If there is no prebuilt package for your machine, they compile KingCobra **on your machine** from the
+source release (needs a C compiler and `make`).
+
 <details open>
 <summary><b>Linux / macOS</b></summary>
-
-```bash
-sudo make install                 # binary, `kc` alias, *.kc file type and icon (PREFIX=/usr, DESTDIR supported)
-make install-mime-user            # no root: file type + icon for the current user only
-make uninstall                    # remove everything `install` added
-```
-
-One-line install (Linux x86-64, ARM64, ARMhf, RISC-V 64 — picks the right build for your CPU and verifies the checksum):
 
 ```bash
 curl -fsSL https://github.com/DivyanshuSinha136/kingcobra/releases/latest/download/install.sh | sh
 ```
 
-Debian/Ubuntu: `make deb` builds a package; see [docs/PACKAGING.md](docs/PACKAGING.md) for the APT repository.
+| Your machine | You get |
+|---|---|
+| Debian / Ubuntu (amd64, arm64, armhf, riscv64) | `.deb`, installed with apt |
+| Fedora / RHEL / Rocky / Alma / openSUSE (amd64, arm64) | `.rpm`, installed with dnf / zypper |
+| Alpine and other musl Linux (amd64, arm64) | tarball into `~/.local` (or `/usr/local` as root) |
+| macOS, Apple Silicon or Intel | tarball into `~/.local` (or `/usr/local` as root) |
+| Raspberry Pi 2-5, Orange Pi, BeagleBone, VisionFive, Milk-V and other ARM / RISC-V microcomputers | the Linux row for their CPU (the board model is shown) |
+| Raspberry Pi Zero / 1 (ARMv6), Android (Termux), other CPUs, BSDs | compiled on the device from the source release |
+
+Options: `KC_VERSION=1.0.0`, `KC_METHOD=deb|rpm|tar|src` (`src` always compiles locally), `KC_PREFIX=...`,
+`KC_DRY_RUN=1`, `KC_INSTALL_DEPS=1` (fetch the compiler and headers first), `KC_JOBS`, `KC_TMPDIR`; remove it again with `sh install.sh --uninstall`. Homebrew users can also use the formula attached
+to each release (see [docs/PACKAGING.md](docs/PACKAGING.md)).
+
+Bare-metal microcontrollers (Arduino, ESP32, RP2040, STM32) have no operating system or C library, so KingCobra cannot
+run on them; use a microcomputer that runs Linux.
+
+From a source checkout:
+
+```bash
+sudo make install                 # binary, `kc` alias, man pages, *.kc file type and icon (PREFIX=/usr, DESTDIR supported)
+make install-mime-user            # no root: file type + icon for the current user only
+make uninstall                    # remove everything `install` added
+make deb                          # Debian/Ubuntu package for this machine  (make rpm for Fedora & co.)
+```
 
 </details>
 
 <details>
 <summary><b>Windows</b></summary>
 
-Open **PowerShell as Administrator** and run:
+PowerShell, no administrator rights needed:
 
 ```powershell
-choco install kingcobra
+irm https://github.com/DivyanshuSinha136/kingcobra/releases/latest/download/install.ps1 | iex
+```
+
+or with a package manager:
+
+```powershell
+choco install kingcobra                  # Chocolatey (PowerShell as Administrator)
+scoop install https://github.com/DivyanshuSinha136/kingcobra/releases/latest/download/kingcobra.json    # Scoop
 ```
 
 Then open a new terminal and check it:
@@ -122,9 +148,9 @@ kingcobra version
 kingcobra repl
 ```
 
-The package installs `kingcobra.exe`, a `kc` shortcut, the docs and the examples (Windows x64, statically linked, JIT
-included). It downloads the release zip from GitHub and verifies its SHA-256. Update with `choco upgrade kingcobra`,
-remove with `choco uninstall kingcobra`.
+The Windows build is x64, statically linked, JIT included (on Windows on ARM it runs through the built-in emulation).
+Update with `choco upgrade kingcobra` / `scoop update kingcobra`, remove with `choco uninstall kingcobra` /
+`scoop uninstall kingcobra`.
 
 To open `.kc` files with the KingCobra icon, run `packaging\windows\associate.ps1` from the release zip. To build it
 yourself, use MSYS2 / MinGW-w64 (`make` + `gcc` on `PATH`), then `make install-windows`. Native MSVC (`cl`/`nmake`) is not
@@ -340,7 +366,7 @@ kingcobra/
 ├── examples/        runnable .kc programs, all verified by `make test`
 ├── tests/           language and module test suites
 ├── docs/            language spec, CLI, per-module references, roadmap
-├── packaging/       Debian, Chocolatey, Linux and Windows release tooling
+├── packaging/       deb, rpm, Homebrew, Scoop, Chocolatey, installers and CI release tooling
 ├── assets/          logo and file-type icons
 └── Makefile
 ```
@@ -356,7 +382,7 @@ kingcobra/
 
 ## 🧭 Status & honesty
 
-KingCobra is **v0.10** — a real, working language, but still pre-1.0. The project documents its limits openly rather than
+KingCobra is **v1.0.0** — a real, working language. The project documents its limits openly rather than
 hiding them: the JIT covers a specific int-only shape on purpose, the static type checker is permissive, Win32 GUI is
 written but less tested than X11, and KCOS has been booted and checked in QEMU but not tried on real hardware.
 [docs/STABILITY.md](docs/STABILITY.md) says what you can rely on; [docs/ROADMAP.md](docs/ROADMAP.md) says what's next.
