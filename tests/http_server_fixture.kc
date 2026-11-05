@@ -1,0 +1,25 @@
+// std.http server fixture for tests/smoke_test.sh — serves exactly 8 requests, then exits.
+import std.http;
+import std.io;
+import std.system;
+fn main() {
+    let s = http.listen(0);
+    io.write_file(system.getenv("KC_PORT_FILE"), "" + http.server_port(s));
+    var served = 0;
+    while (served < 8) {
+        let req = http.accept(s, 10);
+        if (req == null) { print("timeout waiting for a request"); break; }
+        served = served + 1;
+        print("req:", req.method, req.target, "|", req.path, "|", req.query, "| body", len(req.body));
+        if (req.path == "/hello") { http.respond(req, 200, "Hello " + req.query); }
+        else if (req.path == "/echo") { http.respond(req, 201, req.body, ["Content-Type: application/octet-stream", "X-Echo-Len: " + len(req.body)]); }
+        else if (req.path == "/empty") { http.respond(req, 204); }
+        else if (req.path == "/spaced path") { http.respond(req, 200, "decoded:" + req.path); }
+        else if (req.path == "/twice") {
+            http.respond(req, 200, "once");
+        }
+        else { http.respond(req, 404, "no " + req.path); }
+    }
+    http.close(s);
+    print("fixture done");
+}

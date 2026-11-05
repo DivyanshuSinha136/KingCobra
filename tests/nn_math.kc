@@ -1,0 +1,177 @@
+// std.nn advanced math utilities — self-checking test (known values + reconstruction identities).
+// Prints "nn math failures: 0" on success.
+import std.nn;
+
+var failures = 0;
+fn ok(name, cond) {
+    if (!cond) { print("FAIL:", name); failures = failures + 1; }
+}
+fn near(a, b) { return nn.allclose(a, b, 0.000001, 0.000001); }
+fn tight(a, b) { return nn.allclose(a, b, 0.000000001, 0.000000001); }
+fn T(v) { return nn.tensor(v); }
+fn shp(t, want) -> bool {
+    let s = nn.shape(t);
+    if (len(s) != len(want)) { return false; }
+    for (i in 0..len(want)) { if (s[i] != want[i]) { return false; } }
+    return true;
+}
+
+fn main() {
+    // ---- special functions
+    ok("erf", near(nn.erf(T([0.0, 0.5, 1.0, -2.0])), T([0.0, 0.5204999, 0.8427008, -0.9953223])));
+    ok("erfinv roundtrip", tight(nn.erf(nn.erfinv(T([0.1, 0.5, 0.9, -0.99, 0.999999]))), T([0.1, 0.5, 0.9, -0.99, 0.999999])));
+    ok("normal_ppf", near(nn.normal_ppf(T([0.5, 0.975, 0.001])), T([0.0, 1.959964, -3.090232])));
+    ok("normal_cdf roundtrip", tight(nn.normal_cdf(nn.normal_ppf(T([0.001, 0.3, 0.975]))), T([0.001, 0.3, 0.975])));
+    ok("lgamma", near(nn.lgamma(T([1.0, 5.0, 0.5])), T([0.0, 3.178054, 0.5723649])));
+    ok("digamma", near(nn.digamma(T([1.0, 2.0, 0.5, -0.5, 10.0])), T([-0.5772157, 0.4227843, -1.9635100, 0.0364899, 2.2517526])));
+    ok("log1p/expm1", near(nn.expm1(nn.log1p(T([0.5, 2.0]))), T([0.5, 2.0])));
+    ok("logit/sigmoid", near(nn.logit(nn.apply("sigmoid", T([-2.0, 0.3]))), T([-2.0, 0.3])));
+    ok("log_sigmoid stable", near(nn.log_sigmoid(T([-800.0, 0.0, 800.0])), T([-800.0, -0.6931472, 0.0])));
+
+    // ---- elementwise / comparison
+    ok("mod sign of divisor", near(nn.mod(T([-7.0, 7.0]), 3.0), T([2.0, 1.0])));
+    ok("floor_div", near(nn.floor_div(T([-7.0, 7.0]), 2.0), T([-4.0, 3.0])));
+    ok("where broadcast", near(nn.where(nn.gt(T([1.0, -2.0, 3.0]), 0.0), T([10.0, 20.0, 30.0]), 0.0), T([10.0, 0.0, 30.0])));
+    ok("masked_fill", near(nn.masked_fill(T([1.0, 2.0, 3.0]), nn.lt(T([1.0, 2.0, 3.0]), 2.5), -1.0), T([-1.0, -1.0, 3.0])));
+    ok("logical ops", near(nn.logical_xor(T([1.0, 1.0, 0.0]), T([1.0, 0.0, 0.0])), T([0.0, 1.0, 0.0])));
+    ok("logaddexp", near(nn.logaddexp(T([0.0, 1000.0]), T([0.0, 1000.0])), T([0.6931472, 1000.6931472])));
+    ok("lerp", near(nn.lerp(T([0.0, 10.0]), T([10.0, 20.0]), 0.25), T([2.5, 12.5])));
+    ok("clamp", near(nn.clamp(T([-5.0, 0.5, 9.0]), 0.0, 1.0), T([0.0, 0.5, 1.0])));
+    ok("equal", nn.equal(T([1.0, 2.0]), T([1.0, 2.0])) && !nn.equal(T([1.0, 2.0]), T([1.0, 3.0])));
+
+    // ---- reductions
+    ok("logsumexp stable", near(nn.logsumexp(T([[1.0, 2.0, 3.0], [1000.0, 1000.0, 1000.0]]), 1), T([3.4076059, 1001.0986123])));
+    ok("norm l2/inf", near(nn.norm(T([3.0, 4.0])), 5.0) && near(nn.norm(T([[3.0, -4.0], [0.0, 0.0]]), "inf", 1), T([4.0, 0.0])));
+    ok("norm l1", near(nn.norm(T([3.0, -4.0]), 1), 7.0));
+    ok("median/quantile", near(nn.median(T([5.0, 1.0, 3.0, 2.0])), 2.5) && near(nn.quantile(T([1.0, 2.0, 3.0, 4.0, 5.0]), 0.9), 4.6));
+    ok("any/all/count", nn.item(nn.any(T([0.0, 1.0]))) == 1 && nn.item(nn.all(T([1.0, 0.0]))) == 0 && nn.item(nn.count_nonzero(T([0.0, 2.0, 3.0]))) == 2);
+    ok("ptp", near(nn.ptp(T([[1.0, 5.0], [2.0, 2.0]]), 1), T([4.0, 0.0])));
+
+    // ---- scans, sorting
+    ok("cumsum", near(nn.cumsum(T([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), 1), T([[1.0, 3.0, 6.0], [4.0, 9.0, 15.0]])));
+    ok("cumsum reverse", near(nn.cumsum(T([1.0, 2.0, 3.0]), 0, true), T([6.0, 5.0, 3.0])));
+    ok("cumprod/cummax/cummin", near(nn.cumprod(T([1.0, 2.0, 3.0, 4.0])), T([1.0, 2.0, 6.0, 24.0])) && near(nn.cummax(T([1.0, 3.0, 2.0, 5.0])), T([1.0, 3.0, 3.0, 5.0])) && near(nn.cummin(T([3.0, 1.0, 2.0])), T([3.0, 1.0, 1.0])));
+    ok("logcumsumexp", near(nn.logcumsumexp(T([0.0, 0.0, 0.0])), T([0.0, 0.6931472, 1.0986123])));
+    ok("diff", near(nn.diff(T([1.0, 4.0, 9.0, 16.0])), T([3.0, 5.0, 7.0])) && near(nn.diff(T([1.0, 4.0, 9.0, 16.0]), 2), T([2.0, 2.0])));
+    ok("sort/argsort", near(nn.sort(T([3.0, 1.0, 2.0])), T([1.0, 2.0, 3.0])) && near(nn.argsort(T([3.0, 1.0, 2.0]), -1, true), T([0.0, 2.0, 1.0])));
+    ok("sort stable", near(nn.argsort(T([2.0, 1.0, 2.0, 1.0])), T([1.0, 3.0, 0.0, 2.0])));
+    let tk = nn.topk(T([[1.0, 9.0, 3.0], [7.0, 2.0, 8.0]]), 2);
+    ok("topk", near(tk.values, T([[9.0, 3.0], [8.0, 7.0]])) && near(tk.indices, T([[1.0, 2.0], [2.0, 0.0]])));
+    let nanv = nn.item(nn.log(T([-1.0])));
+    ok("nan handling", nn.item(nn.nansum(T([1.0, nanv, 2.0]))) == 3 && nn.item(nn.nanmean(T([1.0, nanv, 3.0]))) == 2 && near(nn.isnan(T([1.0, nanv])), T([0.0, 1.0])));
+    ok("nan sorts last", nn.item(nn.isnan(nn.slice_axis(nn.sort(T([3.0, nanv, 1.0])), 0, 2, 3))) == 1);
+
+    // ---- shape manipulation & indexing
+    let m = T([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+    ok("flip", near(nn.flip(m, 1), T([[3.0, 2.0, 1.0], [6.0, 5.0, 4.0]])) && near(nn.flip(m), T([[6.0, 5.0, 4.0], [3.0, 2.0, 1.0]])));
+    ok("roll", near(nn.roll(T([1.0, 2.0, 3.0, 4.0, 5.0]), 2), T([4.0, 5.0, 1.0, 2.0, 3.0])) && near(nn.roll(m, 1, 1), T([[3.0, 1.0, 2.0], [6.0, 4.0, 5.0]])));
+    ok("tile/repeat", near(nn.tile(T([1.0, 2.0]), [2, 2]), T([[1.0, 2.0, 1.0, 2.0], [1.0, 2.0, 1.0, 2.0]])) && near(nn.repeat(T([1.0, 2.0]), 3), T([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])));
+    ok("pad const", near(nn.pad(T([1.0, 2.0, 3.0]), [2, 1]), T([0.0, 0.0, 1.0, 2.0, 3.0, 0.0])));
+    ok("pad reflect/edge/wrap", near(nn.pad(T([1.0, 2.0, 3.0]), 2, "reflect"), T([3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0])) && near(nn.pad(T([1.0, 2.0, 3.0]), 2, "edge"), T([1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0])) && near(nn.pad(T([1.0, 2.0, 3.0]), 2, "wrap"), T([2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0])));
+    ok("pad per-axis", near(nn.pad(m, [[1, 0], [0, 1]], "constant", 9.0), T([[9.0, 9.0, 9.0, 9.0], [1.0, 2.0, 3.0, 9.0], [4.0, 5.0, 6.0, 9.0]])));
+    ok("slice_axis", near(nn.slice_axis(T([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 0, 1, -1, 2), T([1.0, 3.0, 5.0])));
+    ok("broadcast_to", near(nn.broadcast_to(T([1.0, 2.0, 3.0]), [2, 3]), T([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])));
+    ok("squeeze/unsqueeze/swap/move", shp(nn.squeeze(nn.zeros([1, 3, 1])), [3]) && shp(nn.unsqueeze(T([1.0, 2.0]), -1), [2, 1]) && shp(nn.swapaxes(nn.zeros([2, 3, 4]), 0, 2), [4, 3, 2]) && shp(nn.moveaxis(nn.zeros([2, 3, 4]), 0, 2), [3, 4, 2]));
+    ok("stack", near(nn.stack([T([1.0, 2.0]), T([3.0, 4.0])], 1), T([[1.0, 3.0], [2.0, 4.0]])));
+    let parts = nn.split(T([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), [1, 2, 3]);
+    ok("split", near(parts[1], T([2.0, 3.0])) && near(parts[2], T([4.0, 5.0, 6.0])));
+    ok("take", near(nn.take(m, [2, 0], 1), T([[3.0, 1.0], [6.0, 4.0]])) && near(nn.take(m, [-1], 0), T([[4.0, 5.0, 6.0]])));
+    ok("gather", near(nn.gather(m, T([[0.0, 0.0], [2.0, 1.0]]), 1), T([[1.0, 1.0], [6.0, 5.0]])));
+    ok("scatter_add", near(nn.scatter_add(nn.zeros([2, 3]), T([[0.0, 0.0], [2.0, 1.0]]), T([[1.0, 2.0], [3.0, 4.0]]), 1), T([[3.0, 0.0, 0.0], [0.0, 4.0, 3.0]])));
+    ok("scatter", near(nn.scatter(nn.zeros([3]), T([2.0, 0.0]), T([7.0, 8.0]), 0), T([8.0, 0.0, 7.0])));
+    ok("tril/triu/diag/trace", near(nn.tril(nn.ones([3, 3])), T([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])) && near(nn.triu(nn.ones([3, 3]), 1), T([[0.0, 1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])) && near(nn.diag(T([1.0, 2.0])), T([[1.0, 0.0], [0.0, 2.0]])) && near(nn.diag(T([[1.0, 2.0], [3.0, 4.0]])), T([1.0, 4.0])) && near(nn.trace(T([[1.0, 2.0], [3.0, 4.0]])), 5.0));
+
+    // ---- products
+    ok("outer", near(nn.outer(T([1.0, 2.0]), T([3.0, 4.0, 5.0])), T([[3.0, 4.0, 5.0], [6.0, 8.0, 10.0]])));
+    ok("kron", near(nn.kron(T([[1.0, 2.0], [3.0, 4.0]]), T([[0.0, 1.0], [1.0, 0.0]])), T([[0.0, 1.0, 0.0, 2.0], [1.0, 0.0, 2.0, 0.0], [0.0, 3.0, 0.0, 4.0], [3.0, 0.0, 4.0, 0.0]])));
+    ok("cross", near(nn.cross(T([1.0, 0.0, 0.0]), T([0.0, 1.0, 0.0])), T([0.0, 0.0, 1.0])));
+    let a3 = nn.randn([2, 3, 4]); let b3 = nn.randn([2, 4, 5]);
+    ok("bmatmul vs einsum", tight(nn.bmatmul(a3, b3), nn.einsum("bij,bjk->bik", a3, b3)));
+    ok("bmatmul broadcast shape", shp(nn.bmatmul(nn.randn([2, 1, 3, 4]), nn.randn([5, 4, 2])), [2, 5, 3, 2]));
+    ok("einsum transpose/trace/dot/outer", tight(nn.einsum("ij->ji", m), nn.transpose(m)) && near(nn.einsum("ii", T([[1.0, 2.0], [3.0, 4.0]])), 5.0) && near(nn.einsum("ij,ij->", m, m), 91.0) && near(nn.einsum("i,j->ij", T([1.0, 2.0]), T([3.0, 4.0])), T([[3.0, 4.0], [6.0, 8.0]])));
+    ok("einsum 3 operands", near(nn.einsum("ij,jk,kl->il", T([[1.0, 2.0], [3.0, 4.0]]), T([[1.0, 0.0], [0.0, 1.0]]), T([[2.0, 0.0], [0.0, 2.0]])), T([[2.0, 4.0], [6.0, 8.0]])));
+    ok("einsum reductions", near(nn.einsum("ij->i", m), T([6.0, 15.0])) && near(nn.einsum("ij,j->i", m, T([1.0, 1.0, 1.0])), T([6.0, 15.0])));
+    let r23 = nn.randn([2, 3]);
+    ok("einsum implicit output", tight(nn.einsum("ij,jk", r23, nn.ones([3, 2])), nn.matmul(r23, nn.ones([3, 2]))));
+    ok("tensordot", shp(nn.tensordot(nn.randn([2, 3, 4]), nn.randn([4, 5]), 1), [2, 3, 5]) && near(nn.tensordot(m, m, [[0, 1], [0, 1]]), 91.0));
+
+    // ---- statistics
+    let data = T([[1.0, 2.0], [2.0, 4.1], [3.0, 5.9]]);
+    ok("cov", near(nn.cov(data), T([[1.0, 1.95], [1.95, 3.81]])));
+    ok("corrcoef", near(nn.corrcoef(data), T([[1.0, 0.9990153], [0.9990153, 1.0]])));
+    ok("cdist", near(nn.cdist(T([[0.0, 0.0], [1.0, 1.0]]), T([[3.0, 4.0]])), T([[5.0], [3.6055513]])));
+    ok("cosine_similarity", near(nn.cosine_similarity(T([[1.0, 0.0], [1.0, 1.0]]), T([[1.0, 0.0], [-1.0, -1.0]])), T([1.0, -1.0])));
+    ok("normalize", near(nn.normalize(T([[3.0, 4.0]])), T([[0.6, 0.8]])));
+    ok("histogram/bincount", near(nn.histogram(T([0.1, 0.2, 0.5, 0.9, 1.0]), 2), T([3.0, 2.0])) && near(nn.bincount(T([0.0, 1.0, 1.0, 3.0])), T([1.0, 2.0, 0.0, 1.0])));
+    ok("convolve", near(nn.convolve(T([1.0, 2.0, 3.0, 4.0, 5.0]), T([1.0, 1.0, 1.0, 1.0]), "same"), T([3.0, 6.0, 10.0, 14.0, 12.0])) && near(nn.convolve(T([1.0, 2.0, 3.0]), T([0.0, 1.0])), T([0.0, 1.0, 2.0, 3.0])) && near(nn.convolve(T([1.0, 2.0, 3.0, 4.0]), T([1.0, 1.0]), "valid"), T([3.0, 5.0, 7.0])));
+
+    // ---- activation derivatives vs. central differences, softmax backward
+    let xs = T([-3.0, -1.2, -0.3, 0.4, 1.1, 2.4]);
+    let h = 0.000001;
+    let names = ["relu", "relu6", "leaky_relu", "elu", "selu", "gelu", "sigmoid", "tanh", "softplus", "silu", "mish", "softsign", "hard_sigmoid"];
+    for (nm in names) {
+        let num = nn.div(nn.sub(nn.apply(nm, nn.add(xs, h)), nn.apply(nm, nn.sub(xs, h))), 2.0 * h);
+        ok("activation_grad " + nm, nn.allclose(num, nn.activation_grad(nm, xs), 0.0001, 0.0001));
+    }
+    let z = T([[1.0, 2.0, 3.0], [0.5, 0.1, -1.0]]);
+    let sm = nn.softmax(z, 1);
+    ok("log_softmax_axis", near(nn.exp(nn.log_softmax_axis(z, 1)), sm));
+    ok("softmax_grad rows sum to 0", near(nn.sum(nn.softmax_grad(sm, T([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]), 1), 1), T([0.0, 0.0])));
+
+    // ---- linear algebra
+    let A = T([[4.0, 3.0, 2.0], [3.0, 5.0, 1.0], [2.0, 1.0, 6.0]]);
+    let b = T([1.0, 2.0, 3.0]);
+    ok("det", near(nn.det(A), 54.0) && near(nn.det(T([[1.0, 2.0], [2.0, 4.0]])), 0.0));
+    let sl = nn.slogdet(A);
+    ok("slogdet", near(sl.sign, 1.0) && near(sl.logabsdet, 3.9889840));
+    ok("inv", tight(nn.matmul(A, nn.inv(A)), nn.eye(3)));
+    let xsol = nn.solve(A, b);
+    ok("solve", tight(nn.matmul(A, nn.reshape(xsol, [3, 1])), nn.reshape(b, [3, 1])));
+    let P3 = T([[0.0, 2.0, 1.0], [1.0, 1.0, 1.0], [3.0, 0.0, 2.0]]);
+    let lu = nn.lu(P3);
+    ok("lu (needs pivoting)", tight(nn.matmul(nn.matmul(lu.p, lu.l), lu.u), P3));
+    let L = nn.cholesky(A);
+    ok("cholesky", tight(nn.matmul(L, nn.transpose(L)), A));
+    ok("chol_solve", tight(nn.chol_solve(L, b), xsol));
+    let tall = nn.randn([6, 4]); let qr = nn.qr(tall);
+    ok("qr tall", tight(nn.matmul(qr.q, qr.r), tall) && tight(nn.matmul(nn.transpose(qr.q), qr.q), nn.eye(4)));
+    let wide = nn.randn([3, 5]); let qw = nn.qr(wide);
+    ok("qr wide", tight(nn.matmul(qw.q, qw.r), wide) && shp(qw.r, [3, 5]));
+    let ev = nn.eigh(A);
+    ok("eigh", tight(nn.matmul(A, ev.vectors), nn.mul(ev.vectors, nn.reshape(ev.values, [1, 3]))) && tight(nn.matmul(nn.transpose(ev.vectors), ev.vectors), nn.eye(3)));
+    ok("eigh sums to trace", near(nn.sum(ev.values), 15.0) && near(nn.eigvalsh(A), ev.values));
+    let sv = nn.svd(tall);
+    ok("svd tall", tight(nn.matmul(nn.mul(sv.u, nn.reshape(sv.s, [1, 4])), sv.vt), tall) && tight(nn.matmul(nn.transpose(sv.u), sv.u), nn.eye(4)));
+    let sw = nn.svd(wide);
+    ok("svd wide", tight(nn.matmul(nn.mul(sw.u, nn.reshape(sw.s, [1, 3])), sw.vt), wide));
+    ok("svdvals", near(nn.svdvals(tall), sv.s));
+    let rank1 = T([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]]);
+    let s1 = nn.svd(rank1);
+    ok("svd rank deficient", near(s1.s, T([8.3666003, 0.0])) && tight(nn.matmul(nn.mul(s1.u, nn.reshape(s1.s, [1, 2])), s1.vt), rank1) && tight(nn.matmul(nn.transpose(s1.u), s1.u), nn.eye(2)));
+    ok("matrix_rank", nn.matrix_rank(rank1) == 1 && nn.matrix_rank(A) == 3);
+    ok("pinv", tight(nn.matmul(nn.matmul(rank1, nn.pinv(rank1)), rank1), rank1));
+    let ls = nn.lstsq(T([[1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0]]), T([2.1, 2.9, 4.2, 4.8]));
+    ok("lstsq", near(ls.x, T([1.15, 0.94])) && ls.rank == 2);
+    ok("matrix_norm", near(nn.matrix_norm(A), 10.2469508) && near(nn.matrix_norm(A, "nuc"), 15.0) && near(nn.matrix_norm(A, 1), 9.0) && near(nn.matrix_norm(A, "inf"), 9.0) && near(nn.matrix_norm(A, 2), 9.0));
+    ok("cond", near(nn.cond(A), 7.0980756) && nn.cond(T([[1.0, 2.0], [2.0, 4.0]])) > 1000000000000.0);
+    ok("matrix_power", tight(nn.matrix_power(A, 3), nn.matmul(A, nn.matmul(A, A))) && tight(nn.matrix_power(A, -2), nn.matmul(nn.inv(A), nn.inv(A))) && tight(nn.matrix_power(A, 0), nn.eye(3)));
+    ok("expm", tight(nn.expm(nn.zeros([2, 2])), nn.eye(2)) && near(nn.expm(T([[0.0, 1.0], [-1.0, 0.0]])), T([[0.5403023, 0.8414710], [-0.8414710, 0.5403023]])) && near(nn.expm(T([[1.0, 0.0], [0.0, 2.0]])), T([[2.7182818, 0.0], [0.0, 7.3890561]])));
+    let bat = nn.randn([4, 3, 3]);
+    ok("batched inv/det", tight(nn.bmatmul(bat, nn.inv(bat)), nn.broadcast_to(nn.eye(3), [4, 3, 3])) && shp(nn.det(bat), [4]));
+    ok("batched solve shared rhs", shp(nn.solve(bat, nn.randn([3, 2])), [4, 3, 2]));
+
+    // ---- sampling
+    nn.seed(7);
+    let un = nn.uniform([20000], -1.0, 3.0);
+    ok("uniform range/mean", nn.item(nn.min(un)) >= -1.0 && nn.item(nn.max(un)) < 3.0 && nn.allclose(nn.mean(un), 1.0, 0.0, 0.05));
+    let tn = nn.trunc_normal([20000], 0.0, 1.0, -1.0, 2.0);
+    ok("trunc_normal bounds/mean", nn.item(nn.min(tn)) >= -1.0 && nn.item(nn.max(tn)) <= 2.0 && nn.allclose(nn.mean(tn), 0.2296, 0.0, 0.03));
+    ok("bernoulli mean", nn.allclose(nn.mean(nn.bernoulli([20000], 0.3)), 0.3, 0.0, 0.02));
+    let rp = nn.randperm(10);
+    ok("randperm is a permutation", near(nn.sort(rp), nn.arange(10)));
+    let mc = nn.bincount(nn.multinomial(T([0.0, 1.0, 3.0]), 20000));
+    ok("multinomial weights", nn.item(nn.slice_axis(mc, 0, 0, 1)) == 0 && nn.allclose(nn.item(nn.slice_axis(mc, 0, 2, 3)) / 20000.0, 0.75, 0.0, 0.02));
+    ok("multinomial without replacement", near(nn.sort(nn.multinomial(T([1.0, 1.0, 1.0, 0.0]), 3, false)), T([0.0, 1.0, 2.0])));
+
+    print("nn math failures:", failures);
+}

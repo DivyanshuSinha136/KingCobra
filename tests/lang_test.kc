@@ -1,0 +1,136 @@
+// The language's own test suite, written in KingCobra and run with:  kingcobra test tests/lang_test.kc
+// Every function named test_* is a test; assert / assert_eq report failures with file:line.
+
+// ---------------------------------------------------------------- literals and operators
+fn test_exact_integers() {
+    assert_eq(9007199254740993, 9007199254740992 + 1, "above 2^53 a double cannot hold this");
+    assert_eq(-9223372036854775808 + 1, -9223372036854775807);
+    assert_eq(0xFF, 255);  assert_eq(0b1010_1010, 170);  assert_eq(1_000_000, 1000000);
+}
+fn test_float_exponents() { assert_eq(1e3, 1000.0); assert_eq(2.5e-1, 0.25); }
+fn test_chars_are_code_points() { assert_eq('a', 97); assert_eq('\n', 10); assert_eq('é', 233); }
+fn test_ternary_and_coalesce() {
+    assert_eq(true ? 1 : 2, 1);
+    assert_eq(false ? 1 : true ? 2 : 3, 2);
+    assert_eq(null ?? "d", "d");
+    assert_eq(0 ?? "d", 0, "0 is not null");
+}
+fn test_integer_division_and_modulo() {
+    assert_eq(7 / 2, 3.5);  assert_eq(8 / 2, 4);  assert_eq(-7 % 3, -1);  assert_eq(7 % -3, 1);
+    assert_eq(idiv(-7, 2), -4);
+    let min = -9223372036854775808;
+    assert_eq(min % -1, 0);
+}
+fn test_bitwise_precedence() { assert(6 & 2 == 2, "& binds tighter than =="); assert_eq(1 << 4 | 1, 17); }
+fn test_in_operator() { assert(2 in [1, 2]); assert(!(3 in [1, 2])); assert("ell" in "hello"); assert("k" in { k: 1 }); }
+
+// ---------------------------------------------------------------- strings and f-strings
+fn test_fstrings() {
+    let n = 3; let who = "x";
+    assert_eq(f"{who}={n + 1}", "x=4");
+    assert_eq(f"{{literal}} {n}", "{literal} 3");
+    assert_eq(f"{n > 2 ? "big" : "small"}", "big");
+}
+fn test_plain_strings_keep_braces() { assert_eq("{n}", "{n}"); }
+fn test_string_helpers() {
+    assert_eq("ab".repeat(3), "ababab");  assert_eq("7".pad_left(3, "0"), "007");
+    assert_eq("héy".chars(), ["h", "é", "y"]);  assert_eq(chr(ord("a") + 1), "b");
+}
+
+// ---------------------------------------------------------------- collections
+fn test_slicing() {
+    let a = [10, 20, 30, 40];
+    assert_eq(a[1..3], [20, 30]);  assert_eq(a[..2], [10, 20]);  assert_eq(a[2..], [30, 40]);
+    assert_eq("hello"[1..4], "ell");
+}
+fn test_structural_equality() {
+    assert_eq([1, [2, 3]], [1, [2, 3]]);
+    assert_eq({ a: 1, b: 2 }, { b: 2, a: 1 });
+    assert([1, 2] != [1, 3]);
+}
+fn test_higher_order() {
+    let xs = [5, 3, 8, 1];
+    assert_eq(xs.map(fn(x) -> int { return x * 2; }), [10, 6, 16, 2]);
+    assert_eq(xs.filter(fn(x) -> bool { return x > 3; }), [5, 8]);
+    assert_eq(xs.reduce(fn(a, b) -> int { return a + b; }, 0), 17);
+    assert_eq(sorted(xs), [1, 3, 5, 8]);
+    assert_eq(xs, [5, 3, 8, 1], "sorted() must not modify its input");
+}
+fn test_sort_is_stable() {
+    let people = [{ n: "a", age: 30 }, { n: "b", age: 25 }, { n: "c", age: 30 }, { n: "d", age: 25 }];
+    let names = sorted(people, fn(p, q) -> int { return p.age - q.age; }).map(fn(p) -> string { return p.n; });
+    assert_eq(names, ["b", "d", "a", "c"]);
+}
+fn test_object_helpers() {
+    let o = { b: 2, a: 1 };
+    assert_eq(o.keys(), ["b", "a"]);  assert_eq(o.get("z", 0), 0);  assert_eq(o.merge({ a: 9 }).a, 9);
+}
+
+// ---------------------------------------------------------------- functions
+fn greet(name: string, greeting: string = "Hello") -> string { return f"{greeting}, {name}"; }
+fn total(first: int, ...rest: int) -> int { var t = first; for (x in rest) { t += x; } return t; }
+fn id<T>(x: T) -> T { return x; }
+fn test_default_and_variadic_parameters() {
+    assert_eq(greet("A"), "Hello, A");  assert_eq(greet("A", "Hi"), "Hi, A");
+    assert_eq(total(1), 1);  assert_eq(total(1, 2, 3), 6);  assert_eq(id("s"), "s");
+}
+fn test_arity_errors_are_catchable() {
+    let f = fn(a, b = 2) -> int { return a + b; };            // a closure: only checked at run time
+    try { f(); assert(false, "should not reach"); } catch (e) { assert("expects 1 to 2" in e.message); }
+    assert_eq(f(1), 3);
+}
+
+// ---------------------------------------------------------------- types
+enum Color { Red, Green = 5, Blue }
+struct Point { x: int, y: int }
+impl Point {
+    fn len2(self) -> int { return self.x * self.x + self.y * self.y; }
+    fn origin() -> Point { return Point { x: 0, y: 0 }; }
+}
+impl string { fn shout(self) -> string { return self.upper() + "!"; } }
+fn test_enums() { assert_eq(Color.Blue, 6); assert_eq(match (Color.Green) { Color.Red => "r", Color.Green | Color.Blue => "gb", _ => "?" }, "gb"); }
+fn test_impl_methods() {
+    assert_eq(Point { x: 3, y: 4 }.len2(), 25);  assert_eq(Point.origin(), Point { x: 0, y: 0 });
+    assert_eq("hey".shout(), "HEY!");
+}
+fn test_destructuring() {
+    let [a, b, ...rest] = [1, 2, 3, 4];  assert_eq(rest, [3, 4]);
+    let { x, y: why } = Point { x: 7, y: 8 };  assert_eq(x + why, 15);
+}
+
+// ---------------------------------------------------------------- control flow
+fn test_labeled_loops() {
+    var hits = 0;
+    outer: for (i in 0..4) { for (j in 0..4) { if (j == 2) { continue outer; } if (i == 3) { break outer; } hits += 1; } }
+    assert_eq(hits, 6);
+}
+fn test_for_forms() {
+    var out = [];
+    for (i, v in ["a", "b"]) { push(out, f"{i}{v}"); }
+    for (k, v in { one: 1 }) { push(out, f"{k}{v}"); }
+    for (c in "xy") { push(out, c); }
+    assert_eq(out, ["0a", "1b", "one1", "x", "y"]);
+}
+
+// ---------------------------------------------------------------- errors and memory
+fn test_try_catch_throw() {
+    var seen = [];
+    try { throw "s"; } catch (e) { push(seen, e); }
+    try { throw { code: 7 }; } catch (e) { push(seen, e.code); }
+    try { let a = [1]; print(a[9]); } catch (e) { push(seen, e.kind); }
+    assert_eq(seen, ["s", 7, "runtime"]);
+}
+fn test_defer_runs_on_error() {
+    let before = mem_stats().regions_live;
+    fn leaky() -> int { let p = alloc(16); defer free(p); throw "boom"; }
+    try { leaky(); } catch (e) { }
+    assert_eq(mem_stats().regions_live, before, "defer must free on the error path");
+}
+fn test_use_after_free_is_catchable() {
+    var a = [1, 2]; free(a);
+    try { print(a[0]); assert(false); } catch (e) { assert("use after free" in e.message); }
+}
+fn deep(n: int) -> int { return deep(n + 1) + 1; }
+fn test_stack_overflow_is_catchable() {
+    try { deep(0); assert(false, "no overflow?"); } catch (e) { assert("stack overflow" in e.message); }
+}

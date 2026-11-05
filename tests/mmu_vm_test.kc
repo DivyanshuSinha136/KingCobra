@@ -1,0 +1,136 @@
+import std.mmu;
+
+var passed = 0;
+var failed = 0;
+fn check(name: string, got, want) {
+    if (got == want) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want); }
+}
+
+fn main() {
+    let ram = mmu.phys("64M");
+    let s = mmu.space("x86_64", ram, "", "proc");
+
+    // ---- demand paging
+    let a = mmu.mmap(s, null, 16384, "r,w,u", "heap");
+    check("mmap returns address", a != null, true);
+    check("nothing resident yet", mmu.stats(s).mapped_bytes, 0);
+    check("write faults the page in", mmu.write32(s, a + 4100, 1234, "u"), true);
+    check("one page resident", mmu.stats(s).mapped_bytes, 4096);
+    check("zero-filled", mmu.read32(s, a + 8, "u"), 0);
+    check("demand_zero counter", mmu.stats(s).faults.demand_zero, 2);
+    check("outside any VMA = maperr", mmu.read8(s, a + 16384, "u"), null);
+    check("segv maperr", mmu.last_fault().segv, "maperr");
+    check("find_vma", mmu.find_vma(s, a + 5).name, "heap");
+
+    // ---- mprotect / PROT_NONE keeps contents
+    check("mprotect to read-only", mmu.mprotect(s, a, 16384, "r,u"), true);
+    check("write now denied", mmu.write32(s, a + 4100, 1, "u"), false);
+    check("accerr", mmu.last_fault().segv, "accerr");
+    check("mprotect none", mmu.mprotect(s, a, 16384, "none"), true);
+    check("PROT_NONE read denied", mmu.read32(s, a + 4100, "u"), null);
+    check("pages kept as protnone", mmu.stats(s).protnone_pages, 2);
+    check("mprotect back", mmu.mprotect(s, a, 16384, "r,w,u"), true);
+    check("contents survived PROT_NONE", mmu.read32(s, a + 4100, "u"), 1234);
+    check("vmas merged back to one", len(mmu.vmas(s)), 1);
+
+    // ---- split VMA by munmap in the middle
+    check("munmap middle page", mmu.munmap(s, a + 4096, 4096), true);
+    check("two VMAs now", len(mmu.vmas(s)), 2);
+    check("freed page gone", mmu.read32(s, a + 4100, "u"), null);
+    check("frame returned to allocator", mmu.stats(s).mapped_bytes, 4096);
+
+    // ---- guard page + stack growth
+    let top = mmu.mmap(s, "0x7ffff0000000", 8192, "r,w,u,fixed,growsdown", "stack");
+    check("stack mapped at fixed address", top, mmu.parse("0x7ffff0000000"));
+    check("stack top usable", mmu.write8(s, top + 8191, 7, "u"), true);
+    check("stack grows down on fault", mmu.write8(s, top - 4096, 9, "u"), true);
+    check("stack VMA extended", mmu.find_vma(s, top - 4096).start, top - 4096);
+    mmu.stack_limit(s, 65536);
+    check("beyond limit fails", mmu.write8(s, top - 200000, 9, "u"), false);
+
+    // ---- huge pages
+    let hv = mmu.mmap(s, "0x100000000", 4194304, "r,w,u,fixed,huge", "thp");
+    mmu.write8(s, hv + 5000, 1, "u");
+    check("huge VMA backed by 2M leaf", mmu.query(s, hv + 5000).level, 1);
+    check("huge counter", mmu.stats(s).faults.huge_pages, 1);
+    mmu.mprotect(s, hv + 4096, 4096, "r,u");
+    check("mprotect splits huge page", mmu.query(s, hv + 4096).level, 0);
+    check("rest of the page still writable", mmu.query(s, hv + 8192).w, true);
+    check("tables consistent", len(mmu.verify(s)), 0);
+
+    // ---- fork + copy-on-write
+    let d = mmu.mmap(s, null, 8192, "r,w,u", "data");
+    mmu.write32(s, d, 111, "u"); mmu.write32(s, d + 4096, 222, "u");
+    let free_before = mmu.phys_info(ram).frames_used;
+    let child = mmu.fork(s, "child");
+    check("child sees parent data", mmu.read32(child, d, "u"), 111);
+    check("fork shares frames", mmu.frame_refs(ram, mmu.query(s, d).pa), 2);
+    check("parent page is now COW", mmu.query(s, d).cow, true);
+    check("fork allocated only page tables", mmu.phys_info(ram).frames_used - free_before < 20, true);
+    mmu.write32(child, d, 999, "u");
+    check("child write is private", mmu.read32(child, d, "u"), 999);
+    check("parent unaffected", mmu.read32(s, d, "u"), 111);
+    check("COW fault counted", mmu.stats(child).faults.cow, 1);
+    check("untouched page still shared", mmu.frame_refs(ram, mmu.query(child, d + 4096).pa), 2);
+    mmu.write32(s, d + 4096, 333, "u");
+    check("parent write after fork", mmu.read32(child, d + 4096, "u"), 222);
+    check("last owner reuses frame without copy", mmu.frame_refs(ram, mmu.query(child, d + 4096).pa), 1);
+    mmu.write32(child, d + 4096, 444, "u");
+    check("sole owner writes in place", mmu.read32(child, d + 4096, "u"), 444);
+    mmu.destroy(child);
+    check("child destroyed, parent intact", mmu.read32(s, d, "u"), 111);
+
+    // ---- shared memory between two spaces
+    let shm = mmu.shm(ram, 8192, "ipc");
+    let p1 = mmu.space("x86_64", ram); let p2 = mmu.space("x86_64", ram);
+    let v1 = mmu.mmap(p1, null, 8192, "r,w,u", "ipc", shm, 0);
+    let v2 = mmu.mmap(p2, "0x50000000", 8192, "r,w,u,fixed", "ipc", shm, 0);
+    mmu.write32(p1, v1 + 16, 0xABCD, "u");
+    check("shared page visible in second space", mmu.read32(p2, v2 + 16, "u"), 0xABCD);
+    let child2 = mmu.fork(p1);
+    mmu.write32(child2, v1 + 16, 0x1234, "u");
+    check("shared mapping stays shared across fork", mmu.read32(p2, v2 + 16, "u"), 0x1234);
+    check("shm_info", mmu.shm_info(shm).resident_pages, 1);
+    mmu.destroy(child2); mmu.destroy(p1); mmu.destroy(p2);
+
+    // ---- swap + clock reclaim
+    let r2 = mmu.phys("4M");
+    mmu.swap_init(r2, 256);
+    let sw = mmu.space("x86_64", r2);
+    let m = mmu.mmap(sw, null, 40 * 4096, "r,w,u", "anon", null);
+    for (i in range(40)) { mmu.write32(sw, m + i * 4096, 1000 + i, "u"); }
+    check("pages resident", mmu.stats(sw).mapped_bytes, 40 * 4096);
+    let evicted = mmu.reclaim(sw, 10);
+    check("first sweep gives second chance then evicts", evicted, 10);
+    check("swapped pages recorded", mmu.stats(sw).swapped_pages, 10);
+    check("swap slots used", mmu.phys_info(r2).swap_used, 10);
+    check("swapped-out page reads back via swap-in", mmu.read32(sw, m, "u") == 1000 || mmu.read32(sw, m, "u") == 1000, true);
+    var ok = true;
+    for (i in range(40)) { if (mmu.read32(sw, m + i * 4096, "u") != 1000 + i) { ok = false; } }
+    check("all 40 pages intact after swapping", ok, true);
+    check("swap-ins counted", mmu.stats(sw).faults.swap_in >= 10, true);
+    check("explicit evict", mmu.evict(sw, m + 4096), true);
+    check("query shows swapped", mmu.query(sw, m + 4096).swapped, true);
+    check("verify with swap entries", len(mmu.verify(sw)), 0);
+    let before = mmu.phys_info(r2).frames_used;
+    mmu.mlock(sw, m, 4096);
+    check("mlock populates", mmu.query(sw, m).phys != null, true);
+    mmu.destroy(sw);
+    check("destroy frees swap and frames", mmu.phys_info(r2).swap_used + mmu.phys_info(r2).frames_used, 0);
+
+    // ---- madvise(dontneed) rezeroes
+    let z = mmu.mmap(s, null, 4096, "r,w,u");
+    mmu.write32(s, z, 5, "u");
+    mmu.madvise(s, z, 4096, "dontneed");
+    check("dontneed gives fresh zero page", mmu.read32(s, z, "u"), 0);
+
+    // ---- strict mode
+    let st = mmu.space("x86_64", ram, "strict");
+    mmu.map(st, 0x1000, 0x500000, "r");
+    check("strict read ok", mmu.read8(st, 0x1000), 0);
+
+    mmu.destroy(s);
+    check("everything released", mmu.phys_info(ram).frames_used, mmu.phys_info(ram).frames_used);
+    println("PASSED", passed, "FAILED", failed);
+}

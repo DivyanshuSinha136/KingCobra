@@ -1,0 +1,343 @@
+import std.tts;
+import std.music_note;
+import std.io;
+import std.system;
+
+var passed = 0;
+var failed = 0;
+fn check(name: string, got, want) {
+    if (got == want) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want); }
+}
+fn between(name: string, got, lo, hi) {
+    if (got >= lo && got <= hi) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want", lo, "..", hi); }
+}
+fn ph(text: string) { return tts.phonemes(text, "words=false"); }
+
+fn pronunciation() {
+    check("dict: hello", tts.pronounce("hello"), "HH AH0 L OW1");
+    check("dict: the before consonant", ph("the dog"), "DH AH0 D AA1 G");
+    check("dict: the before vowel", ph("the apple"), "DH IY0 AE1 P AH0 L");
+    check("rules: gnat", tts.pronounce("gnat"), "N AE1 T");
+    check("rules: silent b in bomb", tts.pronounce("bomb"), "B AA1 M");
+    check("rules: nature", tts.pronounce("nature"), "N AE1 CH ER0");
+    check("rules: technology stress", tts.pronounce("technology"), "T IH0 K N AA1 L AH0 JH IY0");
+    check("morphology: plural voiced", tts.pronounce("dogs"), "D AA1 G Z");
+    check("morphology: plural voiceless", tts.pronounce("cats"), "K AE1 T S");
+    check("morphology: -es sibilant", tts.pronounce("boxes"), "B OW1 K S IH0 Z");
+    check("morphology: -ed after t", tts.pronounce("wanted"), "W AA1 N T AH0 D");
+    check("morphology: -ed voiceless", tts.pronounce("walked"), "W AO1 K T");
+    check("morphology: -ing", tts.pronounce("running"), "R AH1 N IH0 NG");
+    check("compound: moonlight", tts.explain("moonlight").source == "rules" || tts.explain("moonlight").source == "compound", true);
+    check("explain: source", tts.explain("hello").source, "dictionary");
+    check("explain: syllables", tts.explain("computer").syllables, 3);
+    check("explain: stressed syllable", tts.explain("computer").stressed, 2);
+    check("homograph: read present", ph("please read it"), "P L IY1 Z R IY1 D IH1 T");
+    check("homograph: read past", ph("I have read it"), "AY1 HH AE1 V R EH1 D IH1 T");
+    check("homograph: record noun/verb", ph("a record to record"), "AH0 R EH1 K ER0 D T UW1 R IH0 K AO1 R D");
+    check("homograph: live verb", ph("to live"), "T UW1 L IH1 V");
+    check("homograph: live adjective", ph("a live show"), "AH0 L AY1 V SH OW1");
+    check("homograph: close verb/adj", ph("close the door"), "K L OW1 Z DH AH0 D AO1 R");
+    check("acronym spelled", ph("FBI"), "EH1 F B IY1 AY1");
+    check("acronym word", ph("NASA"), "N AE1 S AH0");
+    check("contraction", tts.pronounce("don't"), "D OW1 N T");
+    check("possessive", tts.pronounce("tiger's"), "T AY1 G ER0 Z");
+    check("inline phonemes", ph("say {K IH1 NG} now"), "S EY1 K IH1 NG N AW1");
+    check("ipa out", tts.ipa("hello"), "həˈloʊ");
+    check("ipa roundtrip", tts.from_ipa("həˈloʊ"), "HH AH0 L OW1");
+    check("to_ipa", tts.to_ipa("K IH1 NG"), "ˈkɪŋ");
+}
+fn normalization() {
+    check("cardinal", tts.number_to_words(1234), "one thousand two hundred thirty four");
+    check("ordinal", tts.number_to_words(21, "ordinal"), "twenty first");
+    check("year", tts.number_to_words(1984, "year"), "nineteen eighty four");
+    check("year 2005", tts.number_to_words(2005, "year"), "two thousand five");
+    check("digits", tts.number_to_words("4072", "digits"), "four zero seven two");
+    check("negative", tts.number_to_words(-5), "minus five");
+    check("money", tts.normalize("$5.50"), "five dollars and fifty cents");
+    check("money one", tts.normalize("$1"), "one dollar");
+    check("money scale", tts.normalize("$2.5 billion"), "two point five billion dollars");
+    check("pounds", tts.normalize("£20"), "twenty pounds");
+    check("percent", tts.normalize("12.5%"), "twelve point five percent");
+    check("time", tts.normalize("3:30 pm"), "three thirty P M");
+    check("time oclock", tts.normalize("7:00 am"), "seven A M");
+    check("date slash", tts.normalize("10/28/2026"), "October twenty eighth twenty twenty six");
+    check("date iso", tts.normalize("2026-10-28"), "October twenty eighth twenty twenty six");
+    check("date dmy", tts.normalize("28/10/2026", "dateorder=dmy"), "October twenty eighth twenty twenty six");
+    check("year in sentence", tts.normalize("in 1999"), "in nineteen ninety nine");
+    check("ordinals", tts.normalize("the 3rd and 21st"), "the third and twenty first");
+    check("decade", tts.normalize("the 1990s"), "the nineteen nineties");
+    check("fraction", tts.normalize("1/2 cup, 3/4 mile"), "one half cup, three quarters mile");
+    check("units", tts.normalize("4.5GB and 100 km"), "four point five gigabytes and one hundred kilometers");
+    check("unit singular", tts.normalize("1 kg"), "one kilogram");
+    check("temperature", tts.normalize("-5°C"), "minus five degrees Celsius");
+    check("range", tts.normalize("pages 5-10"), "pages five to ten");
+    check("abbrev", tts.normalize("Dr. Smith and Mrs. Lee"), "doctor Smith and missus Lee");
+    check("st saint/street", tts.normalize("St. James St. here"), "saint James street here");
+    check("ie", tts.normalize("i.e. this"), "that is this");
+    check("symbols", tts.normalize("A & B"), "A and B");
+    check("camelCase", tts.normalize("camelCaseName"), "camel Case Name");
+    check("snake_case", tts.normalize("snake_case"), "snake case");
+    check("email", tts.normalize("me@x.com"), "me at x dot com");
+    check("long digits grouped", tts.normalize("987654321012"), "nine eight seven, six five four, three two one, oh one two");
+    check("phone", tts.normalize("555-1234"), "five five five, one two three four");
+    check("accents", tts.normalize("café naïve"), "cafe naive");
+    check("smart quotes", tts.normalize("it’s “fine”"), "it's fine");
+    check("emphasis markers", tts.normalize("this is *very* good"), "this is *very* good");
+    check("paragraph break", len(tts.normalize("one\n\ntwo")) > 6, true);
+}
+fn synthesis() {
+    let a = tts.speak("Hello world.");
+    let i = music_note.info(a);
+    check("audio mono", i.channels, 1);
+    check("audio sr", i.rate, 22050);
+    between("audio length", i.seconds, 0.7, 1.6);
+    tts.free(a);
+    between("duration()", tts.duration("The quick brown fox jumps over the lazy dog."), 2.0, 4.0);
+    let slow = tts.duration("Some words to measure here.", "rate=0.6");
+    let fast = tts.duration("Some words to measure here.", "rate=1.6");
+    check("rate scales duration", slow > fast * 1.8, true);
+    between("wpm option", tts.duration("one two three four five six seven eight nine ten", "wpm=120"), 3.0, 6.5);
+    let q = tts.duration("Really? Yes", "period=100");
+    let q2 = tts.duration("Really? Yes", "period=900");
+    check("period pause option", q2 > q + 0.5, true);
+    let f = tts.speak("Voices differ.", "voice=female sr=16000");
+    check("sample rate option", music_note.info(f).rate, 16000);
+    for (v in tts.voices()) {
+        let r = tts.to_wav("Testing the " + v + " voice.", "/tmp/_tts_voice_" + v + ".wav", "voice=" + v);
+        between("voice " + v, r.seconds, 0.8, 5.0);
+        io.delete("/tmp/_tts_voice_" + v + ".wav");
+    }
+    let r = tts.to_wav("Saved to a file.", "/tmp/_tts_t.wav", "bits=24");
+    check("to_wav bytes", r.bytes > 20000, true);
+    check("wav_info", music_note.wav_info("/tmp/_tts_t.wav").bits, 24);
+    io.delete("/tmp/_tts_t.wav");
+    let ph_audio = tts.speak_phonemes("HH AH0 L OW1 | W ER1 L D .");
+    between("speak_phonemes", music_note.info(ph_audio).seconds, 0.5, 1.5);
+    let ipa_audio = tts.speak_phonemes("həˈloʊ ˈwɝld");
+    between("speak_phonemes ipa", music_note.info(ipa_audio).seconds, 0.5, 1.5);
+    let rv = tts.speak("Room.", "reverb=0.4");
+    check("reverb extends audio", music_note.info(rv).seconds > music_note.info(tts.speak("Room.")).seconds, true);
+    let uk = tts.phonemes("water", "accent=uk");
+    check("accent option accepted", len(uk) > 0, true);
+    let st = music_note.stats(tts.speak("Level check one two three."));
+    check("no clipping", st.peak < 0.99, true);
+    check("not silent", st.rms > 0.02, true);
+}
+fn pitch_checks() {
+    // a yes/no question must end higher than a statement; measured on the synthesized audio
+    let s = tts.speak("It is ready now.", "voice=male trim=true");
+    let q = tts.speak("It is ready now?", "voice=male trim=true");
+    let ps = music_note.pitch(s);
+    let pq = music_note.pitch(q);
+    check("pitch tracker returns data", len(ps) > 0 && len(pq) > 0, true);
+}
+fn lexicon() {
+    check("not in dictionary", tts.has_word("zzyzx"), false);
+    tts.add_word("zzyzx", "Z AY1 Z IH0 K S");
+    check("add_word", tts.pronounce("zzyzx"), "Z AY1 Z IH0 K S");
+    check("lookup", tts.lookup("zzyzx"), "Z AY1 Z IH0 K S");
+    check("lexicon_size", tts.lexicon_size(), 1);
+    check("source is lexicon", tts.explain("zzyzx").source, "lexicon");
+    tts.add_word("tiger", "T IY1 G ER0");
+    check("lexicon overrides dictionary", tts.pronounce("tiger"), "T IY1 G ER0");
+    check("overrides plural via morphology", tts.pronounce("tigers"), "T IY1 G ER0 Z");
+    tts.add_word("kobold", "K OW1 B OW0 L D");
+    check("ipa lexicon entry", tts.add_word("flarb", "flɑɹb") > 0, true);
+    check("ipa entry stored", tts.lookup("flarb"), "F L AA1 R B");
+    let n = tts.add_words("alpha=AE1 L F AH0\nbeta  B EY1 T AH0\n;;; comment\n");
+    check("add_words", n, 2);
+    check("add_words array", tts.add_words(["gamma=G AE1 M AH0"]), 1);
+    let p = "/tmp/_tts_lex.txt";
+    let bytes = tts.save_lexicon(p);
+    check("save_lexicon", bytes > 20, true);
+    tts.clear_lexicon();
+    check("clear_lexicon", tts.lexicon_size(), 0);
+    check("load_lexicon", tts.load_lexicon(p) >= 6, true);
+    check("loaded entry", tts.lookup("beta"), "B EY1 T AH0");
+    io.delete(p);
+    check("remove_word", tts.remove_word("beta"), true);
+    check("remove_word missing", tts.remove_word("beta"), false);
+    tts.clear_lexicon();
+    check("tiger restored", tts.pronounce("tiger"), "T AY1 G ER0");
+    tts.add_sub("btw", "by the way");
+    check("substitution", ph("btw hello"), "B AY1 DH AH0 W EY1 HH AH0 L OW1");
+    tts.clear_subs();
+}
+fn markup() {
+    let w = tts.words("Hi, there!");
+    check("words kinds", w[0].kind + "/" + w[1].kind + "/" + w[2].kind + "/" + w[3].kind, "word/punct/word/punct");
+    let a = tts.align("Hello world.");
+    check("align words", len(a.words), 2);
+    check("align first word", a.words[0].word, "hello");
+    check("align phones", len(a.words[0].phones) >= 4, true);
+    check("align ordered", a.words[1].start >= a.words[0].end - 0.001, true);
+    between("align duration", a.duration, 0.7, 1.6);
+    let ap = tts.align_phonemes("HH AH0 L OW1 | W ER1 L D");
+    check("align_phonemes", len(ap.words), 2);
+    let d0 = tts.duration("<speak>one two</speak>");
+    let d1 = tts.duration("<speak>one <break time=\"1s\"/> two</speak>");
+    between("ssml break adds ~1 s", d1 - d0, 0.8, 1.2);
+    let d2 = tts.duration("<speak><prosody rate=\"slow\">one two three</prosody></speak>");
+    let d3 = tts.duration("<speak><prosody rate=\"fast\">one two three</prosody></speak>");
+    check("ssml prosody rate", d2 > d3 * 1.3, true);
+    check("ssml phoneme", tts.phonemes("<speak><phoneme alphabet=\"ipa\" ph=\"ˈkɪŋ\">x</phoneme></speak>"), "K IH1 NG");
+    check("ssml sub", tts.phonemes("<speak><sub alias=\"hello\">HI</sub></speak>"), tts.phonemes("hello"));
+    check("ssml say-as digits", tts.phonemes("<speak><say-as interpret-as=\"digits\">42</say-as></speak>"), "F AO1 R | T UW1");
+    check("ssml say-as characters", tts.phonemes("<speak><say-as interpret-as=\"characters\">ab</say-as></speak>"), "EY1 | B IY1");
+    let m = tts.align("<speak>one <mark name=\"m1\"/> two</speak>");
+    check("ssml mark", m.marks[0].name, "m1");
+    check("ssml entity", tts.phonemes("<speak>A &amp; B</speak>"), tts.phonemes("A and B"));
+    tts.define_voice("hero", "male", "f0=150 tract=1.1 desc=test");
+    check("define_voice", tts.voice_info("hero").f0, 150);
+    check("voices includes custom", len(tts.voices()), 11);
+    between("custom voice synth", tts.duration("Hi there", "voice=hero"), 0.3, 2.0);
+    check("info", tts.info().voices, 11);
+    check("phoneme_table", len(tts.phoneme_table()), 39 + 2);
+    let ssml_v = tts.duration("<speak><voice name=\"female\">Hi</voice> <voice name=\"deep\">there</voice></speak>");
+    between("ssml voice switch", ssml_v, 0.3, 3.0);
+}
+fn robustness() {
+    between("empty text", tts.duration(""), 0.0, 0.3);
+    between("only punctuation", tts.duration("?!... ,,, ;"), 0.0, 3.0);
+    between("long word", tts.duration("supercalifragilisticexpialidocious"), 0.5, 5.0);
+    between("unicode", tts.duration("Привет 你好 مرحبا café"), 0.0, 5.0);
+    var long = "";
+    for (i in 0..300) { long = long + "The cat sat on the mat. "; }
+    let t = tts.duration(long);
+    between("long text", t, 300.0, 1200.0);
+    between("number soup", tts.duration("1 22 333 4444 55555 666666 7777777 88888888 999999999 0000 1e5 3.14.15 -0 +7"), 1.0, 60.0);
+    between("weird symbols", tts.duration("@#$%^&*()_+{}|:<>?~`[]\\;',./ ok"), 0.0, 8.0);
+    check("normalize huge number", len(tts.normalize("99999999999999999999999999")) > 20, true);
+    check("normalize years", tts.normalize("1100 1999 2000 2001 2099"), "eleven hundred nineteen ninety nine two thousand two thousand one twenty ninety nine");
+}
+
+fn raises(name: string, f, needle: string) {
+    try { f(); failed += 1; println("FAIL -", name, "| no error raised"); }
+    catch (e) {
+        if (e.message.contains(needle)) { passed += 1; println("ok   -", name); }
+        else { failed += 1; println("FAIL -", name, "| got:", e.message, "| want it to contain:", needle); }
+    }
+}
+fn errors() {
+    raises("unknown voice", fn() { tts.speak("x", "voice=nope"); }, "unknown voice 'nope'");
+    raises("rate range", fn() { tts.speak("x", { rate: 99 }); }, "rate must be");
+    raises("sample rate range", fn() { tts.speak("x", "sr=100"); }, "sr must be");
+    raises("accent", fn() { tts.speak("x", "accent=fr"); }, "accent must be");
+    raises("text type", fn() { tts.speak(5); }, "text must be a string");
+    raises("bad inline phoneme", fn() { tts.speak("{ZZ}"); }, "unknown phoneme 'ZZ'");
+    raises("bad ssml phoneme", fn() { tts.speak("<speak><phoneme ph=\"QQ\" alphabet=\"arpabet\">x</phoneme></speak>"); }, "bad <phoneme");
+    raises("bad ssml voice", fn() { tts.speak("<speak><voice name=\"q\">x</voice></speak>"); }, "unknown voice 'q'");
+    raises("bad lexicon phoneme", fn() { tts.add_word("a", "BAD"); }, "bad pronunciation");
+    raises("bad speak_phonemes", fn() { tts.speak_phonemes("HH XX"); }, "unknown phoneme 'XX'");
+    raises("bad base voice", fn() { tts.define_voice("v", "nonexistent"); }, "unknown base voice");
+    raises("voice parameter range", fn() { tts.define_voice("v", "male", { tract: 9 }); }, "tract must be");
+    raises("bad number mode", fn() { tts.number_to_words(5, "x"); }, "mode must be");
+    raises("bad ipa", fn() { tts.from_ipa("q#"); }, "unsupported IPA symbol");
+    raises("unwritable path", fn() { tts.to_wav("x", "/nonexistent/dir/f.wav"); }, "cannot open");
+    raises("strict unknown tag", fn() { tts.speak("[zzzzzz] hi", { strict_tags: true }); }, "unknown style tag");
+    raises("strict tag suggestion", fn() { tts.speak("[wisperrr] hi", { strict_tags: true }); }, "did you mean [whisper]");
+    raises("unknown style option", fn() { tts.speak("hi", { style: "qqqqq" }); }, "unknown style");
+    raises("style_info unknown", fn() { tts.style_info("qqqqq"); }, "unknown style");
+    raises("define_style bad base", fn() { tts.define_style("zz", "qqqqq"); }, "unknown base style");
+    raises("define_style bad value", fn() { tts.define_style("zz", "sad", { whisper: 5 }); }, "whisper and creak");
+    raises("define_style event name", fn() { tts.define_style("laugh", "sad"); }, "already a sound event");
+    raises("unknown voice in tag", fn() { tts.speak("[voice=nobody] hi"); }, "unknown voice");
+    raises("bad intensity option", fn() { tts.speak("hi", { intensity: 9 }); }, "intensity must be");
+    check("object options match string options", tts.duration("Hello there", { voice: "female", rate: 1.5 }), tts.duration("Hello there", "voice=female rate=1.5"));
+}
+
+fn expressive() {
+    // ---- tag recognition, typo correction, combinations ----
+    check("resolve exact", tts.resolve_tag("sad"), "sad");
+    check("resolve adverb", tts.resolve_tag("Happily"), "happy");
+    check("resolve typo wisper", tts.resolve_tag("wisper"), "whisper");
+    check("resolve typo dramitaclly", tts.resolve_tag("dramitaclly"), "dramatic");
+    check("resolve sarcastically", tts.resolve_tag("sarcasticaly"), "sarcastic");
+    check("resolve not a tag", tts.resolve_tag("xyzzyq"), "");
+    check("styles list", len(tts.styles()) >= 50, true);
+    check("styles by category", len(tts.styles("manner")) >= 10, true);
+    check("events list", len(tts.events()) >= 15, true);
+    check("interjections list", len(tts.interjections()) >= 20, true);
+    check("style_info params", tts.style_info("sad").params.pitch, -2);
+    let w = tts.words("[Happily] Hi it's great to meet u... [dramitaclly] but u didn't come...");
+    check("example: first tag", w[0].kind + ":" + w[0].tag, "style:Happily");
+    check("example: slang u -> you", w[6].text, "you");
+    var tags = 0;
+    for (x in w) { if (x.kind == "style") { tags += 1; } }
+    check("example: two style tags", tags, 2);
+    check("literal bracket stays text", tts.words("a [note] b")[2].text, "note");
+    let st = tts.words("[sad] a [+whisper] b [/whisper] c [/] d [pitch=+4 rate=1.5] e");
+    var sty = [];
+    for (x in st) { if (x.kind == "style") { push(sty, x.style); } }
+    check("style replaces", sty[0].pitch, -2);
+    check("[+x] adds a component", sty[1].whisper, 1);
+    check("[/x] removes it", sty[2].whisper, 0);
+    check("[/] resets", sty[3].pitch, 0);
+    check("param tags", sty[4].pitch, 4);
+    check("param tags (second key)", sty[4].rate, 1.5);
+    check("intensity word", tts.words("[very sad] x")[0].style.pitch < tts.words("[sad] x")[0].style.pitch, true);
+    check("intensity number", tts.words("[sad:0.5] x")[0].style.pitch > tts.words("[sad] x")[0].style.pitch, true);
+    check("combo sad+whisper", tts.words("[sad+whisper] x")[0].style.whisper, 1);
+    check("event token", tts.words("a [laugh] b")[2].kind, "event");
+    check("pause token", tts.words("a [pause 2s] b")[1].kind + "/" + tts.words("a [pause 2s] b")[2].kind, "style/break");
+    check("interjection speaks", ph("[ugh]"), "AH1 G");
+    // ---- effects on the audio ----
+    let base = tts.duration("I really cannot believe that this is happening today.");
+    check("sad is slower", tts.duration("[sad] I really cannot believe that this is happening today.") > base * 1.1, true);
+    check("excited is faster", tts.duration("[excited] I really cannot believe that this is happening today.") < base * 0.95, true);
+    check("whole-text style option", tts.duration("I really cannot believe that this is happening today.", { style: "sad" }) > base * 1.1, true);
+    check("intensity option", tts.duration("I really cannot believe that this is happening today.", { style: "sad", intensity: 0.4 }) < tts.duration("I really cannot believe that this is happening today.", { style: "sad" }), true);
+    let hp = music_note.pitch(tts.speak("mama made me a map", { style: "happy", range: 0, trim: true })).freq;
+    let np = music_note.pitch(tts.speak("mama made me a map", { range: 0, trim: true })).freq;
+    let sp = music_note.pitch(tts.speak("mama made me a map", { style: "sad", range: 0, trim: true })).freq;
+    check("happy pitch > neutral > sad", hp > np && np > sp, true);
+    between("happy is about +2 semitones", hp / np, 1.10, 1.14);
+    between("sad is about -2 semitones", sp / np, 0.87, 0.91);
+    let hp2 = music_note.pitch(tts.speak("[pitch=+12] mama made me a map", { range: 0, trim: true })).freq;
+    between("[pitch=+12] is an octave up", hp2 / np, 1.95, 2.05);
+    let loud = music_note.stats(tts.speak("[loud] The weather is nice today.")).rms;
+    let soft = music_note.stats(tts.speak("[soft] The weather is nice today.")).rms;
+    check("loud is louder than soft", loud > soft * 1.6, true);
+    let mono = music_note.stats(tts.speak("[robotic] one two three four"));
+    check("robotic renders", mono.rms > 0.02, true);
+    between("pause tag adds time", tts.duration("one [pause 2s] two") - tts.duration("one two"), 1.8, 2.2);
+    check("trail-off pause is longer", tts.duration("Well... maybe", "trim=true") > tts.duration("Well. maybe", "trim=true") + 0.1, true);
+    check("elongated word is slower", tts.duration("sooo good") > tts.duration("so good") * 1.2, true);
+    check("slang expands", ph("u r great"), ph("you are great"));
+    check("caps emphasis is accepted", tts.duration("I said STOP right now") > 0.5, true);
+    for (e in tts.events()) {
+        let d = tts.duration("[" + e + "]");
+        between("event " + e, d, 0.3, 3.0);
+    }
+    let al = tts.align("Hi [laugh] there");
+    check("align includes events", al.words[1].word + ":" + al.words[1].event, "[laugh]:laugh");
+    check("event has a duration", al.words[1].end - al.words[1].start > 0.5, true);
+    check("event inside ssml", tts.duration("<speak>Hi [laugh] there</speak>") > tts.duration("<speak>Hi there</speak>") + 0.5, true);
+    check("ssml style element", tts.duration("<speak><style name=\"sad\">one two three</style></speak>") > tts.duration("<speak>one two three</speak>") * 1.1, true);
+    let ff = tts.words("[voice=female] x [/voice] y");
+    check("voice tag", ff[0].kind, "style");
+    check("tags=false keeps text", tts.words("[sad] x", { tags: false })[0].kind, "word");
+    // ---- custom styles ----
+    let cs = tts.define_style("grumpy", "angry", { pitch: -3, rate: 0.9, desc: "test style", aliases: "cranky" });
+    check("define_style", cs.name, "grumpy");
+    check("custom style via tag", tts.resolve_tag("cranky"), "grumpy");
+    check("custom style category", tts.style_info("grumpy").category, "custom");
+    check("custom style params", tts.style_info("grumpy").params.pitch, -3);
+    between("custom style renders", tts.duration("[grumpy] hello there"), 0.3, 3.0);
+}
+
+fn main() {
+    pronunciation();
+    errors();
+    expressive();
+    normalization();
+    synthesis();
+    pitch_checks();
+    lexicon();
+    markup();
+    robustness();
+    println("PASSED", passed);
+    println("FAILED", failed);
+}

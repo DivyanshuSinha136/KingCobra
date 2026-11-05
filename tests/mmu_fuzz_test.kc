@@ -1,0 +1,91 @@
+import std.mmu;
+
+// Randomised differential test: a model (plain arrays) against the real page-table engine.
+// 8 MiB of virtual space (4 x 2 MiB regions, 2048 pages); random 4K maps, 2M huge maps, unmaps
+// (including partial unmaps that must split huge pages), protect, then full comparison + verify.
+var seed = 12345;
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return int(seed / 65536) % n;
+}
+
+fn run(arch: string, steps: int) -> int {
+    let ram = mmu.phys("64M");
+    let s = mmu.space(arch, ram);
+    let base = 0x10000000;
+    var pa_of = [];  var w_of = [];
+    for (i in range(2048)) { push(pa_of, -1); push(w_of, false); }
+    var bad = 0;
+    var has2m = false;
+    for (sz in mmu.arch_info(arch).page_sizes) { if (sz == 2097152) { has2m = true; } }
+    for (step in range(steps)) {
+        let op = rnd(10);
+        let page = rnd(2048);
+        if (op < 4) {                                   // map one 4K page if free
+            if (pa_of[page] == -1) {
+                let pa = 0x1000000 + rnd(4096) * 4096;
+                let wr = rnd(2) == 1;
+                var fl = "r";
+                if (wr) { fl = "r,w"; }
+                if (mmu.map(s, base + page * 4096, pa, fl)) { pa_of[page] = pa; w_of[page] = wr; }
+                else { bad += 1; println("map failed", mmu.last_error()); }
+            }
+        } else if (op == 4 && !has2m) {
+            // this architecture has no 2 MiB pages
+        } else if (op == 4) {                           // map a 2M huge page if its whole region is free
+            let reg = rnd(4);
+            var free = true;
+            for (i in range(512)) { if (pa_of[reg * 512 + i] != -1) { free = false; } }
+            if (free) {
+                let pa = 0x2000000 + rnd(8) * 2097152;
+                if (mmu.map(s, base + reg * 2097152, pa, "r,w", 2097152)) {
+                    for (i in range(512)) { pa_of[reg * 512 + i] = pa + i * 4096; w_of[reg * 512 + i] = true; }
+                } else { bad += 1; println("huge map failed", mmu.last_error()); }
+            }
+        } else if (op < 8) {                            // unmap a random run of pages (can split huge pages)
+            let n = 1 + rnd(40);
+            var cnt = n;
+            if (page + cnt > 2048) { cnt = 2048 - page; }
+            mmu.unmap(s, base + page * 4096, cnt * 4096);
+            for (i in range(cnt)) { pa_of[page + i] = -1; w_of[page + i] = false; }
+        } else {                                        // protect a run: drop write
+            let n = 1 + rnd(40);
+            var cnt = n;
+            if (page + cnt > 2048) { cnt = 2048 - page; }
+            mmu.protect(s, base + page * 4096, cnt * 4096, "-w");
+            for (i in range(cnt)) { w_of[page + i] = false; }
+        }
+        if (step % 25 == 0) {
+            let issues = mmu.verify(s);
+            if (len(issues) > 0) { bad += 1; println("verify:", issues); }
+        }
+    }
+    for (i in range(2048)) {
+        let q = mmu.query(s, base + i * 4096);
+        if (pa_of[i] == -1) { if (q != null) { bad += 1; println(arch, "page", i, "should be unmapped"); } }
+        else if (q == null) { bad += 1; println(arch, "page", i, "should be mapped"); }
+        else {
+            if (q.pa != pa_of[i]) { bad += 1; println(arch, "page", i, "wrong pa"); }
+            if (q.w != w_of[i]) { bad += 1; println(arch, "page", i, "wrong w", q.w, w_of[i]); }
+        }
+    }
+    let mapped = mmu.stats(s).mapped_bytes;
+    var expect = 0;
+    for (i in range(2048)) { if (pa_of[i] != -1) { expect += 4096; } }
+    if (mapped != expect) { bad += 1; println(arch, "mapped_bytes", mapped, "expected", expect); }
+    mmu.unmap(s, base, 8388608);
+    if (mmu.stats(s).table_frames != 1 + 0 && mmu.stats(s).table_frames != 1) { bad += 1; println(arch, "table frames not reclaimed:", mmu.stats(s).table_frames); }
+    mmu.destroy(s);
+    if (mmu.phys_info(ram).frames_used != 0) { bad += 1; println(arch, "leaked frames:", mmu.phys_info(ram).frames_used); }
+    return bad;
+}
+
+fn main() {
+    var total = 0;
+    for (a in ["x86_64", "x86_32", "arm64", "arm64_39", "riscv_sv32", "riscv_sv39", "riscv_sv48", "riscv_sv57", "x86_64_la57"]) {
+        let b = run(a, 600);
+        println(a, "inconsistencies:", b);
+        total += b;
+    }
+    println("FUZZ TOTAL", total);
+}

@@ -1,0 +1,517 @@
+import std.music_note;
+import std.fbin;
+import std.io;
+import std.system;
+
+var passed = 0;
+var failed = 0;
+fn check(name: string, got, want) {
+    if (got == want) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want); }
+}
+fn same(name: string, got, want) {
+    var ok = len(got) == len(want);
+    var i = 0;
+    while (ok && i < len(got)) { if (got[i] != want[i]) { ok = false; } i += 1; }
+    if (ok) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want); }
+}
+fn near(name: string, got, want, tol) {
+    var d = got - want;
+    if (d < 0) { d = 0 - d; }
+    if (d <= tol) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want, "+-", tol); }
+}
+fn ev_at(txt: string, i: int) { return music_note.events(txt)[i]; }
+
+// ------------------------------------------------------------------ theory
+fn theory() {
+    near("A4 = 440", music_note.freq("A4"), 440.0, 0.0001);
+    near("C4 = 261.626", music_note.freq("C4"), 261.6256, 0.001);
+    near("midi 69 -> 440", music_note.freq(69), 440.0, 0.0001);
+    near("custom A4 tuning", music_note.freq("A4", 432.0), 432.0, 0.0001);
+    check("midi C4", music_note.midi("C4"), 60);
+    check("midi Bb3", music_note.midi("Bb3"), 58);
+    check("midi C-1", music_note.midi("C-1"), 0);
+    check("name 61 sharps", music_note.name(61), "C#4");
+    check("name 61 flats", music_note.name(61, true), "Db4");
+    same("transpose array", music_note.transpose(["C4", "E4", "rest"], 7), ["G4", "B4", "rest"]);
+    check("interval", music_note.interval("C4", "G4"), 7);
+    same("scale major", music_note.scale("C4", "major"), ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"]);
+    same("scale pentatonic minor", music_note.scale("A3", "pentatonic_minor"), ["A3", "C4", "D4", "E4", "G4", "A4"]);
+    check("scale 2 octaves length", len(music_note.scale("C3", "major", 2)), 15);
+    same("chord Cmaj7", music_note.chord("Cmaj7"), ["C4", "E4", "G4", "B4"]);
+    same("chord F#m", music_note.chord("F#m"), ["F#4", "A4", "C#5"]);
+    same("chord Bb7 flats", music_note.chord("Bb7"), ["Bb4", "D5", "F5", "Ab5"]);
+    same("chord slash bass", music_note.chord("Am/E"), ["E4", "A4", "C5", "E5"]);
+    check("identify Cmaj7", music_note.identify(["E4", "C4", "G4", "B4"]), "Cmaj7");
+    check("identify inversion", music_note.identify(["E4", "G4", "C5"]), "C/E");
+    check("identify minor", music_note.identify(["A3", "C4", "E4"]), "Am");
+    check("identify nothing", music_note.identify(["C4", "C#4", "D4", "D#4", "E4"]), "");
+    let f = music_note.from_freq(450.0);
+    check("from_freq note", f.note, "A4");
+    near("from_freq cents", f.cents, 38.9, 0.1);
+    check("key_signature Gm", music_note.key_signature("Gm").fifths, -2);
+    same("key_signature D", music_note.key_signature("D").accidentals, ["F#", "C#"]);
+}
+
+// ------------------------------------------------------------------ notation
+fn notation() {
+    // durations at 120 BPM: a quarter note is 0.5 s
+    let e = music_note.events("tempo 120\nC4 D4:h r:q E4:e. F4:e");
+    check("quarter start", e[0]["start"], 0.0);
+    near("half note starts after a quarter", e[1]["start"], 0.5, 0.000000001);
+    near("half note lasts 1 s", e[1]["duration"], 1.0, 0.000000001);
+    near("dotted eighth start (rest counted)", e[2]["start"], 2.0, 0.000000001);
+    near("dotted eighth length", e[2]["duration"], 0.375, 0.000000001);
+    near("note after dotted eighth", e[3]["start"], 2.375, 0.000000001);
+    // duration spellings all agree
+    near("1/8 == e", ev_at("tempo 60\nC4:1/8 D4", 1)["start"], 0.5, 0.000000001);
+    near("8 == e", ev_at("tempo 60\nC4:8 D4", 1)["start"], 0.5, 0.000000001);
+    near("1.5b", ev_at("tempo 60\nC4:1.5b D4", 1)["start"], 1.5, 0.000000001);
+    near("q+e", ev_at("tempo 60\nC4:q+e D4", 1)["start"], 1.5, 0.000000001);
+    near("triplet eighth", ev_at("tempo 60\nC4:e3 D4:e3", 1)["start"], 1.0 / 3.0, 0.000000001);
+    near("default length l=e", ev_at("tempo 60\nl=e C4 D4", 1)["start"], 0.5, 0.000000001);
+    // key signatures
+    check("key G sharpens F", ev_at("key G\nF4", 0)["midi"], 66);
+    check("natural cancels key", ev_at("key G\nFn4", 0)["midi"], 65);
+    check("explicit accidental wins", ev_at("key G\nFb4", 0)["midi"], 64);
+    check("key F flattens B", ev_at("key F\nB4", 0)["midi"], 70);
+    check("minor key Am has no accidentals", ev_at("key Am\nF4", 0)["midi"], 65);
+    // octave state
+    check("octave token", ev_at("o5 C", 0)["midi"], 72);
+    check("octave shift > >", ev_at("> > C", 0)["midi"], 84);
+    check("octave shift <", ev_at("< C", 0)["midi"], 48);
+    check("explicit octave wins", ev_at("o5 C3", 0)["midi"], 48);
+    check("transpose option", ev_at("transpose=2\nC4", 0)["midi"], 62);
+    // ties
+    let tied = music_note.events("tempo 60\nC4:h~ C4:q D4");
+    check("tie merges notes", len(tied), 2);
+    near("tied length", tied[0]["duration"], 3.0, 0.000000001);
+    check("no tie -> two notes", len(music_note.events("C4:h C4:q")), 2);
+    // repeats
+    check("repeat x3", len(music_note.events("|: C4 D4 :|x3")), 6);
+    check("plain repeat = twice", len(music_note.events("|: C4 :|")), 2);
+    check("nested repeats", len(music_note.events("|: C4 |: D4 :|x2 :|x2")), 6);
+    // chords
+    let ch = music_note.events("[C4 E4 G4]:h D4");
+    check("chord notes", len(ch), 4);
+    check("chord shares onset", ch[2]["start"], ch[0]["start"]);
+    near("note after chord", ch[3]["start"], 1.0, 0.000000001);
+    check("chord symbol", len(music_note.events("{Am7}")), 4);
+    let sc = music_note.events("strum=0.1\n[C4 E4 G4]");
+    near("strum offsets", sc[2]["start"], 0.2, 0.000001);
+    // dynamics
+    check("dynamic pp", ev_at("pp C4", 0)["velocity"], 36);
+    check("dynamic @mf", ev_at("@ff C4", 0)["velocity"], 112);
+    check("per-note velocity", ev_at("C4@100", 0)["velocity"], 100);
+    check("accent adds velocity", ev_at("C4!", 0)["velocity"], 100);
+    // tempo map
+    let tm = music_note.events("tempo 120\nC4 tempo=60 D4 E4");
+    near("tempo change: first quarter 0.5 s", tm[1]["start"], 0.5, 0.000000001);
+    near("tempo change: slower after", tm[2]["start"], 1.5, 0.000000001);
+    // drums + tracks
+    let d = music_note.events("track d drums\nkick:q [hat snare]:q");
+    check("drum events", len(d), 3);
+    check("drum name", d[1]["note"], "hat");
+    check("drum flag", d[0]["drum"], true);
+    check("gm drum number", d[0]["midi"], 36);
+    let multi = music_note.parse("title \"Demo\"\ncomposer Me\ntempo 90\ntime 3/4\nkey Dm\ntrack a piano\nC4\ntrack b bass vol=0.5 pan=0.4\nC2\ntrack a\nD4\n");
+    let info = music_note.score_info(multi);
+    check("title", info.title, "Demo");
+    check("composer", info.composer, "Me");
+    check("tempo", info.tempo, 90.0);
+    check("time signature", info.time, "3/4");
+    check("key", info.key, "Dm");
+    check("two tracks", len(info.tracks), 2);
+    check("track reopened appends", info.tracks[0]["notes"], 2);
+    check("track volume", info.tracks[1]["volume"], 0.5);
+    check("track instrument", info.tracks[1]["instrument"], "bass");
+    check("comments ignored", len(music_note.events("C4 # a comment\n// another\nD4")), 2);
+    check("multiline", len(music_note.events("C4 D4\nE4 F4\n\nG4")), 5);
+    check("bar lines ignored", len(music_note.events("C4 D4 | E4 F4 |")), 4);
+    music_note.free(multi);
+}
+
+// ------------------------------------------------------------------ synthesis
+fn synth() {
+    let names = music_note.instruments();
+    check("instrument count", len(names) >= 20, true);
+    var pitch_ok = 0;
+    var pitched = 0;
+    for (n in names) {
+        if (n != "drums" && n != "noise" && n != "organ" && n != "bass" && n != "bell" && n != "xylophone" && n != "808" && n != "cowbell" && n != "slap") {
+            let a = music_note.note("A3", 1.0, "instrument=" + n);
+            let p = music_note.pitch(a, "start=0.25 min=80 max=1000");
+            pitched += 1;
+            if (p.voiced && p.freq > 217.0 && p.freq < 223.0) { pitch_ok += 1; } else { println("   pitch off for", n, p.freq); }
+            music_note.free(a);
+        }
+    }
+    check("every pitched instrument plays A3 in tune", pitch_ok, pitched);
+    for (d in music_note.drums()) {
+        let a = music_note.drum(d);
+        let st = music_note.stats(a);
+        if (st.peak > 1.0 || st.silent) { check("drum " + d + " level", st.peak, "0..1"); }
+        music_note.free(a);
+    }
+    check("drums never clip", true, true);
+    let t = music_note.tone("sine", 1000.0, 1.0, "amp=0.5");
+    near("tone peak", music_note.stats(t).peak, 0.5, 0.001);
+    near("tone length", music_note.info(t).seconds, 1.0, 0.001);
+    near("tone spectrum peak", music_note.spectrum(t, "size=8192 start=0.1").peak_freq, 1000.0, 1.0);
+    near("square has odd harmonics", music_note.spectrum(music_note.tone("square", 500.0, 1.0), "size=8192 start=0.1").peak_freq, 500.0, 2.0);
+    check("tone from note name", music_note.info(music_note.tone("sine", "A4", 0.1)).frames, 4410);
+    near("sweep ends high", music_note.spectrum(music_note.sweep(200.0, 4000.0, 1.0), "size=2048 start=0.9").peak_freq, 3200.0, 900.0);
+    check("noise kinds", music_note.stats(music_note.noise("pink", 0.5)).silent, false);
+    near("additive harmonics", music_note.spectrum(music_note.tone("sine", 200.0, 1.0, "harmonics=0,1"), "size=8192 start=0.1").peak_freq, 400.0, 1.0);
+
+    let score = "tempo 120\ntrack m piano\nC4 E4 G4 C5:h\ntrack b bass\nC2:w\ntrack d drums\nkick snare kick snare\n";
+    let a = music_note.render(score);
+    let st = music_note.stats(a);
+    check("render stereo", music_note.info(a).channels, 2);
+    near("render length (2.5 s + 1.5 s tail)", music_note.info(a).seconds, 4.0, 0.01);
+    check("render not silent", st.silent, false);
+    check("render never exceeds full scale", st.peak <= 1.0, true);
+    check("render solo track", music_note.stats(music_note.render(score, "solo=b")).silent, false);
+    let mono = music_note.render(score, "mono=true");
+    check("render mono option", music_note.info(mono).channels, 1);
+    let fast = music_note.render(score, "speed=2 tail=0");
+    near("speed option halves duration", music_note.info(fast).seconds, 1.25, 0.01);
+    let again = music_note.render(score);
+    check("rendering is deterministic", music_note.stats(again).rms, st.rms);
+    let click = music_note.click_track(120.0, 8);
+    near("click track length", music_note.info(click).seconds, 4.05, 0.01);
+}
+
+// ------------------------------------------------------------------ DSP
+fn dsp() {
+    let lo = music_note.tone("sine", 100.0, 1.0, "amp=0.5");
+    let hi = music_note.tone("sine", 3000.0, 1.0, "amp=0.5");
+    let both = music_note.mix([lo, hi]);
+    near("mix sums", music_note.stats(both).rms_db, -6.0, 0.2);
+    let l = music_note.lowpass(both, 400.0, "slope=24");
+    near("lowpass keeps only the low sine", music_note.stats(l).rms_db, -9.03, 0.3);
+    let h = music_note.highpass(both, 1000.0, "slope=24");
+    near("highpass keeps only the high sine", music_note.stats(h).rms_db, -9.03, 0.3);
+    let bp = music_note.bandpass(both, 3000.0, 4.0);
+    near("bandpass passes its centre", music_note.spectrum(bp, "size=8192 start=0.2").peak_freq, 3000.0, 3.0);
+    let nt = music_note.notch(both, 3000.0, 8.0);
+    near("notch removes its centre", music_note.stats(nt).rms_db, -9.03, 0.5);
+    let pk = music_note.filter(lo, "peak", 100.0, "gain=6 q=1");
+    near("peaking boost +6 dB", music_note.stats(pk).rms_db - music_note.stats(lo).rms_db, 6.0, 0.3);
+    let eq = music_note.eq(lo, ["peak freq=100 gain=-6 q=1", "highshelf freq=8000 gain=3"]);
+    near("eq cut", music_note.stats(eq).rms_db - music_note.stats(lo).rms_db, -6.0, 0.4);
+
+    near("gain -6 dB", music_note.stats(music_note.gain(lo, -6.0)).peak, 0.2506, 0.002);
+    near("normalize", music_note.stats(music_note.normalize(lo, -3.0)).peak_db, -3.0, 0.01);
+    let lm = music_note.limiter(music_note.gain(lo, 12.0), "ceiling=-3");
+    check("limiter holds the ceiling", music_note.stats(lm).peak_db <= -2.99, true);
+    let cp = music_note.compressor(music_note.tone("sine", 440.0, 1.0, "amp=0.9"), "threshold=-20 ratio=8 attack=0.001");
+    check("compressor reduces level", music_note.stats(cp).rms_db < -14.0, true);
+    check("gate silences quiet audio", music_note.stats(music_note.gate(music_note.gain(lo, -70.0), "threshold=-50")).peak < 0.0005, true);
+    near("fade out reaches silence", music_note.stats(music_note.slice(music_note.fade(lo, 0.0, 0.5), "start=0.99")).peak, 0.0, 0.01);
+    near("slice length", music_note.info(music_note.slice(lo, "start=0.25 end=0.75")).seconds, 0.5, 0.001);
+    near("concat with crossfade", music_note.info(music_note.concat([lo, lo], 0.1)).seconds, 1.9, 0.001);
+    near("loop", music_note.info(music_note.loop(lo, 3)).seconds, 3.0, 0.001);
+    check("reverse keeps length", music_note.info(music_note.reverse(lo)).frames, 44100);
+    near("mix_at extends", music_note.info(music_note.mix_at(lo, lo, 0.5)).seconds, 1.5, 0.001);
+    check("to_mono", music_note.info(music_note.to_mono(music_note.pan(lo, 0.5))).channels, 1);
+    check("to_stereo", music_note.info(music_note.to_stereo(lo)).channels, 2);
+    let pn = music_note.pan(lo, -1.0);
+    near("hard-left pan silences the right channel", music_note.stats(music_note.channel(pn, 1)).peak, 0.0, 0.001);
+    near("trim silence", music_note.info(music_note.trim_silence(music_note.mix_at(music_note.silence(1.0), lo, 0.5))).seconds, 1.0, 0.01);
+
+    // time / pitch
+    near("resample keeps pitch", music_note.spectrum(music_note.resample(hi, 22050), "size=4096 start=0.2").peak_freq, 3000.0, 3.0);
+    check("resample rate", music_note.info(music_note.resample(hi, 22050)).rate, 22050);
+    near("speed 2x -> octave up", music_note.spectrum(music_note.speed(hi, 2.0), "size=4096 start=0.1").peak_freq, 6000.0, 6.0);
+    let ts = music_note.time_stretch(hi, 1.5);
+    near("time_stretch length", music_note.info(ts).seconds, 1.5, 0.01);
+    near("time_stretch keeps pitch", music_note.spectrum(ts, "size=4096 start=0.4").peak_freq, 3000.0, 12.0);
+    near("pitch_shift +12", music_note.spectrum(music_note.pitch_shift(hi, 12.0), "size=4096 start=0.3").peak_freq, 6000.0, 20.0);
+    near("pitch_shift keeps length", music_note.info(music_note.pitch_shift(hi, 7.0)).seconds, 1.0, 0.02);
+
+    // time-based effects
+    let click = music_note.click_track(120.0, 1);
+    check("delay extends by its tail", music_note.info(music_note.delay(click, 0.2, "feedback=0.5")).seconds > music_note.info(click).seconds + 1.0, true);
+    check("delay no tail", music_note.info(music_note.delay(click, 0.2, "tail=0")).frames, music_note.info(click).frames);
+    let rv = music_note.reverb(click, "mix=0.4");
+    check("reverb is stereo and longer", music_note.info(rv).channels == 2 && music_note.info(rv).seconds > music_note.info(click).seconds, true);
+    check("chorus", music_note.stats(music_note.chorus(lo)).silent, false);
+    check("flanger", music_note.stats(music_note.flanger(lo)).silent, false);
+    check("phaser", music_note.stats(music_note.phaser(lo)).silent, false);
+    check("tremolo modulates", music_note.stats(music_note.tremolo(lo, 5.0, 1.0)).rms_db < music_note.stats(lo).rms_db - 2.0, true);
+    check("vibrato", music_note.stats(music_note.vibrato(lo)).silent, false);
+    let rmf = music_note.spectrum(music_note.ring_mod(hi, 500.0), "size=8192 start=0.1").peak_freq;
+    check("ring mod moves energy to the sidebands", rmf > 2400.0 && rmf < 2600.0 || rmf > 3400.0 && rmf < 3600.0, true);
+    check("distortion adds level", music_note.stats(music_note.distortion(music_note.gain(lo, -20.0), "drive=20")).rms > 0.3, true);
+    check("bitcrush", music_note.stats(music_note.bitcrush(lo, 3, 8)).silent, false);
+    check("dc_block", music_note.stats(music_note.dc_block(lo)).silent, false);
+    let ch = music_note.chain(lo, ["lowpass freq=2000", "reverb mix=0.2", "gain db=-6"]);
+    check("chain applies in order", music_note.info(ch).channels, 2);
+    check("effects list", len(music_note.effects()) > 30, true);
+
+    // convolution
+    let imp = music_note.from_samples([1.0, 0.0, 0.0, 0.0], 44100, 1);
+    let same = music_note.convolve(lo, imp, "normalize=false");
+    near("convolution with a unit impulse is identity", music_note.stats(same).rms, music_note.stats(lo).rms, 0.0001);
+    let ir = music_note.impulse_response(0.5, "decay=0.3");
+    near("convolution reverb tail", music_note.info(music_note.convolve(lo, ir, "mix=0.5")).seconds, 1.5, 0.001);
+}
+
+// ------------------------------------------------------------------ analysis
+fn analysis() {
+    let a = music_note.tone("sine", 261.63, 1.0);
+    let p = music_note.pitch(a, "start=0.2");
+    check("pitch note", p.note, "C4");
+    near("pitch freq", p.freq, 261.63, 0.5);
+    check("noise is not voiced", music_note.pitch(music_note.noise("white", 1.0), "start=0.2").voiced, false);
+    let f = music_note.fft([1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0]);
+    check("fft peak bins", f["mag"][2], 4.0);
+    let inv = music_note.fft(f, true);
+    near("inverse fft", inv["re"][0], 1.0, 0.000000001);
+    check("window", len(music_note.window("hann", 64)), 64);
+    near("hann ends at 0", music_note.window("hann", 64)[0], 0.0, 0.000000000001);
+    let ck = music_note.click_track(120.0, 16);
+    check("onsets found", len(music_note.onsets(ck)) >= 15, true);
+    near("bpm detection", music_note.bpm(ck).bpm, 120.0, 2.0);
+    let s = music_note.samples(a, "start=0 count=5");
+    check("samples count", len(s), 5);
+    let back = music_note.from_samples(music_note.samples(a, "count=100"), 44100, 1);
+    check("from_samples round trip", music_note.info(back).frames, 100);
+    check("waveform points", len(music_note.waveform(a, 50)["max"]), 50);
+    check("stats silent", music_note.stats(music_note.silence(0.1)).silent, true);
+}
+
+// ------------------------------------------------------------------ files
+fn files() {
+    let t = music_note.tone("sine", 440.0, 0.25, "amp=0.5");
+    var ok = 0;
+    for (b in ["8", "16", "24", "32", "float"]) {
+        music_note.save_wav(t, "/tmp/kc_mn_test.wav", "bits=" + b);
+        let back = music_note.load_wav("/tmp/kc_mn_test.wav");
+        var tol = 0.0001;
+        var d = music_note.stats(back).peak - 0.5;
+        if (d < 0) { d = 0 - d; }
+        if (b == "8") { tol = 0.02; }
+        if (music_note.info(back).frames == music_note.info(t).frames && d < tol) { ok += 1; }
+    }
+    check("wav round trip at every bit depth", ok, 5);
+    let wi = music_note.wav_info("/tmp/kc_mn_test.wav");
+    check("wav_info float", wi["float"], true);
+    check("wav_info rate", wi.rate, 44100);
+    // legacy melody form still works and is a mono 16-bit sine file
+    let n = music_note.to_wav(["C4", "D4", "rest", "E4"], "/tmp/kc_mn_legacy.wav", 0.25);
+    check("legacy to_wav returns the sample count", n, 44100);
+    let lw = music_note.wav_info("/tmp/kc_mn_legacy.wav");
+    check("legacy to_wav is mono 16-bit", lw.channels * 100 + lw.bits, 116);
+    // new forms of to_wav
+    let frames = music_note.to_wav("tempo 120\nC4 E4 G4", "/tmp/kc_mn_new.wav", "tail=0");
+    check("to_wav notation", frames, 66150);
+    check("to_wav notes with options", music_note.to_wav(["C4", "E4"], "/tmp/kc_mn_arr.wav", "seconds=0.5 instrument=pluck tail=0"), 44100);
+    check("to_wav audio", music_note.to_wav(t, "/tmp/kc_mn_audio.wav", "bits=24"), 11025);
+    // midi
+    let bytes = music_note.to_midi("tempo 100\ntrack a piano\nC4 D4\ntrack d drums\nkick", "/tmp/kc_mn_test.mid");
+    check("midi size > header", bytes > 60, true);
+    let fs = fbin.open("/tmp/kc_mn_test.mid");
+    check("midi header", fbin.read_string(fs, 4), "MThd");
+    fbin.close(fs);
+    // handle lifecycle
+    let tmp = music_note.tone("sine", 440.0, 0.1);
+    music_note.free(tmp);
+    check("freed audio prints as freed", "" + tmp, "<audio (freed)>");
+}
+
+
+// ------------------------------------------------------------------ phonk / funk
+fn genres() {
+    check("four styles", len(music_note.groove_styles()), 4);
+    check("18 drum voices", len(music_note.drums()), 18);
+    check("production instruments exist", music_note.instruments()[0] == "sine" && len(music_note.instruments()) >= 26, true);
+    let sw = music_note.events("tempo=60\nswing16=0.5\nC4:s D4:s E4:s F4:s");
+    near("swing16 pushes the 2nd sixteenth late", sw[1]["start"], 0.375, 0.000001);
+    near("swing16 leaves the 1st/3rd alone", sw[2]["start"], 0.5, 0.000001);
+    // 808 portamento: a tenuto (^) note slides into the next one on a glide track
+    let slide = music_note.render("tempo 120\ntrack b 808 glide=0.2\nE1:2b^ A1:2b", "tail=0");
+    let plain = music_note.render("tempo 120\ntrack b 808\nE1:2b^ A1:2b", "tail=0");
+    let ps = music_note.spectrum(music_note.slice(slide, "start=1.0 end=1.08"), "size=4096").peak_freq;
+    let pp = music_note.spectrum(music_note.slice(plain, "start=1.0 end=1.08"), "size=4096").peak_freq;
+    check("808 glide starts below the target pitch", ps < pp - 4.0, true);
+    near("808 glide arrives at the target", music_note.spectrum(music_note.slice(slide, "start=1.6 end=1.9"), "size=8192").peak_freq, 55.0, 1.5);
+    // sidechain
+    let kick = music_note.render("tempo 120\ntrack k drums\nkick:q r:q kick:q r:q", "tail=0");
+    let duck = music_note.sidechain(music_note.tone("sine", 220.0, 2.0, "channels=2"), kick, "depth=0.9");
+    check("sidechain ducks on the kick", music_note.stats(music_note.slice(duck, "start=0 end=0.03")).rms * 2.0 < music_note.stats(music_note.slice(duck, "start=0.4 end=0.5")).rms, true);
+    // production effects
+    let t = music_note.tone("saw", 110.0, 1.0, "amp=0.4");
+    check("saturate adds level", music_note.stats(music_note.saturate(t, "drive=4")).rms > music_note.stats(t).rms, true);
+    check("auto-wah (lfo)", music_note.stats(music_note.wah(t, "rate=2")).silent, false);
+    check("auto-wah (envelope)", music_note.stats(music_note.wah(t, "mode=env")).silent, false);
+    check("vinyl adds noise", music_note.stats(music_note.vinyl(music_note.silence(1.0), "level=0.05")).silent, false);
+    var presets_ok = 0;
+    for (p in ["phonk", "funk", "clean", "loud", "lofi", "tape"]) { if (music_note.stats(music_note.master(t, p)).peak <= 1.0) { presets_ok += 1; } }
+    check("every master preset stays below full scale", presets_ok, 6);
+    check("filter names work as chain effects", music_note.info(music_note.chain(t, ["peak freq=500 gain=3", "lowshelf freq=100 gain=2", "highshelf freq=8000 gain=-2", "saturate drive=2"])).frames, 44100);
+    for (i in ["808", "cowbell", "clav", "slap", "wah", "stab"]) { check("instrument " + i + " renders", music_note.stats(music_note.note("A2", 0.5, "instrument=" + i)).silent, false); }
+    check("808 drum", music_note.stats(music_note.drum("kick808")).silent, false);
+
+    // generators: reproducible, valid, every bar adds up
+    var all_valid = 0;
+    for (st in music_note.groove_styles()) {
+        let a = music_note.groove(st, "bars=8 seed=3");
+        let b = music_note.groove(st, "bars=8 seed=3");
+        let c = music_note.groove(st, "bars=8 seed=4");
+        check(st + " is reproducible from its seed", a == b, true);
+        check(st + " changes with the seed", a == c, false);
+        let info = music_note.score_info(music_note.parse(a, "strict_bars"));
+        near(st + " length is 8 bars", info.beats, 32.0, 0.001);
+        if (info.notes > 100 && len(info.tracks) >= 9) { all_valid += 1; }
+    }
+    check("every style fills its tracks", all_valid, 4);
+    for (k in range(12)) {
+        let txt = music_note.groove("funk", "bars=" + str(k + 1) + " seed=" + str(k * 5 + 1) + " intensity=" + str((k % 5) / 4.0));
+        music_note.parse(txt, "strict_bars");
+    }
+    check("odd bar counts and intensities stay valid", true, true);
+    let ph = music_note.groove("phonk", "bars=4 seed=9 bpm=142 key=Am");
+    check("phonk honours bpm", music_note.score_info(ph).tempo, 142.0);
+    let ev = music_note.events(ph, "bass");
+    check("phonk 808 plays the root of Am (A1 = 33)", ev[0]["midi"], 33);
+    check("phonk has cowbell lead and 808", music_note.score_info(ph).tracks[5]["instrument"], "808");
+    check("funk bass is a slap bass", music_note.score_info(music_note.groove("funk")).tracks[5]["instrument"], "slap");
+
+    // produce / stems
+    var finite = 0;
+    for (st in music_note.groove_styles()) {
+        let au = music_note.produce(st, "bars=4 seed=2");
+        let s = music_note.stats(au);
+        if (!s.silent && s.peak <= 1.0 && s.rms_db > -30.0 && s.rms_db < -6.0) { finite += 1; } else { println("   bad produce", st, s); }
+        music_note.free(au);
+    }
+    check("produce returns a mastered, non-clipping mix for every style", finite, 4);
+    let bpm = 150.0;
+    let p = music_note.produce("drift_phonk", "bars=4 seed=2 tail=1");
+    near("produce length = bars + tail", music_note.info(p).seconds, 4.0 * 4.0 * 60.0 / bpm + 1.0, 0.05);
+    check("master=none skips mastering", music_note.stats(music_note.produce("funk", "bars=2 master=none")).silent, false);
+    let st = music_note.stems("phonk", "bars=2 seed=2");
+    var ducked = 0;
+    var names = "";
+    for (s in st) { if (s["ducked"]) { ducked += 1; } names = names + s["name"] + " "; }
+    check("stems include kick", names == "" , false);
+    check("stems: kick is the key, 4 ducked tracks", ducked, 4);
+    check("stems are audio", music_note.info(st[0]["audio"]).channels, 2);
+}
+
+// ------------------------------------------------------------------ KCM: multiline, patterns, timestamps, samples, includes
+fn kcm() {
+    // --- multiline constructs
+    let e = music_note.events("tempo 120\n/* a block\n   comment */ C4 D4 \\\n E4 F4\n[C4\n E4\n G4]:h\n");
+    check("continuation + block comment + multi-line chord", len(e), 7);
+    near("continued line keeps timing", e[3]["start"], 1.5, 0.000001);
+    check("multi-line chord notes share an onset", e[5]["start"] == e[4]["start"] && e[6]["start"] == e[4]["start"], true);
+    check("block comment inside a line", len(music_note.events("C4 /* skip D4 */ E4")), 2);
+    // --- patterns
+    let pt = "tempo 120\npattern riff\n  C4:e D4:e\n  E4:q\nend\ntrack a\n$riff $riff*2 G4\n";
+    let pe = music_note.events(pt);
+    check("pattern expansion count", len(pe), 10);
+    near("pattern repeat timing", pe[8]["start"], 2.5, 0.000001);
+    check("nested patterns", len(music_note.events("pattern a\nC4 D4\nend\npattern b\n$a $a\nend\n$b*2")), 8);
+    check("repeats inside patterns", len(music_note.events("pattern r\n|: C4 :|x3\nend\n$r")), 3);
+    check("option tokens inside patterns", ev_at("pattern p\nvel=100\nC4\nend\n$p", 0)["velocity"], 100);
+    // --- timestamps
+    let ts = "tempo 120\ntrack a\nC4\nat=2.5s D4\nwait=1s E4\nmark=here F4\nat=0:10 G4\nat=here A4\n";
+    let te = music_note.events(ts);
+    near("at= jumps to an absolute time", te[1]["start"], 2.5, 0.000001);
+    near("wait= advances by seconds", te[2]["start"], 4.0, 0.000001);
+    near("at=m:ss", te[4]["start"], 10.0, 0.000001);
+    near("at=marker jumps back", te[5]["start"], 4.5, 0.000001);
+    check("event timecode", te[4]["timecode"], "00:00:10.000");
+    let mk = music_note.markers(ts);
+    check("one marker", len(mk), 1);
+    near("marker time", mk[0]["time"], 4.5, 0.000001);
+    check("marker name and track", mk[0]["name"] + "/" + mk[0]["track"], "here/a");
+    let mk2 = music_note.markers("tempo 100\nmark outro 1:30\nmark intro 0:05\nC4");
+    check("timed markers sorted by time", mk2[0]["name"] + "," + mk2[1]["name"], "intro,outro");
+    near("timed marker seconds", mk2[1]["time"], 90.0, 0.000001);
+    near("at=marker jumps to a timed marker", ev_at("tempo 60\nmark m 3\ntrack a\nat=m C4", 0)["start"], 3.0, 0.000001);
+    near("timestamps use ms units", ev_at("at=500ms C4", 0)["start"], 0.5, 0.000001);
+    near("timestamps use 1m30s", ev_at("at=1m30s C4", 0)["start"], 90.0, 0.000001);
+    near("timestamps follow the tempo map", ev_at("tempo 60\ntrack a\nC4:q tempo=120 at=3s D4", 1)["start"], 3.0, 0.000001);
+    check("timecode", music_note.timecode(3725.5), "01:02:05.500");
+    check("timecode with frames", music_note.timecode(61.5, "fps=30"), "00:01:01:15");
+    near("time_seconds", music_note.time_seconds("0:01:02.5"), 62.5, 0.000001);
+    near("time_seconds units", music_note.time_seconds("1m30s"), 90.0, 0.000001);
+    near("length directive sets the output duration", music_note.info(music_note.render("tempo 120\nlength 3.0\nC4 D4", "tail=0")).seconds, 3.0, 0.001);
+    check("score_info reports length and markers", music_note.score_info(ts).markers, 1);
+    // --- samples
+    let tone = music_note.tone("sine", 440.0, 0.5, "amp=0.5");
+    music_note.save_wav(tone, "/tmp/kc_mn_s440.wav");
+    let blk = music_note.embed(tone, "name=beep gain=-3 root=A4");
+    check("embed writes a sample block", blk[0] == "s" && len(blk) > 200, true);
+    let sc = music_note.parse("tempo 120\nsample file1 \"/tmp/kc_mn_s440.wav\" root=A4\n" + blk + "track t sample=file1\nA4:q C5:q\ntrack u\n&beep:q file1\n");
+    let sl = music_note.sample_list(sc);
+    check("two samples declared", len(sl), 2);
+    check("file sample source", sl[0]["source"], "/tmp/kc_mn_s440.wav");
+    check("inline sample source", sl[1]["source"], "inline");
+    near("inline sample keeps its length", sl[1]["seconds"], 0.5, 0.0001);
+    check("inline sample options", sl[1]["gain"], -3.0);
+    check("inline sample root", sl[1]["root"], "A4");
+    let se = music_note.events(sc);
+    check("sample events", len(se), 4);
+    check("sample name on the event", se[2]["sample"] + "," + se[3]["sample"], "beep,file1");
+    let au = music_note.render(sc, "tail=0.2");
+    check("sample render is not silent", music_note.stats(au).silent, false);
+    let pitched = music_note.render("tempo 120\nsample s1 \"/tmp/kc_mn_s440.wav\" root=A4\ntrack t sample=s1\nC5:q", "tail=0");
+    near("pitched sample plays at the note's pitch", music_note.spectrum(music_note.slice(pitched, "start=0.02 end=0.4"), "size=8192").peak_freq, 523.25, 3.0);
+    let trig = music_note.render("tempo 120\nsample s1 \"/tmp/kc_mn_s440.wav\" root=A4\ntrack t\ntranspose=12\n&s1", "tail=0");
+    near("trigger transpose shifts a sample an octave", music_note.spectrum(music_note.slice(trig, "start=0.02 end=0.2"), "size=8192").peak_freq, 880.0, 4.0);
+    // trim, gain, reverse, tempo sync
+    music_note.save_wav(music_note.tone("sine", 220.0, 1.0, "amp=0.5"), "/tmp/kc_mn_s1s.wav");
+    let trim = music_note.render("sample x \"/tmp/kc_mn_s1s.wav\" start=0.25 end=0.75 oneshot\ntrack t\n&x", "tail=0");
+    near("sample start/end trim", music_note.info(trim).seconds, 0.55, 0.06);
+    let g0 = music_note.stats(music_note.render("sample x \"/tmp/kc_mn_s1s.wav\"\ntrack t\n&x:q", "tail=0")).rms;
+    let g6 = music_note.stats(music_note.render("sample x \"/tmp/kc_mn_s1s.wav\" gain=-6\ntrack t\n&x:q", "tail=0")).rms;
+    near("sample gain in dB", g6 / g0, 0.5012, 0.01);
+    let sync = music_note.render("tempo 60\nsample x \"/tmp/kc_mn_s1s.wav\" bpm=120 oneshot\ntrack t\n&x", "tail=0");
+    near("tempo-synced sample stretches to the score tempo", music_note.info(sync).seconds, 2.05, 0.1);
+    let nosync = music_note.render("tempo 120\nsample x \"/tmp/kc_mn_s1s.wav\" bpm=120 oneshot\ntrack t\n&x", "tail=0");
+    near("no stretch when tempos match", music_note.info(nosync).seconds, 1.05, 0.05);
+    let host = music_note.parse("tempo 120\ntrack t\nmine mine", "", ["mine"], [tone]);
+    check("samples supplied by the host program", len(music_note.events(host)), 2);
+    check("host sample source", music_note.sample_list(host)[0]["source"], "host");
+    let dr = music_note.events("tempo 120\nsample clap2 \"/tmp/kc_mn_s440.wav\"\ntrack d drums\nkick clap2 snare");
+    check("sample names work like drum names", dr[1]["sample"], "clap2");
+    // --- include + parse_file + relative paths
+    io.write_file("/tmp/kc_mn_inc.kcm", "pattern beat\n  kick:q snare:q\nend\n");
+    io.write_file("/tmp/kc_mn_song.kcm", "title Included\ntempo 100\ninclude \"kc_mn_inc.kcm\"\nsample s \"kc_mn_s440.wav\" oneshot\ntrack d drums\n$beat*2\ntrack c\n&s\n");
+    let sf = music_note.parse_file("/tmp/kc_mn_song.kcm", "strict_bars");
+    let fi = music_note.score_info(sf);
+    check("parse_file title", fi.title, "Included");
+    check("include brought in the pattern", fi.tracks[0]["notes"], 4);
+    check("relative sample path resolved against the file", fi.samples, 1);
+    check("render a file-based score", music_note.stats(music_note.render(sf)).silent, false);
+    let based = music_note.parse("sample s \"kc_mn_s440.wav\"\ntrack c\n&s", "base=/tmp");
+    check("base= option for text scores", len(music_note.events(based)), 1);
+    check("render text with base=", music_note.stats(music_note.render("sample s \"kc_mn_s440.wav\"\ntrack c\n&s", "base=/tmp tail=0")).silent, false);
+    // inline round trip through a .kcm file
+    io.write_file("/tmp/kc_mn_inline.kcm", "tempo 120\n" + blk + "track t\n&beep\n");
+    let il = music_note.render(music_note.parse_file("/tmp/kc_mn_inline.kcm"), "tail=0");
+    near("inline audio survives a file round trip", music_note.info(il).seconds, 0.55, 0.06);
+    // embedding an existing wav file by path
+    let emb2 = music_note.embed("/tmp/kc_mn_s440.wav", "name=fromfile");
+    check("embed from a wav path", music_note.sample_list(music_note.parse(emb2 + "track t\n&fromfile"))[0]["seconds"], 0.5);
+}
+
+fn main() {
+    theory();
+    notation();
+    synth();
+    dsp();
+    analysis();
+    files();
+    genres();
+    kcm();
+    println("PASSED", passed);
+    println("FAILED", failed);
+}

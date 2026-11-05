@@ -1,0 +1,49 @@
+import std.mmu;
+
+var passed = 0;
+var failed = 0;
+fn check(name: string, got, want) {
+    if (got == want) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want); }
+}
+
+fn main() {
+    let info = mmu.host_info();
+    check("page size is a power of two", info.page_size >= 4096 && info.page_size % 4096 == 0, true);
+    let pg = info.page_size;
+
+    let r = mmu.host_alloc(4 * pg, "r,w,guard");
+    check("alloc", r != null, true);
+    check("fresh memory is zero", mmu.host_read64(r, 0), 0);
+    mmu.host_write32(r, 16, 0xFEEDBEEF);
+    check("read back", mmu.host_read32(r, 16), 0xFEEDBEEF);
+    mmu.host_write_bytes(r, 100, "hello");
+    check("bytes", mmu.host_read_bytes(r, 100, 5), "hello");
+    check("out of bounds is an error value", mmu.host_read8(r, 4 * pg), null);
+
+    check("protect page 1 read-only", mmu.host_protect(r, pg, pg, "r"), true);
+    check("write to RO page refused (no SIGSEGV)", mmu.host_write8(r, pg + 1, 1), false);
+    check("read of RO page ok", mmu.host_read8(r, pg + 1), 0);
+    check("protect page 2 none", mmu.host_protect(r, 2 * pg, pg, "none"), true);
+    check("read of PROT_NONE page refused", mmu.host_read8(r, 2 * pg), null);
+    check("protection runs", len(mmu.host_pages(r)), 4);
+    check("misaligned protect is fatal-free? (aligned ok)", mmu.host_protect(r, 2 * pg, pg, "r,w"), true);
+
+    check("resident count", mmu.host_resident(r) >= 1, true);
+    mmu.host_advise(r, 0, pg, "dontneed");
+    check("dontneed zeroes", mmu.host_read32(r, 16), 0);
+    check("residency string length", len(mmu.host_residency(r)), 4);
+
+    let tr = mmu.host_translate(r, 100, true);
+    check("pagemap says present", tr.present, true);
+
+    let maps = mmu.host_maps();
+    check("maps non-empty", len(maps) > 3, true);
+    let q = mmu.host_query(mmu.host_address(r) + pg);
+    check("region appears in the real memory map", q != null && q.size >= pg, true);
+    check("host_stats", mmu.host_stats().minor_faults > 0, true);
+
+    check("free", mmu.host_free(r), true);
+    check("double free is a clean false", mmu.destroy(r), false);
+    println("PASSED", passed, "FAILED", failed);
+}

@@ -1,0 +1,108 @@
+// std.nn regression test: every layer, activation, loss and container is checked against
+// numerical (central-difference) gradients, for both parameters and inputs. Prints one summary line.
+import std.nn;
+
+fn chk(name: string, model, loss, x, y) -> int {
+    let r = nn.gradcheck(model, loss, x, y, "samples", 80);
+    if (!r.ok) {
+        print("FAIL", name, "max_rel_err =", r.max_rel_error, " worst:", r.worst);
+        return 1;
+    }
+    return 0;
+}
+
+fn part1() -> int {
+    var bad = 0;
+
+    nn.seed(1);
+    let x = nn.randn([6, 5]);
+    let y = nn.randn([6, 3]);
+    let cls = [0, 2, 1, 1, 0, 2];
+
+    bad = bad + chk("dense+tanh mse", nn.sequential([nn.dense(5, 4), nn.tanh(), nn.dense(4, 3)]), "mse", x, y);
+    bad = bad + chk("dense no bias", nn.sequential([nn.dense(5, 3, "bias", false)]), "mse", x, y);
+    bad = bad + chk("mlp relu ce", nn.mlp([5, 8, 3]), "ce", x, cls);
+    bad = bad + chk("ce label smoothing", nn.mlp([5, 8, 3]), nn.loss("ce", "smoothing", 0.1), x, cls);
+    bad = bad + chk("ce one-hot target", nn.mlp([5, 8, 3]), "ce", x, nn.one_hot(cls, 3));
+    bad = bad + chk("ce ignore_index", nn.mlp([5, 8, 3]), nn.loss("ce", "ignore_index", 1), x, cls);
+
+    let acts = ["gelu", "sigmoid", "tanh", "softplus", "silu", "mish", "elu", "selu", "leaky_relu", "softsign", "hard_sigmoid", "relu6", "relu"];
+    for (a in acts) {
+        bad = bad + chk("act " + a, nn.sequential([nn.dense(5, 4), nn.activation(a), nn.dense(4, 3)]), "mse", x, y);
+    }
+    bad = bad + chk("softmax layer + mse", nn.sequential([nn.dense(5, 3), nn.softmax()]), "mse", x, y);
+    bad = bad + chk("log_softmax + nll", nn.sequential([nn.dense(5, 3), nn.log_softmax()]), "nll", x, cls);
+
+    bad = bad + chk("batchnorm", nn.sequential([nn.dense(5, 4), nn.batchnorm(4), nn.tanh(), nn.dense(4, 3)]), "mse", x, y);
+    bad = bad + chk("layernorm", nn.sequential([nn.dense(5, 4), nn.layernorm(4), nn.tanh(), nn.dense(4, 3)]), "mse", x, y);
+    bad = bad + chk("dropout (fixed mask)", nn.sequential([nn.dense(5, 6), nn.dropout(0.4), nn.dense(6, 3)]), "mse", x, y);
+    bad = bad + chk("residual", nn.sequential([nn.dense(5, 4), nn.residual([nn.dense(4, 4), nn.tanh()]), nn.dense(4, 3)]), "mse", x, y);
+
+    let pred = nn.randn([6, 3]);
+    let pm = nn.sequential([nn.dense(5, 3)]);
+    bad = bad + chk("huber", pm, nn.loss("huber", "delta", 0.5), x, y);
+    bad = bad + chk("mae", pm, "mae", x, y);
+    bad = bad + chk("logcosh", pm, "logcosh", x, y);
+    bad = bad + chk("bce_logits", pm, "bce_logits", x, nn.round(nn.rand([6, 3])));
+    bad = bad + chk("bce_logits pos_weight", pm, nn.loss("bce_logits", "pos_weight", 3.0), x, nn.round(nn.rand([6, 3])));
+    bad = bad + chk("bce (sigmoid)", nn.sequential([nn.dense(5, 3), nn.sigmoid()]), "bce", x, nn.round(nn.rand([6, 3])));
+    bad = bad + chk("hinge", pm, "hinge", x, nn.sub(nn.mul(nn.round(nn.rand([6, 3])), 2), 1));
+    bad = bad + chk("kl_div", nn.sequential([nn.dense(5, 3), nn.log_softmax()]), "kl", x, nn.softmax(nn.randn([6, 3])));
+
+    return bad;
+}
+
+fn part2() -> int {
+    var bad = 0;
+
+    nn.seed(7);
+    let img = nn.randn([3, 2, 7, 6]);
+    let t4 = nn.randn([3, 4]);
+    let cls = [1, 0, 3];
+
+    bad = bad + chk("conv2d basic + flatten", nn.sequential([nn.conv2d(2, 3, 3), nn.flatten(), nn.dense(3 * 5 * 4, 4)]), "mse", img, t4);
+    bad = bad + chk("conv2d stride2 pad1", nn.sequential([nn.conv2d(2, 3, 3, "stride", 2, "padding", 1), nn.flatten(), nn.dense(3 * 4 * 3, 4)]), "mse", img, t4);
+    bad = bad + chk("conv2d dilation2 same", nn.sequential([nn.conv2d(2, 2, 3, "dilation", 2, "padding", "same"), nn.flatten(), nn.dense(2 * 7 * 6, 4)]), "mse", img, t4);
+    bad = bad + chk("conv2d rect kernel [2,3]", nn.sequential([nn.conv2d(2, 2, [2, 3]), nn.flatten(), nn.dense(2 * 6 * 4, 4)]), "mse", img, t4);
+    bad = bad + chk("conv2d no bias", nn.sequential([nn.conv2d(2, 2, 2, "bias", false), nn.global_avg_pool(), nn.dense(2, 4)]), "mse", img, t4);
+    bad = bad + chk("maxpool2d", nn.sequential([nn.conv2d(2, 2, 1), nn.maxpool2d(2), nn.flatten(), nn.dense(2 * 3 * 3, 4)]), "mse", img, t4);
+    bad = bad + chk("avgpool2d pad", nn.sequential([nn.conv2d(2, 2, 1), nn.avgpool2d(3, "stride", 2, "padding", 1), nn.flatten(), nn.dense(2 * 4 * 3, 4)]), "mse", img, t4);
+    bad = bad + chk("conv+bn+relu cnn", nn.sequential([nn.conv2d(2, 3, 3, "padding", 1), nn.batchnorm(3), nn.relu(), nn.maxpool2d(2), nn.flatten(), nn.dense(3 * 3 * 3, 4)]), "ce", img, cls);
+
+    let seq = nn.randn([3, 2, 9]);
+    bad = bad + chk("conv1d", nn.sequential([nn.conv1d(2, 3, 3), nn.global_avg_pool(), nn.dense(3, 4)]), "mse", seq, t4);
+    bad = bad + chk("conv1d stride/pad", nn.sequential([nn.conv1d(2, 3, 3, "stride", 2, "padding", 1), nn.maxpool1d(2), nn.flatten(), nn.dense(3 * 2, 4)]), "mse", seq, t4);
+    bad = bad + chk("avgpool1d", nn.sequential([nn.conv1d(2, 2, 1), nn.avgpool1d(3), nn.flatten(), nn.dense(2 * 3, 4)]), "mse", seq, t4);
+
+    let s3 = nn.randn([3, 5, 2]);
+    bad = bad + chk("rnn last", nn.sequential([nn.rnn(2, 4), nn.dense(4, 4)]), "mse", s3, t4);
+    bad = bad + chk("lstm last", nn.sequential([nn.lstm(2, 4), nn.dense(4, 4)]), "mse", s3, t4);
+    bad = bad + chk("gru last", nn.sequential([nn.gru(2, 4), nn.dense(4, 4)]), "mse", s3, t4);
+    let ys = nn.randn([3, 5, 4]);
+    bad = bad + chk("rnn seq", nn.sequential([nn.rnn(2, 4, "return_sequences", true)]), "mse", s3, ys);
+    bad = bad + chk("lstm seq", nn.sequential([nn.lstm(2, 4, "return_sequences", true)]), "mse", s3, ys);
+    bad = bad + chk("gru seq", nn.sequential([nn.gru(2, 4, "return_sequences", true)]), "mse", s3, ys);
+    bad = bad + chk("stacked lstm->gru", nn.sequential([nn.lstm(2, 3, "return_sequences", true), nn.gru(3, 4), nn.dense(4, 4)]), "mse", s3, t4);
+    bad = bad + chk("lstm seq + time-distributed dense + ce", nn.sequential([nn.lstm(2, 4, "return_sequences", true), nn.dense(4, 3)]), "ce", s3, [[0,1,2,1,0],[2,2,1,0,1],[1,0,0,2,2]]);
+
+    let ids = [[1, 4, 2, 0], [3, 3, 1, 2], [0, 2, 4, 1]];
+    bad = bad + chk("embedding padding_idx", nn.sequential([nn.embedding(5, 3, "padding_idx", 0), nn.flatten(), nn.dense(12, 4)]), "mse", ids, t4);
+    bad = bad + chk("embedding + gru", nn.sequential([nn.embedding(5, 3), nn.gru(3, 4), nn.dense(4, 4)]), "mse", ids, t4);
+
+    let sa = nn.randn([2, 4, 6]);
+    let ta = nn.randn([2, 4, 6]);
+    bad = bad + chk("attention", nn.sequential([nn.attention(6, 2)]), "mse", sa, ta);
+    bad = bad + chk("attention causal 3 heads", nn.sequential([nn.attention(6, 3, "causal", true)]), "mse", sa, ta);
+    bad = bad + chk("pos_encoding + attention", nn.sequential([nn.pos_encoding(), nn.attention(6, 2)]), "mse", sa, ta);
+    bad = bad + chk("transformer_block", nn.sequential([nn.transformer_block(6, 2, 10)]), "mse", sa, ta);
+    bad = bad + chk("transformer_block causal", nn.sequential([nn.transformer_block(6, 3, 8, "causal", true), nn.layernorm(6)]), "mse", sa, ta);
+    bad = bad + chk("tiny GPT: embed+pe+block+head", nn.sequential([nn.embedding(7, 6), nn.pos_encoding(), nn.transformer_block(6, 2, 8, "causal", true), nn.dense(6, 7)]), "ce", [[1,2,3,4],[5,6,0,1]], [[2,3,4,5],[6,0,1,2]]);
+    bad = bad + chk("reshape layer", nn.sequential([nn.dense(4, 6), nn.reshape_layer([2, 3]), nn.flatten(), nn.dense(6, 4)]), "mse", t4, t4);
+
+    return bad;
+}
+
+fn main() {
+    let bad = part1() + part2();
+    print("gradcheck failures:", bad);
+}

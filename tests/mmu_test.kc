@@ -1,0 +1,176 @@
+import std.mmu;
+
+var passed = 0;
+var failed = 0;
+fn check(name: string, got, want) {
+    if (got == want) { passed += 1; println("ok   -", name); }
+    else { failed += 1; println("FAIL -", name, "| got:", got, "| want:", want); }
+}
+
+// ---------------------------------------------------------------- page-table basics on every architecture
+fn arch_roundtrip(arch: string) {
+    let ram = mmu.phys("64M");
+    let s = mmu.space(arch, ram);
+    check(arch + " map", mmu.map(s, 0x400000, 0x200000, "r,w,u"), true);
+    check(arch + " write/read", mmu.write32(s, 0x400008, 0xCAFEF00D) && mmu.read32(s, 0x400008) == 0xCAFEF00D, true);
+    check(arch + " lands in physical memory", mmu.phys_read(ram, 0x200008, 4), 0xCAFEF00D);
+    check(arch + " unmapped read faults", mmu.read8(s, 0x800000), null);
+    check(arch + " fault kind", mmu.last_fault().kind, "not_present");
+    let q = mmu.query(s, 0x400123);
+    check(arch + " query phys", q.phys, 0x200123);
+    var want_flags = "r,w,u";
+    if (arch == "x86_32") { want_flags = "r,w,x,u"; }
+    check(arch + " query flags", q.flags, want_flags);
+    check(arch + " verify clean", len(mmu.verify(s)), 0);
+    check(arch + " unmap", mmu.unmap(s, 0x400000, 4096), 1);
+    check(arch + " tables reclaimed", mmu.stats(s).table_frames, 1);
+    mmu.destroy(s);
+    check(arch + " destroy returns all frames", mmu.phys_info(ram).frames_used, 0);
+}
+fn main() {
+    for (a in mmu.archs()) { arch_roundtrip(a); }
+
+    // ---------------------------------------------------------------- raw PTE formats (known values)
+    check("x86_64 pte rw-user", mmu.hex(mmu.pte_encode("x86_64", 0x5000, "r,w,u")), "0x8000000000005007");
+    check("x86_64 pte rx", mmu.hex(mmu.pte_encode("x86_64", 0x5000, "r,x")), "0x0000000000005001");
+    check("x86_32 pte rw", mmu.hex(mmu.pte_encode("x86_32", 0x5000, "r,w"), 8), "0x00005003");
+    check("riscv pte rwx user", mmu.hex(mmu.pte_encode("riscv_sv39", 0x5000, "r,w,x,u")), "0x000000000000141f");
+    check("arm64 pte user rw page", mmu.pte_decode("arm64", mmu.pte_encode("arm64", 0x5000, "r,w,u,a,d")).flags, "r,w,u");
+    check("riscv reserved W-only", mmu.pte_decode("riscv_sv39", 0x5 * 0 + 0x1005).kind, "bad");
+    check("x86 large misaligned", mmu.pte_decode("x86_64", mmu.parse("0x203083"), 2097152).kind, "bad");
+    check("x86_64 canonical", mmu.is_canonical("x86_64", "0x0000800000000000"), false);
+    check("x86_64 canonical high", mmu.is_canonical("x86_64", "0xFFFF800000000000"), true);
+    check("canonical sign-extends", mmu.hex(mmu.canonical("x86_64", "0x0000800000000000")), "0xffff800000000000");
+    check("split x86_64", str(mmu.split("x86_64", 0x1234567000).indices), "[0, 72, 418, 359]");
+    check("root_reg riscv sv39", mmu.hex(mmu.root_reg(mmu.space("riscv_sv39", mmu.phys("1M"), "asid=3"))), "0x8000300000000000");
+
+    // ---------------------------------------------------------------- large pages, splitting, high half
+    let ram = mmu.phys("128M");
+    let s = mmu.space("x86_64", ram);
+    check("2M map", mmu.map(s, 0x200000, 0x400000, "r,w", 2097152), true);
+    check("2M misaligned va rejected", mmu.map(s, 0x201000, 0x400000, "r,w", 2097152), false);
+    check("2M query level", mmu.query(s, 0x2ff000).level, 1);
+    check("1G map", mmu.map(s, 0x40000000, 0, "r", 1073741824), true);
+    check("unmap middle of 2M splits", mmu.unmap(s, 0x280000, 4096), 1);
+    check("split leaves 4K pages", mmu.query(s, 0x27f000).level, 0);
+    check("split keeps translation", mmu.query(s, 0x27f000).phys, 0x47f000);
+    check("hole is unmapped", mmu.query(s, 0x280000), null);
+    check("stats after split", mmu.stats(s).pages["4K"], 511);
+    check("high half map", mmu.map(s, "0xFFFF800000000000", 0x7000000, "r,w,g"), true);
+    mmu.write64(s, "0xFFFF800000000000", 77);
+    check("high half read", mmu.read64(s, "0xFFFF800000000000"), 77);
+    check("non-canonical fault", mmu.read8(s, "0x0000800000000000"), null);
+    check("non-canonical vector", mmu.last_fault().vector, "#GP");
+    check("map_range huge", mmu.map_range(s, 0x80000000, 0x2000000, 0x600000, "r,w,huge"), 3);
+    check("map_range level", mmu.query(s, 0x80000000).level, 1);
+    check("protect range", mmu.protect(s, 0x80000000, 0x600000, "-w"), 3 * 512);
+    check("protect applied", mmu.query(s, 0x80000000).w, false);
+    check("write to RO faults", mmu.write8(s, 0x80000000, 1), false);
+    check("RO fault code", mmu.last_fault().code, 3);
+    check("1G page beyond RAM is reported", len(mmu.verify(s)), 1);
+    mmu.unmap(s, 0x40000000, 1073741824);
+    check("verify with mixed sizes", len(mmu.verify(s)), 0);
+
+    // ---------------------------------------------------------------- policy: user/supervisor, SMEP, SMAP, NX, WP
+    let p = mmu.space("x86_64", ram, "smap");
+    mmu.map(p, 0x1000, 0x10000, "r,w,u"); mmu.map(p, 0x2000, 0x11000, "r,w"); mmu.map(p, 0x3000, 0x12000, "r,x,u"); mmu.map(p, 0x4000, 0x13000, "r");
+    check("user reads user page", mmu.read8(p, 0x1000, "u"), 0);
+    check("user blocked from kernel page", mmu.read8(p, 0x2000, "u"), null);
+    check("kernel blocked by SMAP", mmu.read8(p, 0x1000, "s"), null);
+    check("SMAP fault is protection", mmu.last_fault().kind, "protection");
+    check("NX blocks exec", mmu.can(p, 0x1000, "x", "u"), false);
+    check("exec allowed", mmu.can(p, 0x3000, "x", "u"), true);
+    check("SMEP blocks kernel exec of user page", mmu.can(p, 0x3000, "x", "s"), false);
+    check("WP: kernel cannot write RO", mmu.write8(p, 0x4000, 1), false);
+    mmu.policy(p, "nowp");
+    check("WP off: kernel may write RO", mmu.write8(p, 0x4000, 1), true);
+    check("#PF error code user write", mmu.translate(p, 0x4000, "w", "u").code, 7);
+
+    // ---------------------------------------------------------------- accessed / dirty bits
+    let q = mmu.space("x86_64", ram);
+    mmu.map(q, 0x1000, 0x20000, "r,w");
+    check("A clear before use", mmu.query(q, 0x1000).accessed, false);
+    mmu.read8(q, 0x1000);
+    check("A set by read", mmu.query(q, 0x1000).accessed && !mmu.query(q, 0x1000).dirty, true);
+    mmu.write8(q, 0x1000, 1);
+    check("D set by write", mmu.query(q, 0x1000).dirty, true);
+    check("table entries get A too", mmu.walk(q, 0x1000).steps[0].raw % 64 >= 32, true);
+
+    // ---------------------------------------------------------------- TLB
+    let t = mmu.space("x86_64", ram, "tlb=16,ways=2");
+    mmu.map(t, 0x1000, 0x30000, "r,w");
+    mmu.read8(t, 0x1000); mmu.read8(t, 0x1000);
+    let ti = mmu.tlb_info(t);
+    check("tlb hit counted", ti.hits >= 1 && ti.valid == 1, true);
+    mmu.unmap(t, 0x1000, 4096);
+    check("auto shootdown on unmap", mmu.tlb_info(t).valid, 0);
+    let m = mmu.space("x86_64", ram, "manual_tlb");
+    mmu.map(m, 0x1000, 0x31000, "r,w");
+    mmu.write8(m, 0x1000, 5);
+    mmu.unmap(m, 0x1000, 4096);
+    check("stale TLB entry still translates", mmu.read8(m, 0x1000), 5);
+    mmu.tlb_invalidate(m, 0x1000);
+    check("after INVLPG it faults", mmu.read8(m, 0x1000), null);
+
+    // ---------------------------------------------------------------- ASIDs and context switch
+    let c = mmu.cpu("x86_64");
+    let a1 = mmu.space("x86_64", ram); let a2 = mmu.space("x86_64", ram);
+    mmu.map(a1, 0x1000, 0x40000, "r,w"); mmu.map(a2, 0x1000, 0x41000, "r,w");
+    mmu.phys_write(ram, 0x40000, 4, 111); mmu.phys_write(ram, 0x41000, 4, 222);
+    mmu.switch(c, a1); check("cpu sees space 1", mmu.read32(c, 0x1000), 111);
+    mmu.switch(c, a2); check("cpu sees space 2 (tagged TLB, no flush)", mmu.read32(c, 0x1000), 222);
+    mmu.switch(c, a1); check("back to space 1", mmu.read32(c, 0x1000), 111);
+    check("flush count stays zero with PCID", mmu.tlb_info(c).flushes, 0);
+    let c2 = mmu.cpu("x86_32"); let o1 = mmu.space("x86_32", ram); let o2 = mmu.space("x86_32", ram);
+    mmu.map(o1, 0x1000, 0x40000, "r,w"); mmu.map(o2, 0x1000, 0x41000, "r,w");
+    mmu.switch(c2, o1); mmu.read32(c2, 0x1000); mmu.switch(c2, o2);
+    check("no-ASID cpu flushes on switch", mmu.read32(c2, 0x1000), 222);
+
+    // ---------------------------------------------------------------- software A/D (arm64 / riscv) and fault codes
+    let r = mmu.space("riscv_sv39", ram, "sw_ad");
+    mmu.map(r, 0x1000, 0x50000, "r,w,u");
+    let f = mmu.translate(r, 0x1000, "w", "u");
+    check("riscv Svade faults on clear A", f.ok, false);
+    check("riscv store page fault cause", f.code, 15);
+    check("riscv accessed-flag kind", f.kind, "access_flag");
+    mmu.map(r, 0x2000, 0x51000, "r,w,u,a,d");
+    check("riscv with A/D set works", mmu.write8(r, 0x2000, 1, "u"), true);
+    let ar = mmu.space("arm64", ram);
+    mmu.map(ar, 0x1000, 0x52000, "r");
+    check("arm64 permission fault FSC", mmu.translate(ar, 0x1000, "w").code, 0x4F);
+    check("arm64 translation fault FSC", mmu.translate(ar, 0x9000, "r").code, 0x07);
+    mmu.map(ar, "0xFFFF000000001000", 0x53000, "r,w");
+    check("arm64 TTBR1 half", mmu.write8(ar, "0xFFFF000000001000", 9) && mmu.read8(ar, "0xFFFF000000001000") == 9, true);
+    check("arm64 two roots", mmu.root(ar, 1) != null && mmu.root(ar, 0) != mmu.root(ar, 1), true);
+
+    // ---------------------------------------------------------------- device windows
+    let dev = mmu.phys("4M");
+    var last_write = 0;
+    fn dev_read(off, width) { return 0x1000 + off; }
+    fn dev_write(off, width, v) { last_write = v; }
+    check("device window", mmu.device(dev, 0x200000, 0x10000, dev_read, dev_write, "uart"), true);
+    check("device read callback", mmu.phys_read(dev, 0x200008, 4), 0x1008);
+    mmu.phys_write(dev, 0x200000, 4, 42);
+    check("device write callback", last_write, 42);
+    let ds = mmu.space("x86_64", dev);
+    mmu.map(ds, 0x70000000, 0x200000, "r,w,nc");
+    check("translated access reaches the device", mmu.read32(ds, 0x70000010), 0x1010);
+    check("device frames are not allocatable", mmu.frame_alloc(dev, 1, 1) < 0x200000 || mmu.frame_alloc(dev, 1, 1) >= 0x210000, true);
+
+    // ---------------------------------------------------------------- user fault handler (demand paging by hand)
+    let h = mmu.space("x86_64", ram);
+    var handled = 0;
+    fn pager(fault) {
+        handled += 1;
+        let page = mmu.align_down(fault.va, 4096);
+        let fr = mmu.frame_alloc(ram);
+        return mmu.map(h, page, fr, "r,w,own");
+    }
+    mmu.on_fault(h, pager);
+    mmu.write32(h, 0x123456, 99);
+    check("user handler maps and retries", mmu.read32(h, 0x123456), 99);
+    check("handler ran once", handled, 1);
+    mmu.on_fault(h, null);
+
+    println("PASSED", passed, "FAILED", failed);
+}
