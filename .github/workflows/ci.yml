@@ -75,7 +75,7 @@ jobs:
           platforms: arm,riscv64
 
       - name: Build, test and package in a ${{ matrix.image }} container
-        run: packaging/ci/build-in-container.sh "${{ matrix.platform }}" "${{ matrix.image }}" dist
+        run: bash packaging/ci/build-in-container.sh "${{ matrix.platform }}" "${{ matrix.image }}" dist
 
       - uses: actions/upload-artifact@v4
         if: always()
