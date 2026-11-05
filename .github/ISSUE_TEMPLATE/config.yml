@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/DivyanshuSinha136/kingcobra/discussions
+    about: Ask how to do something or float an idea before filing an issue (enable Discussions in repo settings).
+  - name: Security vulnerability
+    url: https://github.com/DivyanshuSinha136/kingcobra/security/advisories/new
+    about: Please report security problems privately, not as a public issue. See SECURITY.md.
+  - name: Documentation
+    url: https://github.com/DivyanshuSinha136/kingcobra/tree/main/docs
+    about: Language spec, CLI, memory model and per-module references.

@@ -1,0 +1,6 @@
+# Runner labels that GitHub provides but older actionlint releases do not know yet
+self-hosted-runner:
+  labels:
+    - macos-15-intel
+    - macos-26
+    - windows-11-arm

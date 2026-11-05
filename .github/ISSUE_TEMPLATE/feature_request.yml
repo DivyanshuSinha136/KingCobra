@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a language feature, tool improvement, or CLI change.
+title: "[feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Sketch the syntax or API. A short `.kc` example of how you'd like to use it helps a lot.
+      render: kingcobra
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other designs you thought about.
+  - type: dropdown
+    id: compat
+    attributes:
+      label: Compatibility impact
+      description: Breaking changes need a major release — see docs/STABILITY.md.
+      options: ["Purely additive", "Changes existing behavior", "Not sure"]
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked docs/ROADMAP.md and existing issues.
+          required: true
+        - label: I'm willing to help implement or test this.
+          required: false

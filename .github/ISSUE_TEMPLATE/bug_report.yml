@@ -1,0 +1,76 @@
+name: Bug report
+description: Something behaves differently from the docs, crashes, or gives a wrong result.
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A small, self-contained reproduction is the fastest way to a fix.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A short `.kc` program (or REPL session) that shows the problem. Remove anything not needed.
+      render: kingcobra
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Actual output / error message
+      description: "Paste the full output, including the `file:line:col: error:` line."
+      render: text
+  - type: textarea
+    id: info
+    attributes:
+      label: Output of `kingcobra info`
+      description: Version, compiler, platform, and whether the JIT is on.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Core language / parser
+        - Type checker
+        - Interpreter / JIT
+        - Memory / pointers
+        - Standard library module
+        - kcc (compiler)
+        - kasm (assembler)
+        - kcos (OS)
+        - kcide / debugger
+        - Build / install / packaging
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: module
+    attributes:
+      label: Module (if a standard-library bug)
+      placeholder: e.g. std.json
+  - type: dropdown
+    id: jit
+    attributes:
+      label: Does it still happen with `--no-jit`?
+      options: ["Not applicable / not tried", "Yes", "No — only with the JIT"]
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and the docs.
+          required: true
+        - label: I can reproduce it on the latest release or `main`.
+          required: false

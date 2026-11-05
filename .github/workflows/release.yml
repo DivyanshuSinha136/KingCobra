@@ -1,0 +1,354 @@
+name: Release
+
+# Push a tag like v1.0.0 (it must match KC_VERSION in compiler/include/kc_common.h). This compiles KingCobra for every
+# device it ships for and publishes one GitHub Release:
+#   Linux glibc  amd64 / arm64 / armhf / riscv64   .deb + .tar.gz   (built in Debian 12 / 13 containers)
+#   Linux musl   amd64 / arm64 (Alpine)            .tar.gz
+#   Fedora family amd64 / arm64                    .rpm
+#   macOS        arm64 / amd64                     .tar.gz
+#   Windows      x64                               .zip (+ Chocolatey .nupkg, Scoop manifest)
+#   everything else                                -src.tar.gz (install.sh compiles it on the user's machine)
+# plus SHA256SUMS, a build-provenance attestation, install.sh / install.ps1 and the Homebrew formula.
+# Packages are installed in clean containers before anything is published. Optional channels (APT repository on
+# GitHub Pages, Chocolatey, Homebrew tap, winget) switch on only when their secret/variable exists - see docs/PACKAGING.md.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:      # builds everything and uploads the files as workflow artifacts; publishes nothing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: release checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version, changelog, banner and placeholder checks
+        run: tools/check-release.sh "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}"
+
+  linux:
+    name: linux ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    continue-on-error: ${{ !matrix.blocking }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # blocking: the release does not happen unless these pass their smoke tests
+          - { name: amd64,      runner: ubuntu-latest,    platform: linux/amd64,   image: "debian:bookworm", blocking: true,  qemu: false }
+          - { name: arm64,      runner: ubuntu-24.04-arm, platform: linux/arm64,   image: "debian:bookworm", blocking: true,  qemu: false }
+          - { name: armhf,      runner: ubuntu-latest,    platform: linux/arm/v7,  image: "debian:bookworm", blocking: true,  qemu: true }
+          - { name: riscv64,    runner: ubuntu-latest,    platform: linux/riscv64, image: "debian:trixie",   blocking: true,  qemu: true }
+          # optional: a failure only means that asset is missing (install.sh then falls back to compiling from source)
+          - { name: musl-amd64, runner: ubuntu-latest,    platform: linux/amd64,   image: "alpine:3.21",     blocking: false, qemu: false }
+          - { name: musl-arm64, runner: ubuntu-24.04-arm, platform: linux/arm64,   image: "alpine:3.21",     blocking: false, qemu: false }
+          - { name: rpm-amd64,  runner: ubuntu-latest,    platform: linux/amd64,   image: "fedora:latest",   blocking: false, qemu: false }
+          - { name: rpm-arm64,  runner: ubuntu-24.04-arm, platform: linux/arm64,   image: "fedora:latest",   blocking: false, qemu: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.qemu
+        with:
+          platforms: arm,riscv64
+      # Debian 12 (glibc 2.36) so the .deb and tarball run on Debian 12+, Ubuntu 22.04+ and newer.
+      # (riscv64 uses Debian 13, the first stable release with that port.)
+      - name: Build, test and package
+        run: packaging/ci/build-in-container.sh "${{ matrix.platform }}" "${{ matrix.image }}" dist
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  macos:
+    name: macos ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: arm64, runner: macos-15 }
+          - { name: amd64, runner: macos-15-intel }
+    continue-on-error: true        # a missing macOS asset makes install.sh / Homebrew compile from source instead
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          make -j"$(sysctl -n hw.ncpu)"
+          ./kingcobra info
+      - name: Sanity check (blocking)
+        run: |
+          echo 'fn fib(n: int) -> int { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } fn main() { print(fib(20)); }' > /tmp/fib.kc
+          test "$(./kingcobra run /tmp/fib.kc)" = "6765"
+      - name: Full smoke test
+        run: |
+          brew install bash coreutils >/dev/null
+          "$(brew --prefix)/bin/bash" tests/smoke_test.sh
+      - name: Package
+        run: |
+          ver=$(make -s version)
+          codesign -s - -f kingcobra || true      # ad-hoc signature: required to run on Apple Silicon
+          mkdir -p dist
+          packaging/ci/make-tarball.sh "dist/kingcobra-$ver-macos-${{ matrix.name }}.tar.gz" --no-mime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.name }}
+          path: dist/
+          retention-days: 14
+
+  windows:
+    name: windows x64
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make zip
+            mingw-w64-x86_64-gcc
+      # Statically linked so the .exe needs nothing but Windows itself (no MinGW DLLs to ship).
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          make -j"$(nproc)" LDFLAGS=-static
+          ./kingcobra.exe info
+          echo 'fn fib(n: int) -> int { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } fn main() { print(fib(20)); }' > /tmp/fib.kc
+          test "$(./kingcobra.exe run /tmp/fib.kc | tr -d '\r')" = "6765"
+          echo "--- DLLs the exe imports:"; objdump -p kingcobra.exe | grep "DLL Name" | sort -u
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          ver=$(make -s version)
+          s=stage; rm -rf "$s"; mkdir -p "$s/assets"
+          cp kingcobra.exe LICENSE README.md "$s/"
+          cp -r docs examples "$s/"; cp -r assets/icons "$s/assets/"
+          find "$s" \( -name '*.o' -o -name '*.so' \) -delete
+          mkdir -p dist
+          (cd "$s" && zip -qr "../dist/kingcobra-$ver-windows-x64.zip" .)
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-x64
+          path: dist/
+          retention-days: 14
+
+  verify:
+    # Install the freshly built packages the way a user would, in CLEAN containers of several distributions, run a
+    # program, then uninstall. Catches missing dependencies and glibc-too-old problems before anything is published.
+    name: verify ${{ matrix.image }} (${{ matrix.kind }})
+    needs: linux
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: ${{ !matrix.blocking }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "debian:12",       kind: deb, art: amd64,      glob: "kingcobra_*_amd64.deb",           blocking: true }
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "ubuntu:22.04",    kind: deb, art: amd64,      glob: "kingcobra_*_amd64.deb",           blocking: true }
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "ubuntu:24.04",    kind: deb, art: amd64,      glob: "kingcobra_*_amd64.deb",           blocking: true }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, image: "debian:12",       kind: deb, art: arm64,      glob: "kingcobra_*_arm64.deb",           blocking: true }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, image: "ubuntu:24.04",    kind: deb, art: arm64,      glob: "kingcobra_*_arm64.deb",           blocking: true }
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "debian:12",       kind: tar, art: amd64,      glob: "kingcobra-*-linux-amd64.tar.gz",  blocking: true }
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "alpine:3.21",     kind: tar, art: musl-amd64, glob: "kingcobra-*-linux-musl-amd64.tar.gz", blocking: false }
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "fedora:latest",   kind: rpm, art: rpm-amd64,  glob: "kingcobra-*.x86_64.rpm",          blocking: false }
+          - { runner: ubuntu-latest,    platform: linux/amd64, image: "rockylinux:9",    kind: rpm, art: rpm-amd64,  glob: "kingcobra-*.x86_64.rpm",          blocking: false }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, image: "fedora:latest",   kind: rpm, art: rpm-arm64,  glob: "kingcobra-*.aarch64.rpm",         blocking: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.art }}
+          path: dist
+      - name: Install, run, uninstall in ${{ matrix.image }}
+        run: |
+          pkg=$(find dist -maxdepth 1 -name '${{ matrix.glob }}' | head -n1)
+          test -n "$pkg"
+          packaging/ci/verify-package.sh "${{ matrix.platform }}" "${{ matrix.image }}" "$pkg" "${{ matrix.kind }}"
+
+  release:
+    name: publish GitHub Release
+    needs: [check, linux, macos, windows, verify]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write          # build-provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Source tarball, manifests, checksums
+        run: |
+          ver=$(make -s version)
+          git archive --format=tar.gz --prefix="kingcobra-$ver/" -o "dist/kingcobra-$ver-src.tar.gz" HEAD
+          cp install.sh install.ps1 dist/
+          packaging/render-manifests.sh dist "$GITHUB_REPOSITORY" dist
+          tools/release-notes.sh "$ver" > release-notes.md
+          cd dist
+          rm -f ./*.log
+          # every asset except the checksum file itself; optional assets that failed to build are simply absent
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum > ../SHA256SUMS.new
+          mv ../SHA256SUMS.new SHA256SUMS
+          cat SHA256SUMS
+      - name: Build provenance attestation (check with gh attestation verify)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/*.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  chocolatey:
+    # Packs the Chocolatey package against the zip that is now on the GitHub Release, test-installs it on a Windows
+    # runner (which downloads the zip from the release and checks its SHA-256), then attaches the .nupkg to the release.
+    # Publishing to community.chocolatey.org happens only if the secret CHOCOLATEY_API_KEY exists (every version goes
+    # through Chocolatey's moderation before it appears).
+    needs: release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the release zip
+        run: gh release download "$env:GITHUB_REF_NAME" --pattern 'kingcobra-*-windows-x64.zip' --dir dist
+      - name: Pack
+        run: |
+          $zip = Get-ChildItem dist/kingcobra-*-windows-x64.zip | Select-Object -First 1
+          $ver = $env:GITHUB_REF_NAME.TrimStart('v')
+          ./packaging/chocolatey/build.ps1 -Version $ver -Repo $env:GITHUB_REPOSITORY -ZipPath $zip.FullName -OutDir choco-out
+      - name: Test install / uninstall
+        run: |
+          choco install kingcobra --source "$PWD\choco-out" -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'choco install failed' }
+          kingcobra version
+          kc version
+          choco uninstall kingcobra -y --no-progress
+          if (Get-Command kingcobra -ErrorAction SilentlyContinue) { throw 'kingcobra still on PATH after uninstall' }
+      - name: Attach the .nupkg to the release
+        run: gh release upload "$env:GITHUB_REF_NAME" (Get-ChildItem choco-out/*.nupkg).FullName --clobber
+      - name: Push to community.chocolatey.org (only if configured)
+        env:
+          CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          if ($env:CHOCO_KEY) {
+            $pkg = Get-ChildItem choco-out/*.nupkg | Select-Object -First 1
+            choco push $pkg.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY
+          } else { Write-Host 'CHOCOLATEY_API_KEY not set: skipping push' }
+
+  homebrew:
+    # Enable by setting the repository variable HOMEBREW_TAP (e.g. "owner/homebrew-kingcobra") and the secret
+    # HOMEBREW_TAP_TOKEN (a token that can push to that repo). Users then run: brew install owner/kingcobra/kingcobra
+    needs: release
+    if: vars.HOMEBREW_TAP != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fetch the formula rendered for this release
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern kingcobra.rb --dir .
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Update the tap
+        run: |
+          mkdir -p tap/Formula
+          cp kingcobra.rb tap/Formula/kingcobra.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/kingcobra.rb
+          git diff --cached --quiet || git commit -m "kingcobra ${GITHUB_REF_NAME#v}"
+          git push
+
+  winget:
+    # Enable by setting the repository variable WINGET_PUBLISH=true and the secret WINGET_TOKEN (a classic PAT with
+    # public_repo). The first version of a package must be submitted to microsoft/winget-pkgs by hand; this updates it.
+    needs: release
+    if: vars.WINGET_PUBLISH == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: DivyanshuSinha.KingCobra
+          installers-regex: '-windows-x64\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  apt-repo:
+    # Enable by setting the repository variable APT_PAGES=true and turning on GitHub Pages (source: GitHub Actions).
+    # Optional signing: secret APT_GPG_PRIVATE_KEY (armored private key) and variable APT_GPG_KEY_ID.
+    needs: release
+    if: vars.APT_PAGES == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Build the repository
+        env:
+          KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          KEY_ID: ${{ vars.APT_GPG_KEY_ID }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq dpkg-dev gnupg
+          if [ -n "$KEY" ] && [ -n "$KEY_ID" ]; then
+            echo "$KEY" | gpg --batch --import
+            export GPG_KEY="$KEY_ID"
+          fi
+          packaging/debian/make-apt-repo.sh site dist/kingcobra_*.deb
+          cp install.sh install.ps1 site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  apt-deploy:
+    needs: apt-repo
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

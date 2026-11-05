@@ -1,0 +1,17 @@
+# Apply with a label-sync tool or the gh CLI, e.g.: gh label create <name> --color <hex> --description "<text>"
+- { name: bug,               color: d73a4a, description: Something is broken }
+- { name: enhancement,       color: a2eeef, description: New feature or improvement }
+- { name: stdlib,            color: 34d399, description: Standard-library module }
+- { name: compiler,          color: 0e8a16, description: Parser, type checker, interpreter or JIT }
+- { name: kcc,               color: 1d76db, description: Native compiler }
+- { name: kasm,              color: 5319e7, description: x86 assembler }
+- { name: kcos,              color: b60205, description: Operating system }
+- { name: ide,               color: fbca04, description: kcide and debugger }
+- { name: docs,              color: 0075ca, description: Documentation }
+- { name: platform,          color: c5def5, description: Windows, macOS, ARM, RISC-V }
+- { name: packaging,         color: bfdadc, description: Install scripts, deb, Chocolatey }
+- { name: needs-triage,      color: ededed, description: Not yet reviewed }
+- { name: needs-repro,       color: f9d0c4, description: Needs a minimal reproduction }
+- { name: breaking,          color: e99695, description: Changes documented behavior }
+- { name: good first issue,  color: 7057ff, description: Good for newcomers }
+- { name: help wanted,       color: 008672, description: Extra attention is welcome }

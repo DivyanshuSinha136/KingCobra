@@ -1,0 +1,32 @@
+name: Standard-library request
+description: Ask for a new `std.*` module or new functions in an existing one.
+title: "[std] "
+labels: ["stdlib", "enhancement", "needs-triage"]
+body:
+  - type: input
+    id: module
+    attributes:
+      label: Module
+      description: New module name, or the existing module to extend.
+      placeholder: e.g. std.ini, or std.json
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: What should it do?
+      description: List the formats, standards or functions it should cover (RFC / spec links help).
+    validations:
+      required: true
+  - type: textarea
+    id: api
+    attributes:
+      label: Example usage
+      description: How would a program call it? Note that KingCobra has no object-literal syntax, so options are usually `"key=value"` strings.
+      render: kingcobra
+  - type: dropdown
+    id: deps
+    attributes:
+      label: Dependencies
+      description: Standard modules are plain C11 with no build-time dependencies; optional system libraries are loaded at run time.
+      options: ["Pure C11", "Needs an optional system library (loaded at run time)", "Not sure"]

@@ -1,0 +1,9 @@
+# Default owner for everything
+*                      @DivyanshuSinha136
+# Language core
+/compiler/             @DivyanshuSinha136
+/std/                  @DivyanshuSinha136
+/docs/                 @DivyanshuSinha136
+# Release and packaging
+/.github/workflows/    @DivyanshuSinha136
+/packaging/            @DivyanshuSinha136

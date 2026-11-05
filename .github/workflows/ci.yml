@@ -1,0 +1,187 @@
+name: CI
+
+# Compiles and tests KingCobra on every kind of device it ships for (the "matrix" below), on every push and PR:
+#   Linux glibc  amd64 / arm64 (native runners), armhf / riscv64 (QEMU)     -> .deb + tarball
+#   Linux musl   amd64 / arm64 (Alpine)                                      -> tarball
+#   Fedora       amd64 / arm64                                               -> .rpm
+#   macOS        Apple Silicon / Intel
+#   Windows      x64 (MinGW-w64, static)
+# QEMU / musl / rpm / macOS entries are reported but do not fail the workflow until they have been green once
+# (then set blocking: true). amd64 and arm64 glibc must always pass.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint + release checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release consistency (version, changelog, banner, placeholders)
+        run: tools/check-release.sh
+      - name: shellcheck
+        run: |
+          shellcheck -s sh install.sh
+          shellcheck tools/*.sh packaging/ci/*.sh packaging/rpm/*.sh packaging/debian/make-apt-repo.sh packaging/render-manifests.sh
+      - name: actionlint
+        run: |
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz | tar xz actionlint
+          ./actionlint
+      - name: Installer dry runs
+        run: |
+          KC_DRY_RUN=1 KC_VERSION=1.0.0 sh install.sh
+          KC_DRY_RUN=1 KC_VERSION=1.0.0 KC_METHOD=src sh install.sh
+          # device choices: ARMv6 boards compile locally, ARMv7 / RISC-V boards get prebuilt packages
+          test "$(KC_DRY_RUN=1 KC_VERSION=1.0.0 KC_MACHINE=armv6l sh install.sh | sed -n 's/.*via //p' | head -n1)" = src
+          test "$(KC_DRY_RUN=1 KC_VERSION=1.0.0 KC_MACHINE=armv7l KC_METHOD=tar sh install.sh | sed -n 's/^Package:  //p')" = kingcobra-1.0.0-linux-armhf.tar.gz
+          test "$(KC_DRY_RUN=1 KC_VERSION=1.0.0 KC_MACHINE=riscv64 KC_METHOD=tar sh install.sh | sed -n 's/^Package:  //p')" = kingcobra-1.0.0-linux-riscv64.tar.gz
+
+  linux:
+    name: linux ${{ matrix.name }}
+    needs: lint
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    continue-on-error: ${{ !matrix.blocking }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: amd64,       runner: ubuntu-latest,    platform: linux/amd64,   image: "debian:bookworm", blocking: true,  qemu: false }
+          - { name: arm64,       runner: ubuntu-24.04-arm, platform: linux/arm64,   image: "debian:bookworm", blocking: true,  qemu: false }
+          - { name: armhf,       runner: ubuntu-latest,    platform: linux/arm/v7,  image: "debian:bookworm", blocking: false, qemu: true }
+          - { name: riscv64,     runner: ubuntu-latest,    platform: linux/riscv64, image: "debian:trixie",   blocking: false, qemu: true }
+          - { name: musl-amd64,  runner: ubuntu-latest,    platform: linux/amd64,   image: "alpine:3.21",     blocking: false, qemu: false }
+          - { name: musl-arm64,  runner: ubuntu-24.04-arm, platform: linux/arm64,   image: "alpine:3.21",     blocking: false, qemu: false }
+          - { name: rpm-amd64,   runner: ubuntu-latest,    platform: linux/amd64,   image: "fedora:latest",   blocking: false, qemu: false }
+          - { name: rpm-arm64,   runner: ubuntu-24.04-arm, platform: linux/arm64,   image: "fedora:latest",   blocking: false, qemu: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (foreign architectures)
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm,riscv64
+
+      - name: Build, test and package in a ${{ matrix.image }} container
+        run: packaging/ci/build-in-container.sh "${{ matrix.platform }}" "${{ matrix.image }}" dist
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  macos:
+    name: macos ${{ matrix.name }}
+    needs: lint
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    continue-on-error: true       # not blocking until it has been green once
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: arm64, runner: macos-15 }
+          - { name: amd64, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          make -j"$(sysctl -n hw.ncpu)"
+          ./kingcobra info
+      - name: "Smoke test (needs bash 5, the system bash is 3.2)"
+        run: |
+          brew install bash coreutils >/dev/null
+          "$(brew --prefix)/bin/bash" tests/smoke_test.sh
+      - name: Package
+        run: |
+          ver=$(make -s version)
+          codesign -s - -f kingcobra || true
+          mkdir -p dist
+          packaging/ci/make-tarball.sh "dist/kingcobra-$ver-macos-${{ matrix.name }}.tar.gz" --no-mime
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-macos-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows:
+    name: windows x64
+    needs: lint
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true       # not blocking until it has been green once
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make zip
+            mingw-w64-x86_64-gcc
+      # Statically linked so the .exe needs nothing but Windows itself (no MinGW DLLs to ship).
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          make -j"$(nproc)" LDFLAGS=-static
+          ./kingcobra.exe info
+          echo 'fn fib(n: int) -> int { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } fn main() { print(fib(20)); }' > /tmp/fib.kc
+          test "$(./kingcobra.exe run /tmp/fib.kc | tr -d '\r')" = "6765"
+          echo "--- DLLs the exe imports:"; objdump -p kingcobra.exe | grep "DLL Name" | sort -u
+
+  installer:
+    # End-to-end test of install.sh: serve the freshly built packages like a GitHub Release and install from them.
+    name: install.sh end-to-end
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-amd64
+          path: dist
+      - name: Serve a fake release and install from it
+        run: |
+          ver=$(make -s version)
+          rel="srv/download/v$ver"; mkdir -p "$rel"
+          cp dist/kingcobra_*.deb dist/kingcobra-*-linux-amd64.tar.gz "$rel/"
+          git archive --format=tar.gz --prefix="kingcobra-$ver/" -o "$rel/kingcobra-$ver-src.tar.gz" HEAD
+          (cd "$rel" && sha256sum kingcobra* > SHA256SUMS)
+          python3 -m http.server 8000 --directory srv >/dev/null 2>&1 &
+          sleep 2
+          export KC_BASE_URL=http://127.0.0.1:8000 KC_VERSION="$ver"
+          echo "::group::tarball"
+          KC_METHOD=tar KC_PREFIX="$PWD/prefix-tar" sh install.sh
+          "$PWD/prefix-tar/bin/kc" version
+          KC_PREFIX="$PWD/prefix-tar" sh install.sh --uninstall
+          test ! -e "$PWD/prefix-tar/bin/kingcobra"
+          echo "::endgroup::"
+          echo "::group::compile from source on this machine"
+          sudo apt-get install -y -qq libx11-dev libreadline-dev >/dev/null
+          KC_METHOD=src KC_PREFIX="$PWD/prefix-src" sh install.sh
+          "$PWD/prefix-src/bin/kingcobra" version
+          echo "::endgroup::"
+          echo "::group::deb via apt (auto-detected)"
+          sh install.sh
+          kingcobra version
+          sh install.sh --uninstall
+          if command -v kingcobra; then echo 'kingcobra still on PATH after uninstall'; exit 1; fi
+          echo "::endgroup::"
