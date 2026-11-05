@@ -1,0 +1,22 @@
+# Homebrew formula (template; packaging/render-manifests.sh fills in @...@). Builds from the source release, so the
+# compiler runs on the user's own Mac (Apple Silicon or Intel) and the result always matches the machine.
+class Kingcobra < Formula
+  desc "KingCobra programming language: interpreter, REPL, type checker and standard library"
+  homepage "https://github.com/@REPO@"
+  url "https://github.com/@REPO@/releases/download/v@VERSION@/kingcobra-@VERSION@-src.tar.gz"
+  sha256 "@SRC_SHA256@"
+  license "MIT"
+
+  def install
+    system "make", "install-bin", "install-man", "install-docs", "PREFIX=#{prefix}"
+  end
+
+  test do
+    assert_match "KingCobra @VERSION@", shell_output("#{bin}/kingcobra --version")
+    (testpath/"hello.kc").write <<~KC
+      fn fib(n: int) -> int { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+      fn main() { print(fib(20)); }
+    KC
+    assert_equal "6765", shell_output("#{bin}/kingcobra run #{testpath}/hello.kc").strip
+  end
+end

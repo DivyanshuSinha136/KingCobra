@@ -1,0 +1,16 @@
+$ErrorActionPreference = 'Stop'
+$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+# The zip holds kingcobra.exe at its root plus docs/ and examples/. Chocolatey creates a shim on PATH for
+# every .exe it finds under tools\, so `kingcobra` works in any new shell after the install.
+$packageArgs = @{
+  packageName    = $env:ChocolateyPackageName
+  unzipLocation  = $toolsDir
+  url64bit       = '@URL@'
+  checksum64     = '@SHA256@'
+  checksumType64 = 'sha256'
+}
+Install-ChocolateyZipPackage @packageArgs
+
+# `kc` is the short name of the same program (a second shim pointing at kingcobra.exe).
+Install-BinFile -Name 'kc' -Path (Join-Path $toolsDir 'kingcobra.exe')

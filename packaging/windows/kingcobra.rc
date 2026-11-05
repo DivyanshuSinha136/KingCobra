@@ -1,0 +1,2 @@
+/* Embeds the KingCobra icon in kingcobra.exe (built by the Makefile via windres, run from the repo root). */
+1 ICON "assets/icons/kingcobra.ico"

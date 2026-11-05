@@ -1,0 +1,61 @@
+# RPM spec for Fedora / RHEL / Rocky / Alma / openSUSE / Amazon Linux.
+# Template: packaging/rpm/build-rpm.sh fills in @VERSION@ and builds it (`make rpm`).
+%global debug_package %{nil}
+%global _build_id_links none
+
+Name:           kingcobra
+Version:        @VERSION@
+Release:        1
+Summary:        KingCobra programming language (interpreter, REPL, debugger, std library)
+License:        MIT
+URL:            https://github.com/DivyanshuSinha136/kingcobra
+Source0:        %{name}-%{version}.tar.gz
+BuildRequires:  gcc
+BuildRequires:  make
+BuildRequires:  libX11-devel
+BuildRequires:  readline-devel
+
+%description
+KingCobra is a native systems programming language with a tree-walking
+interpreter, an optional x86-64 closure JIT, a static type checker, a REPL, a
+debugger back end and a standard library (system, memory, network, http, json,
+csv, nlp, nn, gui, mmio, mmu, regx, game, ascii_screen and more).
+
+It runs on x86-64, aarch64, armv7hl and riscv64. The JIT exists on x86-64 only;
+every other CPU uses the interpreter with identical results.
+
+%prep
+%autosetup -n %{name}-%{version}
+
+%build
+%make_build CC=gcc
+
+%install
+make install PREFIX=%{_prefix} DESTDIR=%{buildroot}
+make install-docs PREFIX=%{_prefix} DESTDIR=%{buildroot}
+install -d %{buildroot}%{_licensedir}/%{name}
+mv %{buildroot}%{_docdir}/%{name}/LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
+strip --strip-unneeded %{buildroot}%{_bindir}/kingcobra || :
+
+%post
+/usr/bin/update-mime-database %{_datadir}/mime >/dev/null 2>&1 || :
+/usr/bin/gtk-update-icon-cache -q -t -f %{_datadir}/icons/hicolor >/dev/null 2>&1 || :
+
+%postun
+/usr/bin/update-mime-database %{_datadir}/mime >/dev/null 2>&1 || :
+/usr/bin/gtk-update-icon-cache -q -t -f %{_datadir}/icons/hicolor >/dev/null 2>&1 || :
+
+%files
+%license %{_licensedir}/%{name}/LICENSE
+%{_bindir}/kingcobra
+%{_bindir}/kc
+%{_mandir}/man1/kingcobra.1*
+%{_mandir}/man1/kc.1*
+%{_docdir}/%{name}
+%{_datadir}/mime/packages/kingcobra.xml
+%{_datadir}/icons/hicolor/*/mimetypes/text-x-kingcobra.png
+%{_datadir}/icons/hicolor/*/apps/kingcobra.png
+
+%changelog
+* Wed Nov 04 2026 Divyanshu Sinha <divyanshu.sinha631@gmail.com> - @VERSION@-1
+- Release @VERSION@. See docs/CHANGELOG.md.

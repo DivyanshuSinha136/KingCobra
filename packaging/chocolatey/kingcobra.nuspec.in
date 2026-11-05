@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Template: packaging/chocolatey/build.ps1 fills in @VERSION@ and @REPO@ and runs `choco pack`. -->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>kingcobra</id>
+    <version>@VERSION@</version>
+    <title>KingCobra</title>
+    <authors>Divyanshu Sinha</authors>
+    <projectUrl>https://github.com/@REPO@</projectUrl>
+    <projectSourceUrl>https://github.com/@REPO@</projectSourceUrl>
+    <packageSourceUrl>https://github.com/@REPO@/tree/main/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://github.com/@REPO@/tree/main/docs</docsUrl>
+    <bugTrackerUrl>https://github.com/@REPO@/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/@REPO@/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <tags>kingcobra programming-language interpreter repl cli</tags>
+    <summary>KingCobra programming language: interpreter, REPL, type checker and standard library.</summary>
+    <description>KingCobra is a native systems programming language with a tree-walking interpreter, an optional x86-64 closure JIT, a static type checker, a REPL, a debugger back end and a standard library (system, memory, network, http, json, csv, nlp, nn, gui, mmio, mmu, regx, game, ascii_screen and more).
+
+This package installs `kingcobra.exe` (and a `kc` shortcut) on your PATH, plus docs and examples. The executable is downloaded from the project's GitHub release and verified against a SHA-256 checksum.
+
+Run `kingcobra help` to get started.</description>
+    <releaseNotes>https://github.com/@REPO@/releases/tag/v@VERSION@</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

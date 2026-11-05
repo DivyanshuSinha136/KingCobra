@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- freedesktop shared-mime-info: makes every *.kc file a "KingCobra source file" with the KingCobra icon.
+     Installed by `make install-mime` (icon: text-x-kingcobra, from assets/icons/hicolor). -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-kingcobra">
+    <comment>KingCobra source file</comment>
+    <sub-class-of type="text/plain"/>
+    <icon name="text-x-kingcobra"/>
+    <generic-icon name="text-x-generic"/>
+    <glob pattern="*.kc"/>
+  </mime-type>
+</mime-info>

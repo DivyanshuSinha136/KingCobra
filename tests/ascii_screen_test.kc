@@ -1,0 +1,184 @@
+// std.ascii_screen regression test — headless (no terminal needed). Run: kingcobra run tests/ascii_screen_test.kc
+import std.ascii_screen;
+
+var fails = 0;
+fn check(name, cond) {
+    if (cond) { print("ok   - " + name); } else { print("FAIL - " + name); fails += 1; }
+}
+fn contains(hay: string, needle: string) -> bool { return hay.contains(needle); }
+
+fn main() {
+    let A = "tests/ascii_screen_assets/";
+    ascii_screen.open("headless", true, "width", 48, "height", 16);
+    check("headless backend", ascii_screen.is_headless());
+    check("size", ascii_screen.size()[0] == 48 && ascii_screen.size()[1] == 16);
+    check("caps", ascii_screen.caps()["backend"] == "headless");
+
+    // ---- drawing ----
+    ascii_screen.begin();
+    ascii_screen.box(0, 0, 20, 5, "style", "double", "title", "T");
+    ascii_screen.text(2, 2, "hello");
+    ascii_screen.text(2, 3, "日本語", "fg", "red");
+    ascii_screen.put(30, 2, "@");
+    ascii_screen.circle(40, 8, 3, "fill", true, "char", "*");
+    ascii_screen.present();
+    let d = ascii_screen.dump();
+    check("box corners", contains(d, "╔═ T ═"));
+    check("text drawn", contains(d, "hello"));
+    check("wide characters keep alignment", contains(d, "日本語"));
+    check("cell readback", ascii_screen.cell(30, 2)[0] == "@");
+    check("circle fill", ascii_screen.cell(40, 8)[0] == "*");
+    check("text_width counts double-width", ascii_screen.text_width("日本") == 4);
+    check("text_wrap", len(ascii_screen.text_wrap("the quick brown fox jumps", 10)) == 3);
+
+    // ---- canvases / blit / hires ----
+    let c = ascii_screen.canvas(8, 3);
+    ascii_screen.target(c);
+    ascii_screen.fill(0, 0, 8, 3, "#");
+    ascii_screen.target(0);
+    ascii_screen.begin();
+    ascii_screen.blit(c, 1, 1);
+    check("blit", ascii_screen.cell(1, 1)[0] == "#" && ascii_screen.cell(8, 3)[0] == "#");
+    let h = ascii_screen.hires(4, 2, "braille");
+    check("hires size", ascii_screen.hires_size(h)[0] == 8 && ascii_screen.hires_size(h)[1] == 8);
+    ascii_screen.hires_line(h, 0, 0, 7, 7, "white");
+    ascii_screen.begin();
+    ascii_screen.hires_draw(h, 0, 0);
+    check("braille output", ascii_screen.cell(0, 0)[0] != " ");
+
+    // ---- images ----
+    let png = ascii_screen.image(A + "photo.png");
+    check("png decode", ascii_screen.image_size(png)[0] == 160);
+    let jpg = ascii_screen.image(A + "photo.jpg");
+    check("jpeg decode", ascii_screen.image_size(jpg)[0] == 320 && ascii_screen.image_size(jpg)[1] == 200);
+    check("jpeg ~= png colour", ascii_screen.image_get(jpg, 50, 40) > 0);
+    let gif = ascii_screen.image(A + "ball.gif");
+    check("gif frames", ascii_screen.image_frames(gif) == 8);
+    let modes = ["ramp", "shape", "half", "quad", "braille", "edges", "blocks"];
+    var i = 0;
+    while (i < len(modes)) {
+        let s = ascii_screen.image_to_ascii(png, "width", 40, "mode", modes[i]);
+        check("image_to_ascii " + modes[i], len(s) > 100);
+        i += 1;
+    }
+    let ans = ascii_screen.image_to_ascii(png, "width", 20, "mode", "half", "ansi", "truecolor");
+    check("ansi export has escapes", contains(ans, "\x1b[38;2;"));
+    check("aspect: 160x100 at width 32 -> 10 rows", len(ascii_screen.text_wrap(ascii_screen.image_to_ascii(png, "width", 32), 200)) == 10);
+    let svg = ascii_screen.svg(A + "icon.svg");
+    check("svg rasterised", ascii_screen.image_size(svg)[0] >= 100);
+    let sa = ascii_screen.image_to_ascii(svg, "width", 30, "mode", "shape");
+    check("svg ascii", len(sa) > 100);
+    let inline = ascii_screen.svg("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><rect width='10' height='10' fill='#fff'/></svg>", "width", 20);
+    check("inline svg", ascii_screen.image_get(inline, 5, 5) == 16777215);
+
+    // ---- animations ----
+    let an = ascii_screen.anim_load(A + "ball.gif", "width", 20, "mode", "half", "color", false);
+    check("gif -> anim", ascii_screen.anim_info(an)["frames"] == 8);
+    ascii_screen.anim_save(an, "/tmp/_as_test.kca");
+    let an2 = ascii_screen.anim_load("/tmp/_as_test.kca");
+    check(".kca round trip", ascii_screen.anim_info(an2)["frames"] == 8 && ascii_screen.anim_info(an2)["width"] == 20);
+    let tf = ascii_screen.anim_from_text(["a", "b", "c"], 5);
+    check("anim_from_text", ascii_screen.anim_info(tf)["frames"] == 3);
+    var k = 0;
+    while (k < 12) { ascii_screen.poll(); k += 1; }
+    check("anim advances with time", ascii_screen.anim_info(an2)["frame"] > 0);
+
+    // ---- fonts ----
+    let lines = ascii_screen.big_text_lines("Hi", "font", "half");
+    check("builtin font height", len(lines) == 4);
+    let fx = ascii_screen.font_define("t", 3, "A", [["###", "#.#", "###"]]);
+    check("font_define", len(ascii_screen.big_text_lines("A", "font", "t", "style", "ascii")) == 3);
+    check("big_text_size", ascii_screen.big_text_size("AB", "font", "block")[1] == 7);
+
+    // ---- effects / transitions ----
+    let fire = ascii_screen.effect("fire", 20, 6);
+    ascii_screen.begin();
+    k = 0; while (k < 10) { ascii_screen.poll(); ascii_screen.effect_draw(fire, 0, 0); k += 1; }
+    check("effect draws", ascii_screen.cell(5, 5)[0] != " ");
+    let ca = ascii_screen.canvas(10, 3); let cb = ascii_screen.canvas(10, 3);
+    ascii_screen.target(ca); ascii_screen.fill(0, 0, 10, 3, "A"); ascii_screen.target(cb); ascii_screen.fill(0, 0, 10, 3, "B"); ascii_screen.target(0);
+    ascii_screen.begin(); ascii_screen.transition("wipe_right", ca, cb, 0.5);
+    check("transition", ascii_screen.cell(0, 0)[0] == "B" && ascii_screen.cell(9, 0)[0] == "A");
+
+    // ---- ANSI art import ----
+    let art = ascii_screen.canvas_from_text("\x1b[31mRED\x1b[0m ok");
+    check("ansi import colour", ascii_screen.cell(0, 0, art)[1] >= 0 && ascii_screen.cell(4, 0, art)[1] == -1);
+
+    // ---- input + controller ----
+    ascii_screen.controller("both");
+    ascii_screen.poll();
+    ascii_screen.send_key("d", true);
+    ascii_screen.poll();
+    check("key down", ascii_screen.key("d") && ascii_screen.key_pressed("d"));
+    check("action right", ascii_screen.action("right") && ascii_screen.axis("move_x") == 1);
+    ascii_screen.poll();
+    check("pressed is one-frame", !ascii_screen.key_pressed("d") && ascii_screen.key("d"));
+    ascii_screen.send_key("d", false);
+    ascii_screen.poll();
+    check("key up", !ascii_screen.key("d") && ascii_screen.key_released("d"));
+    ascii_screen.send_key("a"); ascii_screen.poll();
+    check("tap lasts one frame", ascii_screen.key("a"));
+    ascii_screen.poll();
+    check("tap released", !ascii_screen.key("a"));
+    ascii_screen.send_mouse(7, 3, "left", "press"); ascii_screen.poll();
+    check("mouse", ascii_screen.mouse()[0] == 7 && ascii_screen.mouse()[1] == 3 && ascii_screen.mouse_pressed("left"));
+    ascii_screen.send_text("xyz"); ascii_screen.poll();
+    check("typed text", ascii_screen.typed() == "xyz");
+
+    // ---- HUD ----
+    var got = -1;
+    let menu = ascii_screen.hud("list", "x", 1, "y", 1, "items", ["a", "b", "c"], "on_select", fn(i) { got = i; });
+    ascii_screen.send_key("down"); ascii_screen.poll();
+    ascii_screen.send_key("enter"); ascii_screen.poll();
+    check("list navigation + callback", got == 1 && ascii_screen.hud_get(menu, "selected") == "b");
+    let bar = ascii_screen.hud("bar", "x", 0, "y", 10, "w", 10, "value", 5, "max", 10);
+    ascii_screen.hud_tween(bar, "value", 10, 0.1);
+    k = 0; while (k < 10) { ascii_screen.poll(); k += 1; }
+    check("hud tween", ascii_screen.hud_get(bar, "value") == 10.0);
+    ascii_screen.hud_clear();
+
+    // ---- game: map, entities, physics, camera ----
+    let m = ascii_screen.map_rows(["#####", "#@..#", "#####"]);
+    ascii_screen.map_use(m);
+    check("map spawn", ascii_screen.map_spawn(m)[0] == 1);
+    check("tile solid", ascii_screen.tile_solid(m, 0, 0) && !ascii_screen.tile_solid(m, 2, 1));
+    let e = ascii_screen.spawn(1, 1, "glyph", "@", "vx", 20.0);
+    k = 0; while (k < 30) { ascii_screen.poll(); k += 1; }
+    check("tile collision stops the entity", ascii_screen.get(e, "x") > 2.5 && ascii_screen.get(e, "x") <= 3.01);
+    ascii_screen.despawn(e);
+    check("despawn", !ascii_screen.alive(e));
+    ascii_screen.physics(30.0, 0.0);
+    let m2 = ascii_screen.map_rows(["#####", "#...#", "#...#", "#####"]);
+    ascii_screen.map_use(m2);
+    let f = ascii_screen.spawn(2, 1, "glyph", "o");
+    k = 0; while (k < 60) { ascii_screen.poll(); k += 1; }
+    check("gravity + ground", ascii_screen.get(f, "on_ground") && ascii_screen.get(f, "y") > 1.9);
+    ascii_screen.physics(0.0, 0.0);
+    check("path finding", len(ascii_screen.path(m, 1, 1, 3, 1)) == 3);
+    ascii_screen.camera_follow(f, "smooth", 0);
+    ascii_screen.poll();
+    check("camera follows", ascii_screen.camera()[0] > 2.0);
+
+    // ---- streamed world ----
+    let w = ascii_screen.world("terrain", "seed", 3, "radius", 2);
+    let t0 = ascii_screen.tile_at(w, 1000, 1000);
+    ascii_screen.map_use(w);
+    ascii_screen.camera(0.0, 0.0);
+    ascii_screen.poll();
+    check("world deterministic", ascii_screen.tile_at(w, 1000, 1000) == t0);
+    ascii_screen.tile_set(w, 5, 5, "#");
+    check("world edit", ascii_screen.tile_at(w, 5, 5) == 35);
+    ascii_screen.camera(5000.0, 5000.0);
+    ascii_screen.poll();
+    check("far chunks stream, memory stays bounded", ascii_screen.map_stats(w)["loaded_chunks"] < 80);
+    ascii_screen.camera(0.0, 0.0); ascii_screen.poll();
+    check("edits survive eviction", ascii_screen.tile_at(w, 5, 5) == 35);
+
+    // ---- raycaster ----
+    let rm = ascii_screen.map_rows(["#####", "#...#", "#####"]);
+    let hit = ascii_screen.raycast(rm, 1.5, 1.5, 0.0);
+    check("raycast distance", hit["dist"] > 2.4 && hit["dist"] < 2.6);
+
+    ascii_screen.close();
+    if (fails == 0) { print("ascii_screen tests passed"); } else { print("ascii_screen tests FAILED: " + str(fails)); }
+}

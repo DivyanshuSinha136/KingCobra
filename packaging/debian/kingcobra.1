@@ -1,0 +1,61 @@
+.TH KINGCOBRA 1 "November 2026" "KingCobra 1.0.0" "User Commands"
+.SH NAME
+kingcobra, kc \- the KingCobra programming language
+.SH SYNOPSIS
+.B kingcobra
+[\fIoptions\fR] \fIcommand\fR [\fIargs\fR]
+.br
+.B kingcobra
+[\fIoptions\fR] \fIfile.kc\fR [\fIscript args\fR]
+.SH DESCRIPTION
+Runs, checks, tests and debugs KingCobra programs. With no arguments on a terminal it starts the REPL.
+.SH COMMANDS
+.TP
+.B run \fIfile.kc\fR
+Run a program (a bare file.kc means the same).
+.TP
+.B repl [\fIfile.kc\fR]
+Interactive session.
+.TP
+.B eval \fIcode\fR
+Run a snippet given on the command line.
+.TP
+.B check \fIpath\fR...
+Parse and type-check without running.
+.TP
+.B test [\fIpath\fR...]
+Run every test_* function.
+.TP
+.B new \fIname\fR, init
+Create a project.
+.TP
+.B info
+Version, platform, features and search paths.
+.TP
+.B modules
+List the standard-library modules.
+.TP
+.B help [\fItopic\fR]
+Show help.
+.SH OPTIONS
+.TP
+.B \-\-no\-jit
+Never compile hot functions to machine code; use the interpreter only.
+.TP
+.BI \-I " DIR"
+Add DIR to the #include search path.
+.TP
+.B \-\-no\-typecheck
+Skip the static type checker.
+.SH ENVIRONMENT
+.TP
+.B KC_JIT=0
+Same as \-\-no\-jit.
+.TP
+.B KC_INCLUDE
+Colon-separated #include search path.
+.SH NOTES
+The closure JIT exists on x86-64 only; on ARM64, ARMhf, RISC-V and other CPUs programs run in the interpreter with identical results.
+Run \fBkingcobra help\fR for the complete, current option list.
+.SH AUTHOR
+Divyanshu Sinha <divyanshu.sinha631@gmail.com>

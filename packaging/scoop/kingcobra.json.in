@@ -1,0 +1,24 @@
+{
+    "version": "@VERSION@",
+    "description": "KingCobra programming language: interpreter, REPL, type checker and standard library.",
+    "homepage": "https://github.com/@REPO@",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/@REPO@/releases/download/v@VERSION@/kingcobra-@VERSION@-windows-x64.zip",
+            "hash": "@WIN_SHA256@"
+        }
+    },
+    "bin": [
+        "kingcobra.exe",
+        ["kingcobra.exe", "kc"]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/@REPO@/releases/download/v$version/kingcobra-$version-windows-x64.zip"
+            }
+        }
+    }
+}

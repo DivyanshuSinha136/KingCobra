@@ -1,0 +1,24 @@
+; FBX 7.3.0 project file
+FBXHeaderVersion: 1003
+GlobalSettings:  {
+ Properties70:  {
+  P: "UpAxis", "int", "Integer", "",1
+  P: "UnitScaleFactor", "double", "Number", "",100
+ }
+}
+Objects:  {
+  Geometry: 2001, "Geometry::Cube", "Mesh" {
+    Vertices: *24 {
+      a: -0.5,0,-0.5,0.5,0,-0.5,0.5,1,-0.5,-0.5,1,-0.5,-0.5,0,0.5,0.5,0,0.5,0.5,1,0.5,-0.5,1,0.5
+    }
+    PolygonVertexIndex: *24 {
+      a: 4,5,6,-8,1,0,3,-3,5,1,2,-7,0,4,7,-4,7,6,2,-4,0,1,5,-5
+    }
+  }
+  Model: 2002, "Model::Cube", "Mesh" {
+  }
+}
+Connections:  {
+  C: "OO",2001,2002
+  C: "OO",2002,0
+}
