@@ -214,7 +214,7 @@ jobs:
           mv ../SHA256SUMS.new SHA256SUMS
           cat SHA256SUMS
       - name: Build provenance attestation (check with gh attestation verify)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.deb
