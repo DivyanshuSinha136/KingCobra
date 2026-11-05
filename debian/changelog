@@ -1,0 +1,14 @@
+kingcobra (1.0.0) unstable; urgency=medium
+
+  * First stable release (1.0.0). See docs/CHANGELOG.md.
+
+ -- Divyanshu Sinha <divyanshu.sinha631@gmail.com>  Wed, 04 Nov 2026 12:00:00 +0000
+
+kingcobra (0.10.0) unstable; urgency=medium
+
+  * Support for ARM64, ARMhf and RISC-V (interpreter; JIT is amd64 only).
+  * The JIT probes the platform and falls back to the interpreter.
+  * New --no-jit option and KC_JIT=0.
+  * int(float) is now saturating and identical on every CPU.
+
+ -- Divyanshu Sinha <divyanshu.sinha631@gmail.com>  Mon, 02 Nov 2026 12:00:00 +0000

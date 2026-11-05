@@ -1,0 +1,1 @@
+shlibs:Depends=libc6 (>= 2.38), libreadline8t64 (>= 6.0), libx11-6

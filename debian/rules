@@ -1,0 +1,48 @@
+#!/usr/bin/make -f
+# Debhelper-free packaging: build, install into debian/kingcobra, then
+# dpkg-shlibdeps / dpkg-gencontrol / dpkg-deb. Works natively and for
+# cross builds:  dpkg-buildpackage -us -uc -b -a arm64   (needs crossbuild toolchain)
+include /usr/share/dpkg/architecture.mk
+
+PKG := kingcobra
+D   := $(CURDIR)/debian/$(PKG)
+
+ifneq ($(DEB_BUILD_GNU_TYPE),$(DEB_HOST_GNU_TYPE))
+  CROSS_CC := CC=$(DEB_HOST_GNU_TYPE)-gcc
+  STRIP    := $(DEB_HOST_GNU_TYPE)-strip
+else
+  STRIP    := strip
+endif
+
+build: build-arch
+build-arch:
+	$(MAKE) $(CROSS_CC) all
+build-indep:
+
+clean:
+	$(MAKE) clean
+	rm -rf $(D) debian/substvars debian/files debian/.debhelper
+
+binary: binary-arch binary-indep
+binary-indep:
+binary-arch: build-arch
+	rm -rf $(D)
+	$(MAKE) $(CROSS_CC) install PREFIX=/usr DESTDIR=$(D)
+	$(STRIP) --strip-unneeded $(D)/usr/bin/kingcobra
+	install -d $(D)/usr/share/doc/$(PKG)
+	gzip -9n -f $(D)/usr/share/man/man1/kingcobra.1
+	rm -f $(D)/usr/share/man/man1/kc.1
+	ln -sf kingcobra.1.gz $(D)/usr/share/man/man1/kc.1.gz
+	cp -r docs examples $(D)/usr/share/doc/$(PKG)/
+	find $(D)/usr/share/doc/$(PKG) -name '*.o' -delete -o -name '*.so' -delete
+	install -m 644 README.md $(D)/usr/share/doc/$(PKG)/README.md
+	gzip -9n -c debian/changelog > $(D)/usr/share/doc/$(PKG)/changelog.gz
+	install -m 644 debian/copyright $(D)/usr/share/doc/$(PKG)/copyright
+	find $(D) -type d -exec chmod 755 {} +
+	find $(D)/usr/share -type f -exec chmod 644 {} +
+	dpkg-shlibdeps -edebian/$(PKG)/usr/bin/kingcobra
+	install -d $(D)/DEBIAN
+	dpkg-gencontrol -P$(D)
+	dpkg-deb --root-owner-group --build $(D) ..
+
+.PHONY: build build-arch build-indep clean binary binary-arch binary-indep

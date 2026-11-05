@@ -1,0 +1,19 @@
+Source: kingcobra
+Section: devel
+Priority: optional
+Maintainer: Divyanshu Sinha <divyanshu.sinha631@gmail.com>
+Build-Depends: gcc, make, libx11-dev, libreadline-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: kingcobra
+Architecture: any
+Depends: ${shlibs:Depends}
+Description: KingCobra programming language (interpreter, REPL, debugger, std library)
+ KingCobra is a native systems programming language with a tree-walking
+ interpreter, an optional x86-64 closure JIT, a static type checker, a REPL, a
+ debugger back end and a standard library (system, memory, network, http, json,
+ csv, nlp, nn, gui, mmio, mmu, regx, game, ascii_screen and more).
+ .
+ It runs on amd64, arm64, armhf, riscv64 and i386. The JIT exists on amd64
+ only; every other CPU uses the interpreter with identical results.
