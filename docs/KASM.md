@@ -1,12 +1,15 @@
 # KASM — the KingCobra assembler
 
 `kasm` is an x86 assembler **written in KingCobra** (`kasm/src/*.kc`, no C, no external tools). It reads NASM-style Intel
-syntax and writes flat binaries, Intel HEX, Linux x86-64 executables, linkable ELF64 objects and source arrays. It
+syntax and writes **object code** (flat binaries, ELF64 `.o`, Intel HEX, source arrays); executables and libraries are made by
+**KCC**, which links KASM's object (or `.bin`) with its own linkers (ELF / PE / Mach-O). It
 assembles 16-, 32- and 64-bit code, so the same tool builds boot sectors, kernels, libc-free programs, objects for `gcc`/`ld`,
 and machine code you run in-process with `std.rhex`.
 
 ```
-kasm hello.kasm -f elf -o hello && ./hello                  # Linux executable, no linker involved
+kasm hello.kasm -o hello.o && kcc hello.o -o hello && ./hello   # KASM writes the object, KCC links it
+kasm hello.kasm -f elf -o hello                             # same two steps in one command (KCC's linker runs in-process)
+kasm code.kasm -o code.bin && kcc code.bin -o code          # raw machine code, entry at byte 0 (exported as `main`)
 kasm boot.kasm -o boot.img                                  # flat binary (default)
 kasm lib.kasm -f elfobj -o lib.o && gcc -no-pie main.c lib.o   # object file for gcc / ld
 kasm code.kasm -f kc --name CODE -o -                       # a KingCobra array literal on stdout
@@ -17,11 +20,12 @@ kasm code.kasm -f kc --name CODE -o -                       # a KingCobra array 
 | option | meaning |
 |---|---|
 | `-o FILE` | output (default: input name + the format's extension; `-` = stdout for text formats) |
-| `-f FORMAT` | `bin` (default), `hex` (Intel HEX), `elf` (Linux x86-64 executable), `elfobj` (relocatable `.o`), `kc` / `c` (byte array source), `hexdump`; guessed from the `-o` extension (`.o .hex .elf .kc .h .txt`) |
+| `-f FORMAT` | written by KASM: `bin` (default), `obj` / `elfobj` (relocatable `.o`), `hex`, `kc` / `c`, `hexdump`. Linked by KCC from the object: `exe` / `elf`, `so`, `dll`, `dylib`. Guessed from the `-o` extension (`.o .obj .hex .exe .elf .so .dll .kc .h .txt`) |
+| `--target OS`, `-l LIB`, `--subsystem` | platform (`linux` `windows` `macos`) of `exe/so/dll` output, imported libraries, Windows GUI/console |
 | `-l FILE` / `-m FILE` | listing / section-and-symbol map |
 | `-b 16\|32\|64` | initial `bits` mode (default 64) |
-| `--org ADDR` / `--base ADDR` | flat-binary load address / ELF load address (default `0x400000`) |
-| `--entry SYM` | ELF entry point (default `_start`; without it the first code byte, with a warning) |
+| `--org ADDR` | flat-binary load address (`--base` is accepted and ignored: KCC links position-independent images) |
+| `--entry SYM` | entry of an executable: `main` (C ABI, through KCC's start-up stub) if defined, else `_start` (entered directly, no libc start-up) |
 | `-D NAME[=VAL]`, `-I DIR` | preprocessor define / include directory |
 | `-w`, `-Werror`, `--check` | silence warnings / warnings are errors / assemble without writing |
 
@@ -83,8 +87,8 @@ operand that could mean several sizes is an error rather than a guess.
 |---|---|
 | `bin` | sections laid out from `--org` (or `org`), uninitialised sections omitted — boot sectors, ROMs, shellcode |
 | `hex` | Intel HEX with extended-address records |
-| `elf` | static ELF64 executable: `.text/.rodata` read-execute, `.data/.bss` read-write, section headers and symbols (`objdump -d` works), `PT_GNU_STACK`. Needs `bits 64` |
-| `elfobj` | ELF64 relocatable object: `R_X86_64_64/32/32S/PC32/PLT32/GOTPCREL/…`, section and global symbols, externs, `.note.GNU-stack`. Links with `ld` and `gcc` (PIE and non-PIE) |
+| `exe` / `elf`, `so`, `dll`, `dylib` | KASM writes the object, then KCC's linker (`kcc/src/objin.kc` + `link.kc`) makes the image: ELF64 PIE, shared object, PE32+ or Mach-O. Needs `bits 64`. Code must be position independent (see below) |
+| `obj` / `elfobj` | ELF64 relocatable object: `R_X86_64_64/32/32S/PC32/PLT32/GOTPCREL/…`, section and global symbols, externs, `.note.GNU-stack`. Links with `ld` and `gcc` (PIE and non-PIE) |
 | `kc`, `c` | the bytes as a KingCobra `let name = [ … ];` or a C array |
 | `hexdump` | `xxd`-style dump |
 
@@ -107,14 +111,26 @@ rcx/rdx vs rdi/rsi (see `kasm/examples/kasm_rhex.kc`).
 
 `make test-kasm` (or `sh kasm/tests/verify.sh`) runs, in order: the type check, 22 unit tests, **differential tests that
 assemble 817 instructions with KASM and with GNU `as` and compare the bytes** (`kasm/tools/diff_gas.py`; the golden
-encodings are committed as `kasm/tests/insns*.hex`, so the unit tests need no binutils), and — on Linux x86-64 — runs the
-executables KASM produced, links an object with `gcc`, and executes machine code through `std.rhex`. A 180-branch random jump
+encodings are committed as `kasm/tests/insns*.hex`, so the unit tests need no binutils), and — on Linux x86-64 — builds every example as `.o`/`.bin`, links it with KCC (and a gcc-built object too), runs the results, links an object with `gcc`, and executes machine code through `std.rhex`. A 180-branch random jump
 program relaxes to the same bytes as GNU `as`.
 
 ## Limitations
 
-ELF64 only (no 32-bit ELF, PE/COFF or Mach-O writers); no AVX-512/EVEX, MMX or 3DNow; `dt`/`do`/`dy` data and `%rotate`
+KASM itself writes ELF64 objects only (no 32-bit ELF or COFF/Mach-O objects; KCC links them for other targets); no AVX-512/EVEX, MMX or 3DNow; `dt`/`do`/`dy` data and `%rotate`
 are not implemented; `wrt` supports `..plt` and `..got` only; listings show instruction bytes before relocation; string
 instructions with operands (`movs`, `stos`, …) use the operands only to pick the size; `[rax*2]`-style addresses follow
 NASM (index only, 32-bit displacement). Absolute addresses in memory operands use the 32-bit form unless `default rel`
 or `[rel x]` is given (NASM-compatible).
+
+## Linking with KCC
+
+`kcc input.o -o out` (also `.obj`, `.bin`, or `--raw`) links object code instead of compiling KingCobra source. It reads ELF64
+x86-64 relocatable objects from KASM **and from `gcc -c` / GNU `as`**: sections are merged into text / rodata / data / bss,
+`PC32`, `PLT32`, `GOTPCREL(X)` and `64` relocations are applied by KCC's linkers, undefined symbols become imports
+(`libc.so.6` / `msvcrt.dll` by default, or `-l LIB`). A raw `.bin` becomes one code section with its entry at byte 0
+(`--entry-offset N`, exported as `main` for executables, `code` otherwise; `--symbol NAME`). Executables are entered at `main`
+(C ABI) or `_start` (`--entry SYM`).
+
+Position independence: absolute 32-bit relocations (`mov eax, label`) and absolute 64-bit addresses in code are rejected with an
+explanation, because the images are relocatable. Use `default rel` / `lea reg, [rel sym]`; pointer tables go in `.data`.
+Mach-O executables need a `main`. Windows output from object code is structurally valid but was not run in the test environment.

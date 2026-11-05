@@ -21,6 +21,12 @@ The output extension picks the kind (`.exe` / `.elf` / `.out` / no extension →
 name; `--subsystem windows` makes a Windows GUI program without a console window); `--target linux|windows|macos` picks the OS/ABI for objects
 (`linux`/`macos` use the System V ABI, `windows` the Win64 ABI). `import "other.kc";` pulls another file in.
 
+## Linking object code (`.o`, `.bin`)
+
+`kcc prog.o -o prog` links an ELF64 x86-64 object from **KASM**, GNU `as` or `gcc -c`; `kcc code.bin -o prog` wraps raw machine
+code (entry at byte 0). Options: `--entry SYM` (default `main`, else `_start`), `--entry-offset N`, `--symbol NAME`, `--raw`,
+`-l LIB`, `--target`. Same outputs as for source: executable, `.so`, `.dll`, `.dylib`. See [KASM.md](KASM.md#linking-with-kcc).
+
 ## Pipeline
 
 | Stage | File | |
