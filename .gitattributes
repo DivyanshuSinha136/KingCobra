@@ -1,0 +1,25 @@
+# Normalise line endings: scripts and templates must stay LF even when checked out on Windows
+* text=auto
+*.sh        text eol=lf
+*.in        text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+*.kc        text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+Makefile    text eol=lf
+debian/*    text eol=lf
+*.ps1       text eol=lf
+
+# binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.zip   binary
+*.gz    binary
+
+# files that are not part of the source tarball produced by `git archive` (release "-src" asset)
+.github/            export-ignore
+.gitattributes      export-ignore
+.gitignore          export-ignore
