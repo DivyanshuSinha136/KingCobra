@@ -77,7 +77,7 @@ jobs:
       - name: Build, test and package in a ${{ matrix.image }} container
         run: bash packaging/ci/build-in-container.sh "${{ matrix.platform }}" "${{ matrix.image }}" dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ci-${{ matrix.name }}
@@ -113,7 +113,7 @@ jobs:
           codesign -s - -f kingcobra || true
           mkdir -p dist
           packaging/ci/make-tarball.sh "dist/kingcobra-$ver-macos-${{ matrix.name }}.tar.gz" --no-mime
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ci-macos-${{ matrix.name }}
