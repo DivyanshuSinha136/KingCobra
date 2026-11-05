@@ -1,0 +1,201 @@
+// main.kc -- kcc driver: compile KingCobra source into .o / .so / .dll / .dylib
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.io;
+import std.system;
+import "util.kc" as util;
+import "parser.kc" as parser;
+import "check.kc" as check;
+import "codegen.kc" as cg;
+import "elf_obj.kc" as elf_obj;
+import "elf_so.kc" as elf_so;
+import "coff_obj.kc" as coff_obj;
+import "pe_dll.kc" as pe_dll;
+import "macho.kc" as macho;
+import "flat.kc" as flat;
+
+const USAGE = "kcc -- compile KingCobra into a native executable, shared library or object file\n\n" +
+    "usage: kingcobra kcc/src/main.kc <input.kc> -o <output> [--target linux|windows|macos]\n\n" +
+    "  output extension picks the kind:  .exe     Windows executable (PE32+)   .o/.obj  relocatable object\n" +
+    "                                    (none)   executable for --target      .so      ELF shared library\n" +
+    "                                    .elf/.out  Linux executable           .dll     Windows DLL\n" +
+    "                                                                          .dylib   macOS dylib\n" +
+    "  --exe      build an executable whatever the extension is (needs a `fn main`)\n" +
+    "  --subsystem console|windows   Windows executables: console (default) or GUI (no console window)\n" +
+    "  --target   OS/ABI to generate for (default: from the extension, or this machine for .o / executables)\n" +
+    "  -DNAME[=value]   define a preprocessor macro (#define / #if / #include work as in the interpreter)\n" +
+    "  --target kcos   freestanding flat binary (.bin) for bare metal / KCOS: --base ADDR (default 0x10000), --stack ADDR (default 0x80000), --entry NAME (default kmain), --map\n" +
+    "  -v, --verbose   print each stage as it starts (also: KCC_TRACE=1); shows where a crash happens\n";
+
+var TRACE = false;
+var FLAT_BASE = 0x10000;      // kcos: physical load address of the image
+var FLAT_STACK = 0x80000;     // kcos: initial stack pointer (stack grows down from here)
+var WANT_MAP = false;         // kcos: also write <output>.map
+var FLAT_ENTRY = "kmain";     // kcos: entry function
+
+fn parse_num(t: string) -> int {
+    var s = t;
+    var base = 10;
+    if (len(s) > 2 && (s[0..2] == "0x" || s[0..2] == "0X")) { base = 16; s = s[2..len(s)]; }
+    var v = 0;
+    let digits = "0123456789abcdef";
+    var k = 0;
+    while (k < len(s)) {
+        var d = -1;
+        var j = 0;
+        let ch = s[k].lower();
+        while (j < 16) { if (digits[j] == ch) { d = j; } j = j + 1; }
+        if (d < 0 || d >= base) { println("kcc: bad number '" + t + "'"); system.exit(2); }
+        v = v * base + d;
+        k = k + 1;
+    }
+    return v;
+}
+fn trace(msg: string) { if (TRACE) { println("kcc: [" + msg + "]"); } }
+
+var nsfile = {};          // real path of a module imported `as alias` -> its namespace
+
+fn read_source(path: string, seen, items, ns: string) {
+    let real = system.abspath(path);
+    if (seen.has(real)) { return; }
+    seen[real] = true;
+    if (!io.exists(path)) { throw { message: "cannot open '" + path + "'", line: 0, col: 0, kind: "compile", file: path }; }
+    let src = io.read_file(path);
+    var its = [];
+    try { its = parser.parse_program(preprocess(src, path)); }
+    catch (e) { if (e.kind == "compile") { e["file"] = path; e["src"] = src; } throw e; }
+    for (it in its) {
+        if (it.t == "import") {
+            let child = system.path_join(system.dirname(path), it.path);
+            var cns = "";
+            if (it.alias != "") {
+                let creal = system.abspath(child);
+                if (nsfile.has(creal)) { cns = nsfile[creal]; } else { cns = it.alias; nsfile[creal] = cns; }
+                items.push({ t: "nsalias", alias: it.alias, ns: cns, line: it.line, col: it.col });
+            }
+            read_source(child, seen, items, cns);
+        } else { it["file"] = path; it["ns"] = ns; items.push(it); }
+    }
+}
+
+fn host_target() -> string {
+    let o = system.os();
+    if (o == "windows") { return "windows"; }
+    if (o == "macos") { return "macos"; }
+    return "linux";
+}
+
+fn compile_file(input: string, output: string, target_opt: string, force_exe: bool, subsystem: string) {
+    let ext = system.extension(output);
+    var kind = "object";
+    var target = target_opt;
+    var want = "";                                   // the one target an extension is tied to ("" = any)
+    if (ext == ".so") { kind = "shared"; want = "linux"; }
+    else if (ext == ".dll") { kind = "shared"; want = "windows"; }
+    else if (ext == ".dylib") { kind = "shared"; want = "macos"; }
+    else if (ext == ".o" || ext == ".obj") { kind = "object"; }
+    else if (ext == ".bin") { kind = "flat"; want = "kcos"; }
+    else if (ext == ".exe") { kind = "exe"; want = "windows"; }
+    else if (ext == ".elf" || ext == ".out") { kind = "exe"; want = "linux"; }
+    else if (ext == "") { kind = "exe"; }
+    else if (!force_exe) { throw { message: "unknown output extension '" + ext + "' (use .exe .elf .out .o .obj .so .dll .dylib, no extension for an executable, or --exe)", line: 0, col: 0, kind: "compile" }; }
+    if (force_exe) { kind = "exe"; }
+    if (target == "") { target = (want != "") ? want : host_target(); }
+    if (want != "" && kind != "object" && want != target) { throw { message: "a '" + ext + "' file can only be built for target " + want, line: 0, col: 0, kind: "compile" }; }
+    if (subsystem != "console" && subsystem != "windows") { throw { message: "unknown --subsystem '" + subsystem + "' (use console or windows)", line: 0, col: 0, kind: "compile" }; }
+    if (target == "kcos" && kind != "flat") { throw { message: "--target kcos produces a flat binary: use an output name ending in .bin", line: 0, col: 0, kind: "compile" }; }
+    let items = [];
+    trace("parse " + input + " (kind=" + kind + ", target=" + target + ")");
+    parser.reset();
+    nsfile = {};
+    read_source(input, {}, items, "");
+    trace("check " + str(len(items)) + " top-level items");
+    let ctx = check.check_program(items);
+    trace("codegen target=" + target);
+    let mod = cg.gen_module(ctx, target, system.getenv("KCC_FORCE_ABI") ?? "");
+    if (kind == "exe") {
+        var has_main = false;
+        for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { has_main = true; } }
+        if (!has_main) { throw { message: "an executable needs a `fn main` (define `fn main() -> int { ... }`; it may take (argc: int, argv: **u8))", line: 0, col: 0, kind: "compile", file: input }; }
+    }
+    trace("write " + mod.fmt + " " + kind);
+    var out = null;
+    if (kind == "flat") {
+        let info = flat.build(mod, FLAT_BASE, FLAT_STACK, FLAT_ENTRY);
+        out = info.stream;
+        if (WANT_MAP) { io.write_file(output + ".map", flat.map_text(mod, info)); }
+    } else if (kind == "object") {
+        if (mod.fmt == "elf") { out = elf_obj.build(mod); }
+        else if (mod.fmt == "coff") { out = coff_obj.build(mod); }
+        else if (mod.fmt == "macho") { out = macho.build_obj(mod); }
+    } else {
+        let exe = (kind == "exe");
+        if (mod.fmt == "elf") { out = elf_so.build(mod, system.basename(output), exe); }
+        else if (mod.fmt == "coff") { out = pe_dll.build(mod, system.basename(output), exe, subsystem == "windows" ? 2 : 3); }
+        else if (mod.fmt == "macho") { out = macho.build_image(mod, "@rpath/" + system.basename(output), exe); }
+    }
+    if (out == null) { throw { message: "internal error: no writer for format '" + mod.fmt + "' (" + kind + ")", line: 0, col: 0, kind: "compile" }; }
+    trace("save " + output);
+    fbin.save(out, output);
+    if (!io.exists(output)) { throw { message: "internal error: '" + output + "' was not created (blocked by antivirus or a locked file?)", line: 0, col: 0, kind: "compile" }; }
+    if (kind == "exe" && target != "windows") { system.chmod(output, 493); }     // 0755: loaders refuse a non-executable file
+    return { module: mod, bytes: fbin.size(out), kind: kind, target: target };
+}
+
+fn main() {
+    let args = system.args();
+    var input = "";
+    var output = "";
+    var target = "";
+    var force_exe = false;
+    var subsystem = "console";
+    var i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        if (a == "-o" && i + 1 < len(args)) { output = args[i + 1]; i = i + 2; continue; }
+        if (a == "--target" && i + 1 < len(args)) { target = args[i + 1]; i = i + 2; continue; }
+        if (a == "--subsystem" && i + 1 < len(args)) { subsystem = args[i + 1]; i = i + 2; continue; }
+        if (a == "--exe") { force_exe = true; i = i + 1; continue; }
+        if (a == "--base" && i + 1 < len(args)) { FLAT_BASE = parse_num(args[i + 1]); i = i + 2; continue; }
+        if (a == "--stack" && i + 1 < len(args)) { FLAT_STACK = parse_num(args[i + 1]); i = i + 2; continue; }
+        if (a == "--entry" && i + 1 < len(args)) { FLAT_ENTRY = args[i + 1]; i = i + 2; continue; }
+        if (a == "--map") { WANT_MAP = true; i = i + 1; continue; }
+        if (util.starts_with(a, "-D") && len(a) > 2) { pp_define(a[2..len(a)]); i = i + 1; continue; }
+        if (a == "-h" || a == "--help") { print(USAGE); system.exit(0); }
+        if (a == "-v" || a == "--verbose") { TRACE = true; util.set_trace(true); i = i + 1; continue; }
+        if (util.starts_with(a, "-")) { println("kcc: unknown option " + a); system.exit(2); }
+        input = a;
+        i = i + 1;
+    }
+    if (input == "") { print(USAGE); system.exit(2); }
+    if (output == "") {
+        if (force_exe) { output = system.stem(input) + ((target == "windows" || (target == "" && host_target() == "windows")) ? ".exe" : ""); }
+        else { output = system.stem(input) + ".so"; }
+    }
+    if (system.getenv("KCC_TRACE") != null && system.getenv("KCC_TRACE") != "") { TRACE = true; util.set_trace(true); }
+    try {
+        let r = compile_file(input, output, target, force_exe, subsystem);
+        println("kcc: wrote " + output + " (" + str(r.bytes) + " bytes" + (r.kind == "exe" ? ", " + r.target + " executable" : "") + ")");
+    } catch (e) {
+        if (e.kind == "compile") {
+            let f = e["file"] == null ? input : e["file"];
+            if (e.line > 0) {
+                println(f + ":" + str(e.line) + ":" + str(e.col) + ": error: " + e.message);
+                if (e["src"] != null) {
+                    let lines = e["src"].split("\n");
+                    if (e.line <= len(lines)) {
+                        println("  " + str(e.line) + " | " + lines[e.line - 1]);
+                        println("  " + " ".repeat(len(str(e.line))) + " | " + " ".repeat(e.col - 1) + "^");
+                    }
+                }
+            } else { println("kcc: error: " + e.message); }
+            system.exit(1);
+        }
+        // not a compile diagnostic: never fail silently
+        var msg = "unexpected failure";
+        if (e != null && e["message"] != null) { msg = str(e["message"]); } else if (e != null) { msg = str(e); }
+        println("kcc: internal error while building '" + output + "': " + msg);
+        println("kcc: re-run with --verbose to see which stage failed");
+        system.exit(1);
+    }
+}

@@ -1,0 +1,291 @@
+// pe_dll.kc -- native PE32+ (x86-64) DLL linker, no external tools.
+// Author: Divyanshu Sinha (MIT License)
+//
+// Lays the module out as a Windows DLL: .text (code + import stubs), .rdata (strings, import and export
+// tables), .data (+ .bss as virtual size) and .reloc (DIR64 base relocations). Imports are called through
+// small `jmp [IAT slot]` stubs, exactly like the ELF writer does with the GOT.
+import std.fbin;
+import "util.kc" as util;
+import "entry.kc" as entry;
+
+const IMAGE_BASE = 0x180000000;        // DLLs
+const EXE_BASE = 0x140000000;          // executables (the conventional x64 default)
+const SECT_ALIGN = 0x1000;
+const FILE_ALIGN = 0x200;
+
+fn rva_align(n: int) -> int { return util.align_up(n, SECT_ALIGN); }
+fn file_align(n: int) -> int { return util.align_up(n, FILE_ALIGN); }
+
+fn put_name(s, name: string) {
+    fbin.write_u16(s, 0);                 // hint
+    util.write_cstr(s, name);
+    if ((len(name) + 1) % 2 == 1) { fbin.write_u8(s, 0); }
+}
+
+fn cmp_sym(a, b) -> int { return util.str_cmp(a.name, b.name); }
+
+/// Write pending base-relocation entries of one page into `rel`, then clear them.
+fn flush_page(rel, page: int, entries) {
+    if (page < 0) { return 0; }
+    if (len(entries) % 2 == 1) { entries.push(0); }
+    fbin.write_u32(rel, page);
+    fbin.write_u32(rel, 8 + 2 * len(entries));
+    for (e in entries) { fbin.write_u16(rel, e); }
+    entries.clear();
+    return 0;
+}
+
+/// One 40-byte PE section header.
+fn sect(out, name: string, vsize: int, rva: int, rawsz: int, fo: int, chars: int) {
+    fbin.write_string(out, name); fbin.fill(out, 0, 8 - len(name));
+    fbin.write_u32(out, vsize); fbin.write_u32(out, rva);
+    fbin.write_u32(out, rawsz); fbin.write_u32(out, rawsz == 0 ? 0 : fo);
+    fbin.write_u32(out, 0); fbin.write_u32(out, 0);
+    fbin.write_u16(out, 0); fbin.write_u16(out, 0);
+    fbin.write_u32(out, chars);
+    return 0;
+}
+
+/// Build the .rdata contents. Called twice: the first call (data_rva == 0) only measures the size.
+fn build_rdata(mod, dllname: string, rdata_rva: int, text_rva: int, data_rva: int, bss_rva: int, groups, stub_base: int, exe: bool) {
+    let r = fbin.buffer();
+    // rodata first, so rodata offsets are rdata_rva + off
+    fbin.write_bytes(r, fbin.to_bytes(mod.rodata, 0, fbin.size(mod.rodata)));
+    util.pad_to(r, 16, 0);
+    let info = { iat: {}, iat_start: 0, iat_size: 0, import_dir: 0, import_size: 0, export_dir: 0, export_size: 0 };
+    // hint/name entries
+    let hn = {};
+    for (g in groups) {
+        for (name in g.names) { util.pad_to(r, 2, 0); hn[name] = (rdata_rva + fbin.size(r)); put_name(r, name); }
+    }
+    // IATs (contiguous), then ILTs
+    util.pad_to(r, 8, 0);
+    info.iat_start = (rdata_rva + fbin.size(r));
+    for (g in groups) {
+        g["iat_rva"] = (rdata_rva + fbin.size(r));
+        for (name in g.names) { info.iat[name] = (rdata_rva + fbin.size(r)); fbin.write_u64(r, hn[name]); }
+        fbin.write_u64(r, 0);
+    }
+    info.iat_size = (rdata_rva + fbin.size(r)) - info.iat_start;
+    for (g in groups) {
+        g["ilt_rva"] = (rdata_rva + fbin.size(r));
+        for (name in g.names) { fbin.write_u64(r, hn[name]); }
+        fbin.write_u64(r, 0);
+    }
+    for (g in groups) { g["name_rva"] = (rdata_rva + fbin.size(r)); util.write_cstr(r, g.dll); }
+    util.pad_to(r, 4, 0);
+    // import directory
+    if (len(groups) > 0) {
+        info.import_dir = (rdata_rva + fbin.size(r));
+        for (g in groups) {
+            fbin.write_u32(r, g.ilt_rva); fbin.write_u32(r, 0); fbin.write_u32(r, 0);
+            fbin.write_u32(r, g.name_rva); fbin.write_u32(r, g.iat_rva);
+        }
+        for (i in 0..5) { fbin.write_u32(r, 0); }
+        info.import_size = (rdata_rva + fbin.size(r)) - info.import_dir;
+    }
+    // export directory
+    let exps = [];
+    if (!exe) { for (s in mod.syms) { if (s.global) { exps.push(s); } } }     // an .exe exports nothing
+    exps.sort(cmp_sym);
+    if (len(exps) > 0) {
+        util.pad_to(r, 4, 0);
+        info.export_dir = (rdata_rva + fbin.size(r));
+        let n = len(exps);
+        let dir_size = 40;
+        let funcs_rva = info.export_dir + dir_size;
+        let names_rva = funcs_rva + 4 * n;
+        let ords_rva = names_rva + 4 * n;
+        var str_rva = ords_rva + 2 * n;
+        let dll_rva = str_rva;
+        str_rva = str_rva + len(dllname) + 1;
+        let name_rvas = [];
+        for (s in exps) { name_rvas.push(str_rva); str_rva = str_rva + len(s.name) + 1; }
+        fbin.write_u32(r, 0); fbin.write_u32(r, 0); fbin.write_u16(r, 0); fbin.write_u16(r, 0);
+        fbin.write_u32(r, dll_rva); fbin.write_u32(r, 1);
+        fbin.write_u32(r, n); fbin.write_u32(r, n);
+        fbin.write_u32(r, funcs_rva); fbin.write_u32(r, names_rva); fbin.write_u32(r, ords_rva);
+        for (s in exps) {
+            var base = text_rva;
+            if (s.sec == "rodata") { base = rdata_rva; } else if (s.sec == "data") { base = data_rva; } else if (s.sec == "bss") { base = bss_rva; }
+            fbin.write_u32(r, base + s.off);
+        }
+        for (x in name_rvas) { fbin.write_u32(r, x); }
+        for (i in 0..n) { fbin.write_u16(r, i); }
+        util.write_cstr(r, dllname);
+        for (s in exps) { util.write_cstr(r, s.name); }
+        info.export_size = (rdata_rva + fbin.size(r)) - info.export_dir;
+    }
+    info["stream"] = r;
+    return info;
+}
+
+/// Build a DLL (`exe == false`) or an executable (`exe == true`; `subsystem` 3 = console, 2 = GUI).
+fn build(mod, dllname: string, exe: bool, subsystem: int) {
+    let text_len = fbin.size(mod.text);
+    let data_len = fbin.size(mod.data);
+    let ibase = exe ? EXE_BASE : IMAGE_BASE;
+    let imports = [];
+    for (u in mod.undef) { imports.push(u); }
+    if (exe) {
+        var has_main = false;
+        for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { has_main = true; } }
+        if (!has_main) { util.fail("an executable needs a `fn main` (define `fn main() -> int { ... }`)", 0, 0); }
+        // start-up code needs C runtime start-up and exit (msvcrt.dll exists on every Windows)
+        if (!imports.contains("__getmainargs")) { imports.push("__getmainargs"); }
+        if (!imports.contains("exit")) { imports.push("exit"); }
+    }
+    // group imports by DLL (in first-use order)
+    let groups = [];
+    for (u in imports) {
+        let dll = mod.import_lib.has(u) ? mod.import_lib[u] : "msvcrt.dll";
+        var found = null;
+        for (g in groups) { if (g.dll == dll) { found = g; } }
+        if (found == null) { found = { dll: dll, names: [] }; groups.push(found); }
+        found.names.push(u);
+    }
+    let text_rva = SECT_ALIGN;
+    let stubs_rva = text_rva + util.align_up(text_len, 16);
+    let entry_rva = util.align_up(stubs_rva + 8 * len(imports), 16);
+    let text_vsize = exe ? (entry_rva - text_rva) + entry.WIN64_LEN : (stubs_rva - text_rva) + 8 * len(imports);
+    let rdata_rva = rva_align(text_rva + text_vsize);
+    util.trace("pe: measure .rdata");
+    let probe = build_rdata(mod, dllname, rdata_rva, text_rva, 0, 0, groups, stubs_rva, exe);
+    let rdata_size = fbin.size(probe.stream);
+    let data_rva = rva_align(rdata_rva + rdata_size);
+    let data_vsize = util.align_up(data_len, 16) + mod.bss;
+    let bss_rva = data_rva + util.align_up(data_len, 16);
+    util.trace("pe: build .rdata (imports/exports)");
+    let rd = build_rdata(mod, dllname, rdata_rva, text_rva, data_rva, bss_rva, groups, stubs_rva, exe);
+    let rdata = rd.stream;
+    let reloc_rva = rva_align(data_rva + (data_vsize > 0 ? data_vsize : 1));
+
+    util.trace("pe: patch relocations");
+    // ---- symbol RVAs and patching
+    var base = { text: text_rva, rodata: rdata_rva, data: data_rva, bss: bss_rva };
+    let symrva = {};
+    for (s in mod.syms) { symrva[s.name] = base[s.sec] + s.off; }
+    let text = fbin.from_bytes(fbin.to_bytes(mod.text, 0, text_len));
+    let data = fbin.from_bytes(fbin.to_bytes(mod.data, 0, data_len));
+    let stub_of = {};
+    var i = 0;
+    for (u in imports) { stub_of[u] = stubs_rva + 8 * i; i = i + 1; }
+    let reloc_sites = [];
+    for (r in mod.relocs) {
+        if (r.kind == "abs64") {
+            util.patch_u64(data, r.off, ibase + symrva[r.sym] + r.addend);
+            reloc_sites.push(data_rva + r.off);
+            continue;
+        }
+        let place = text_rva + r.off;
+        let s = (r.kind == "call_ext") ? stub_of[r.sym] : symrva[r.sym];
+        util.patch_i32(text, r.off, s + r.addend - place);
+    }
+    let stubs = fbin.buffer();
+    for (u in imports) {
+        let at = stub_of[u];
+        fbin.write_u8(stubs, 0xFF); fbin.write_u8(stubs, 0x25);
+        fbin.write_i32(stubs, rd.iat[u] - (at + 6));
+        fbin.write_u8(stubs, 0xCC); fbin.write_u8(stubs, 0xCC);
+    }
+    util.trace("pe: base relocations");
+    // base relocation blocks
+    let rel = fbin.buffer();
+    var page = -1;
+    let entries = [];
+    for (site in reloc_sites) {
+        let pg = site & ~0xFFF;
+        if (pg != page) { flush_page(rel, page, entries); page = pg; }
+        entries.push((10 << 12) | (site & 0xFFF));
+    }
+    if (page < 0) { page = text_rva; entries.push(0); }      // an empty-but-valid table
+    flush_page(rel, page, entries);
+    let rel_size = fbin.size(rel);
+
+    // ---- file layout
+    let nsec = 4;
+    let hdr_size = file_align(64 + 4 + 20 + 240 + 40 * nsec);
+    let text_raw = file_align(text_vsize);
+    let rdata_raw = file_align(rdata_size);
+    let data_raw = file_align(data_len);
+    let rel_raw = file_align(rel_size);
+    let text_fo = hdr_size;
+    let rdata_fo = text_fo + text_raw;
+    let data_fo = rdata_fo + rdata_raw;
+    let rel_fo = data_fo + data_raw;
+    let file_size = rel_fo + rel_raw;
+    let image_size = rva_align(reloc_rva + rel_size);
+
+    util.trace("pe: headers (file size " + str(file_size) + ")");
+    let out = fbin.buffer();
+    fbin.fill(out, 0, file_size);
+    // DOS header
+    fbin.seek(out, 0);
+    fbin.write_bytes(out, [0x4D, 0x5A]);
+    fbin.seek(out, 0x3C);
+    fbin.write_u32(out, 64);
+    fbin.seek(out, 64);
+    fbin.write_bytes(out, [0x50, 0x45, 0, 0]);
+    fbin.write_u16(out, 0x8664);
+    fbin.write_u16(out, nsec);
+    fbin.write_u32(out, 0);
+    fbin.write_u32(out, 0);
+    fbin.write_u32(out, 0);
+    fbin.write_u16(out, 240);
+    fbin.write_u16(out, exe ? 0x0022 : 0x2022);      // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE (| DLL)
+    // optional header
+    fbin.write_u16(out, 0x20B);
+    fbin.write_u8(out, 14); fbin.write_u8(out, 0);
+    fbin.write_u32(out, text_raw);
+    fbin.write_u32(out, rdata_raw + data_raw + rel_raw);
+    fbin.write_u32(out, mod.bss);
+    fbin.write_u32(out, exe ? entry_rva : 0);        // entry point (a DLL has none: no DllMain)
+    fbin.write_u32(out, text_rva);
+    fbin.write_u64(out, ibase);
+    fbin.write_u32(out, SECT_ALIGN);
+    fbin.write_u32(out, FILE_ALIGN);
+    fbin.write_u16(out, 6); fbin.write_u16(out, 0);
+    fbin.write_u16(out, 0); fbin.write_u16(out, 0);
+    fbin.write_u16(out, 6); fbin.write_u16(out, 0);
+    fbin.write_u32(out, 0);
+    fbin.write_u32(out, image_size);
+    fbin.write_u32(out, hdr_size);
+    fbin.write_u32(out, 0);
+    fbin.write_u16(out, subsystem);         // 3 = console, 2 = GUI
+    fbin.write_u16(out, 0x8160);            // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+    fbin.write_u64(out, 0x100000);
+    fbin.write_u64(out, 0x1000);
+    fbin.write_u64(out, 0x100000);
+    fbin.write_u64(out, 0x1000);
+    fbin.write_u32(out, 0);
+    fbin.write_u32(out, 16);
+    for (d in 0..16) {
+        var a = 0; var sz = 0;
+        if (d == 0) { a = rd.export_dir; sz = rd.export_size; }
+        else if (d == 1) { a = rd.import_dir; sz = rd.import_size; }
+        else if (d == 5) { a = reloc_rva; sz = rel_size; }
+        else if (d == 12 && len(groups) > 0) { a = rd.iat_start; sz = rd.iat_size; }
+        fbin.write_u32(out, a); fbin.write_u32(out, sz);
+    }
+    sect(out, ".text", text_vsize, text_rva, text_raw, text_fo, 0x60000020);
+    sect(out, ".rdata", rdata_size, rdata_rva, rdata_raw, rdata_fo, 0x40000040);
+    sect(out, ".data", data_vsize > 0 ? data_vsize : 16, data_rva, data_raw, data_fo, 0xC0000040);
+    sect(out, ".reloc", rel_size, reloc_rva, rel_raw, rel_fo, 0x42000040);
+    util.trace("pe: section contents");
+    // section contents
+    fbin.seek(out, text_fo);
+    fbin.write_bytes(out, fbin.to_bytes(text, 0, text_len));
+    fbin.seek(out, text_fo + (stubs_rva - text_rva));
+    fbin.write_bytes(out, fbin.to_bytes(stubs, 0, fbin.size(stubs)));
+    if (exe) {
+        let code = entry.win64(entry_rva, rd.iat["__getmainargs"], symrva["main"], rd.iat["exit"]);
+        fbin.seek(out, text_fo + (entry_rva - text_rva));
+        fbin.write_bytes(out, fbin.to_bytes(code, 0, fbin.size(code)));
+    }
+    fbin.seek(out, rdata_fo);
+    fbin.write_bytes(out, fbin.to_bytes(rdata, 0, rdata_size));
+    if (data_len > 0) { fbin.seek(out, data_fo); fbin.write_bytes(out, fbin.to_bytes(data, 0, data_len)); }
+    fbin.seek(out, rel_fo);
+    fbin.write_bytes(out, fbin.to_bytes(rel, 0, rel_size));
+    return out;
+}

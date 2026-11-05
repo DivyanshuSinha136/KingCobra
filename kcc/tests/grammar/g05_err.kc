@@ -1,0 +1,21 @@
+fn risky(n: int) -> int {
+    if (n > 2) { throw n * 100; }
+    return n;
+}
+fn guarded(n: int) -> int {
+    defer println("guard done", n);
+    return risky(n) + 1;
+}
+fn main() -> int {
+    try { println("ok", guarded(1)); } catch (e) { println("caught", e); }
+    try { println("ok", guarded(5)); } catch (e) { println("caught", e); }
+    for (i in 0..3) {
+        defer println("end of iteration", i);
+        if (i == 1) { continue; }
+        println("body", i);
+    }
+    try {
+        try { throw 7; } catch (inner) { println("inner", inner); throw inner + 1; }
+    } catch (outer) { println("outer", outer); }
+    return 0;
+}

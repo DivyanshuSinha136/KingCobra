@@ -1,0 +1,80 @@
+// entry.kc -- process entry-point stubs for executables (.exe / ELF / Mach-O), no external tools.
+// Author: Divyanshu Sinha (MIT License)
+//
+// A KingCobra program starts at `fn main`. The OS does not call `main` directly, so for ELF and PE
+// the linker adds a few bytes of start-up code ("crt0") that fetches argc/argv, calls `main` and exits
+// with its return value. (Mach-O needs none: dyld calls LC_MAIN's `main` and then exit()s with the result.)
+//
+// Every function here takes the final addresses of its targets in ONE address space (file offsets for
+// ELF, RVAs for PE) and `at`, the address the stub itself will be placed at, and returns the bytes.
+import std.fbin;
+import "util.kc" as util;
+
+/// Append `n` raw bytes, then a rel32 to `target` (the displacement is relative to the end of the instruction,
+/// which is `tail` bytes after the displacement field).
+fn rel32(s, at: int, target: int, tail: int) {
+    fbin.seek(s, 0, "end");
+    let field = fbin.tell(s);
+    fbin.write_i32(s, target - (at + field + 4 + tail));
+}
+
+/// Windows x64. Entered by the loader with rsp = 8 (mod 16).
+///   __getmainargs(&argc, &argv, &envp, 0, &startinfo); exit(main(argc, argv, envp));
+/// `exit` (msvcrt) flushes C stdio, which a bare ExitProcess would not.
+fn win64(at: int, getmainargs_slot: int, main_rva: int, exit_slot: int) {
+    let s = fbin.buffer();
+    fbin.write_bytes(s, [0x48, 0x83, 0xEC, 0x58]);                              // sub  rsp, 0x58   (32 shadow + 5th arg + locals)
+    fbin.write_bytes(s, [0x48, 0xC7, 0x44, 0x24, 0x48, 0, 0, 0, 0]);            // mov  qword [rsp+0x48], 0   (_startupinfo)
+    fbin.write_bytes(s, [0x48, 0x8D, 0x4C, 0x24, 0x30]);                        // lea  rcx, [rsp+0x30]       &argc
+    fbin.write_bytes(s, [0x48, 0x8D, 0x54, 0x24, 0x38]);                        // lea  rdx, [rsp+0x38]       &argv
+    fbin.write_bytes(s, [0x4C, 0x8D, 0x44, 0x24, 0x40]);                        // lea  r8,  [rsp+0x40]       &envp
+    fbin.write_bytes(s, [0x45, 0x31, 0xC9]);                                    // xor  r9d, r9d              doWildCard = 0
+    fbin.write_bytes(s, [0x48, 0x8D, 0x44, 0x24, 0x48]);                        // lea  rax, [rsp+0x48]
+    fbin.write_bytes(s, [0x48, 0x89, 0x44, 0x24, 0x20]);                        // mov  [rsp+0x20], rax       5th argument
+    fbin.write_bytes(s, [0xFF, 0x15]); rel32(s, at, getmainargs_slot, 0);      // call [__getmainargs]
+    fbin.write_bytes(s, [0x8B, 0x4C, 0x24, 0x30]);                              // mov  ecx, [rsp+0x30]       argc
+    fbin.write_bytes(s, [0x48, 0x8B, 0x54, 0x24, 0x38]);                        // mov  rdx, [rsp+0x38]       argv
+    fbin.write_bytes(s, [0x4C, 0x8B, 0x44, 0x24, 0x40]);                        // mov  r8,  [rsp+0x40]       envp
+    fbin.write_bytes(s, [0xE8]); rel32(s, at, main_rva, 0);                     // call main
+    fbin.write_bytes(s, [0x89, 0xC1]);                                          // mov  ecx, eax
+    fbin.write_bytes(s, [0xFF, 0x15]); rel32(s, at, exit_slot, 0);              // call [exit]
+    fbin.write_u8(s, 0xCC);
+    return s;
+}
+const WIN64_LEN = 75;
+
+/// Linux x86-64 with libc: the standard crt1 sequence, handing control to __libc_start_main(main, argc, argv, ...)
+/// so stdio, atexit handlers and exit() behave exactly as in a C program.
+fn linux_libc(at: int, main_addr: int, start_main_got: int) {
+    let s = fbin.buffer();
+    fbin.write_bytes(s, [0x31, 0xED]);                                          // xor  ebp, ebp
+    fbin.write_bytes(s, [0x49, 0x89, 0xD1]);                                    // mov  r9, rdx               rtld_fini (from ld.so)
+    fbin.write_bytes(s, [0x5E]);                                                // pop  rsi                   argc
+    fbin.write_bytes(s, [0x48, 0x89, 0xE2]);                                    // mov  rdx, rsp              argv
+    fbin.write_bytes(s, [0x48, 0x83, 0xE4, 0xF0]);                              // and  rsp, -16
+    fbin.write_bytes(s, [0x50]);                                                // push rax
+    fbin.write_bytes(s, [0x54]);                                                // push rsp                   stack_end
+    fbin.write_bytes(s, [0x45, 0x31, 0xC0]);                                    // xor  r8d, r8d              init  = NULL
+    fbin.write_bytes(s, [0x31, 0xC9]);                                          // xor  ecx, ecx              fini  = NULL
+    fbin.write_bytes(s, [0x48, 0x8D, 0x3D]); rel32(s, at, main_addr, 0);        // lea  rdi, [rip + main]
+    fbin.write_bytes(s, [0xFF, 0x15]); rel32(s, at, start_main_got, 0);         // call [__libc_start_main]
+    fbin.write_u8(s, 0xF4);                                                     // hlt
+    return s;
+}
+const LINUX_LIBC_LEN = 34;
+
+/// Linux x86-64 without any library: main(argc, argv), then the exit_group-style `exit` system call.
+fn linux_raw(at: int, main_addr: int) {
+    let s = fbin.buffer();
+    fbin.write_bytes(s, [0x31, 0xED]);                                          // xor  ebp, ebp
+    fbin.write_bytes(s, [0x48, 0x8B, 0x3C, 0x24]);                              // mov  rdi, [rsp]            argc
+    fbin.write_bytes(s, [0x48, 0x8D, 0x74, 0x24, 0x08]);                        // lea  rsi, [rsp+8]          argv
+    fbin.write_bytes(s, [0x48, 0x83, 0xE4, 0xF0]);                              // and  rsp, -16
+    fbin.write_bytes(s, [0xE8]); rel32(s, at, main_addr, 0);                    // call main
+    fbin.write_bytes(s, [0x89, 0xC7]);                                          // mov  edi, eax
+    fbin.write_bytes(s, [0xB8, 0x3C, 0, 0, 0]);                                 // mov  eax, 60               SYS_exit
+    fbin.write_bytes(s, [0x0F, 0x05]);                                          // syscall
+    fbin.write_bytes(s, [0x0F, 0x0B]);                                          // ud2
+    return s;
+}
+const LINUX_RAW_LEN = 31;

@@ -1,0 +1,79 @@
+// features.kc -- second coverage program: nested aggregates, out-params, stack arguments, f32 storage.
+struct Inner { a: i16, b: u8 }
+struct Outer { id: int, inner: Inner, vals: f32[4], grid: int[2][3] }
+struct Pair { lo: int, hi: int }
+
+var gpair: Pair;
+var gouter: Outer;
+var names: *u8[3];
+let msg: *u8 = "abc";
+
+fn is_even(n: int) -> bool { if (n == 0) { return true; } return is_odd(n - 1); }
+fn is_odd(n: int) -> bool { if (n == 0) { return false; } return is_even(n - 1); }
+
+fn out_params(a: int, b: int, lo: *int, hi: *int) {
+    if (a < b) { *lo = a; *hi = b; } else { *lo = b; *hi = a; }
+}
+fn use_out() -> int { var l = 0; var h = 0; out_params(9, 4, &l, &h); return l * 100 + h; }
+
+fn stack_args(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int {
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + 8*h + 9*i;
+}
+fn float_stack(a: float, b: float, c: float, d: float, e: float, f: float, g: float, h: float, i: float, j: int) -> float {
+    return a + b + c + d + e + f + g + h + i * j as float;
+}
+fn grid_sum() -> int {
+    gouter.id = 7;
+    for (i in 0..2) { for (j in 0..3) { gouter.grid[i][j] = (i + 1) * 10 + j; } }
+    var s = 0;
+    for (i in 0..2) { for (j in 0..3) { s += gouter.grid[i][j]; } }
+    return s + gouter.id;
+}
+fn nested_struct() -> int {
+    gouter.inner.a = -300; gouter.inner.b = 200;
+    return gouter.inner.a + gouter.inner.b;
+}
+fn f32_store() -> float {
+    gouter.vals[0] = 1.5; gouter.vals[1] = 2.25; gouter.vals[3] = 0.125;
+    return gouter.vals[0] + gouter.vals[1] + gouter.vals[3];
+}
+fn compound() -> int {
+    let p: Pair;
+    p.lo = 5; p.hi = 6;
+    p.lo += 10; p.hi *= 7; p.lo <<= 2; p.hi -= 1;
+    var arr: int[4];
+    arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4;
+    arr[2] *= 10; arr[3] %= 3;
+    var f = 1.5;
+    f *= 4.0; f += 1;
+    return p.lo * 1000 + p.hi + arr[2] * 100000 + arr[3] * 10000000 + f as int * 1000000000;
+}
+fn chars(i: int) -> int { return msg[i] as int + 'a' + '\n'; }
+fn pp() -> int {
+    var x = 5;
+    var px: *int = &x;
+    var ppx: **int = &px;
+    **ppx = 42;
+    return x;
+}
+fn bool_fn(b: bool, c: bool) -> int { return b && !c ? 1 : 0; }
+fn neg_mod(a: int, b: int) -> int { return a % b; }
+fn shifts(x: u64) -> u64 { return (x >> 4) + (x >>> 60); }
+fn sshift(x: int) -> int { return (x >> 1) + (x >>> 63); }
+fn pair_global() -> int { gpair.lo = 3; gpair.hi = 4; return gpair.lo * gpair.hi; }
+fn void_fn(p: *int) { *p = 99; }
+fn call_void() -> int { var x = 0; void_fn(&x); return x; }
+fn u8_cmp(a: u8, b: u8) -> int { return a < b ? 1 : (a == b ? 0 : -1); }
+fn ptr_arith() -> int {
+    let a: int[5];
+    for (i in 0..5) { a[i] = i * 11; }
+    let p: *int = &a[1];
+    let q: *int = &a[4];
+    return *(p + 2) + (q - p) as int * 1000 + p[1];
+}
+fn sizes() -> int { return sizeof(Inner) * 1 + sizeof(Outer) * 100 + sizeof(*u8) * 100000 + offsetof(Outer, grid) * 1000000; }
+fn big_frame() -> int {
+    let buf: u8[20000];
+    buf[0] = 1; buf[19999] = 2;
+    return buf[0] + buf[19999];
+}

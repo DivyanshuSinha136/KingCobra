@@ -1,0 +1,24 @@
+struct Counter { n: int }
+impl Counter {
+    fn make(start: int) -> Counter { return Counter { n: start }; }
+    fn inc(self, by: int = 1) -> int { self.n += by; return self.n; }
+}
+fn add(a: int, b: int = 10, c: int = 100) -> int { return a + b + c; }
+fn apply(f: fn(int) -> int, v: int) -> int { return f(v); }
+fn double(x: int) -> int { return x * 2; }
+fn max<T>(a: T, b: T) -> T { return a > b ? a : b; }
+fn swap<T>(a: *T, b: *T) { let t = *a; *a = *b; *b = t; }
+var handler: fn(int) -> int = double;
+fn main() -> int {
+    println(add(1), add(1, 2), add(1, 2, 3));
+    var c: Counter = Counter { n: 5 };
+    println(c.inc(), c.inc(10), c.n);
+    println(apply(double, 21), apply(fn(x: int) -> int { return x + 1000; }, 5));
+    println(max(3, 9), max(8, 2));
+    var p = 1; var q = 2;
+    swap(&p, &q);
+    println(p, q, handler(4));
+    let f: fn(int) -> int = double;
+    println(f(8), f == double, f != null);
+    return 0;
+}

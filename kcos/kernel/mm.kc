@@ -1,0 +1,157 @@
+// mm.kc -- physical memory manager (bitmap over the BIOS E820 map) and the kernel heap.  Author: Divyanshu Sinha (MIT License)
+const BOOTINFO = 0x500;
+const E820_ENTRIES = 0x510;
+const PMM_BITMAP = 0x100000;          // 128 KiB bitmap: 1 bit per 4 KiB frame, covers 4 GiB
+const PMM_RESERVED_END = 0x120000;    // everything below (BIOS area, kernel, bitmap) is never handed out
+const HEAP_BASE = 0x400000;
+const HEAP_MAX = 0x2000000;           // 32 MiB
+
+var pm_frames = 0;
+var pm_free = 0;
+var pm_hint = 0;
+var ram_usable = 0;                   // bytes of usable RAM according to E820
+var heap_start = 0;
+var heap_size = 0;
+
+fn rd64(a: int) -> int { return *(a as *u64) as int; }
+fn wr64(a: int, v: int) { *(a as *u64) = v as u64; }
+
+fn e820_count() -> int { return *((BOOTINFO + 4) as *u32) as int; }
+fn e820_base(i: int) -> int { return rd64(E820_ENTRIES + i * 24); }
+fn e820_len(i: int) -> int { return rd64(E820_ENTRIES + i * 24 + 8); }
+fn e820_type(i: int) -> int { return *((E820_ENTRIES + i * 24 + 16) as *u32) as int; }
+
+fn pm_test(f: int) -> bool { return (((PMM_BITMAP + (f >> 3)) as *u8)[0] & (1 << (f & 7))) != 0; }
+fn pm_set(f: int) { let p = (PMM_BITMAP + (f >> 3)) as *u8; p[0] = (p[0] | (1 << (f & 7))) as u8; }
+fn pm_clear(f: int) { let p = (PMM_BITMAP + (f >> 3)) as *u8; p[0] = (p[0] & ~(1 << (f & 7))) as u8; }
+
+fn pmm_reserve(base: int, len: int) {
+    var f = base >> 12;
+    let end = (base + len + 4095) >> 12;
+    while (f < end && f < pm_frames) { if (!pm_test(f)) { pm_set(f); pm_free--; } f++; }
+}
+
+fn pmm_init() {
+    var top = 0;
+    var i = 0;
+    let n = e820_count();
+    while (i < n) {
+        if (e820_type(i) == 1) {
+            ram_usable = ram_usable + e820_len(i);
+            let end = e820_base(i) + e820_len(i);
+            if (end > top) { top = end; }
+        }
+        i++;
+    }
+    if (top > 0x100000000) { top = 0x100000000; }
+    pm_frames = top >> 12;
+    kmemset(PMM_BITMAP as *u8, 0xFF, 0x20000);              // everything used ...
+    i = 0;
+    while (i < n) {                                         // ... then free the usable regions
+        if (e820_type(i) == 1) {
+            var f = (e820_base(i) + 4095) >> 12;
+            let end = (e820_base(i) + e820_len(i)) >> 12;
+            while (f < end && f < pm_frames) { pm_clear(f); pm_free++; f++; }
+        }
+        i++;
+    }
+    pmm_reserve(0, PMM_RESERVED_END);
+}
+
+/// one 4 KiB frame, or 0 when memory is exhausted
+fn pmm_alloc() -> int {
+    var n = 0;
+    while (n < pm_frames) {
+        let f = (pm_hint + n) % pm_frames;
+        if (!pm_test(f)) { pm_set(f); pm_free--; pm_hint = f + 1; return f << 12; }
+        n++;
+    }
+    return 0;
+}
+
+fn pmm_free_frame(addr: int) {
+    let f = addr >> 12;
+    if (f < pm_frames && pm_test(f)) { pm_clear(f); pm_free++; if (f < pm_hint) { pm_hint = f; } }
+}
+
+// ---------------------------------------------------------------- heap: first-fit free list with coalescing
+// block = 16-byte header { size, magic } + payload; blocks tile the heap exactly.
+const MAGIC_FREE = 0xF4EEF4EE;
+const MAGIC_USED = 0xA10CA10C;
+
+fn heap_init() {
+    var i = 0;
+    let n = e820_count();
+    var end = 0;
+    while (i < n) {
+        if (e820_type(i) == 1 && e820_base(i) <= HEAP_BASE && e820_base(i) + e820_len(i) > HEAP_BASE) { end = e820_base(i) + e820_len(i); }
+        i++;
+    }
+    heap_start = HEAP_BASE;
+    heap_size = end - HEAP_BASE;
+    if (heap_size > HEAP_MAX) { heap_size = HEAP_MAX; }
+    if (heap_size < 65536) { heap_size = 0; return; }
+    heap_size = heap_size & ~15;
+    pmm_reserve(heap_start, heap_size);
+    wr64(heap_start, heap_size - 16);
+    wr64(heap_start + 8, MAGIC_FREE);
+}
+
+fn kmalloc(n: int) -> *u8 {
+    var want = (n + 15) & ~15;
+    if (want < 16) { want = 16; }
+    var b = heap_start;
+    let end = heap_start + heap_size;
+    while (b < end) {
+        let sz = rd64(b);
+        if (rd64(b + 8) == MAGIC_FREE && sz >= want) {
+            if (sz >= want + 32) {                          // split
+                wr64(b + 16 + want, sz - want - 16);
+                wr64(b + 16 + want + 8, MAGIC_FREE);
+                wr64(b, want);
+            }
+            wr64(b + 8, MAGIC_USED);
+            return (b + 16) as *u8;
+        }
+        b = b + 16 + sz;
+    }
+    return 0 as *u8;
+}
+
+fn kzalloc(n: int) -> *u8 {
+    let p = kmalloc(n);
+    if (p != (0 as *u8)) { kmemset(p, 0, n); }
+    return p;
+}
+
+fn heap_coalesce() {
+    var b = heap_start;
+    let end = heap_start + heap_size;
+    while (b < end) {
+        let sz = rd64(b);
+        let nb = b + 16 + sz;
+        if (rd64(b + 8) == MAGIC_FREE && nb < end && rd64(nb + 8) == MAGIC_FREE) { wr64(b, sz + 16 + rd64(nb)); }
+        else { b = nb; }
+    }
+}
+
+fn kfree(p: *u8) {
+    if (p == (0 as *u8)) { return; }
+    let b = (p as int) - 16;
+    if (rd64(b + 8) != MAGIC_USED) { return; }            // double free / bad pointer: ignore
+    wr64(b + 8, MAGIC_FREE);
+    heap_coalesce();
+}
+
+/// out[0]=used bytes, out[1]=free bytes, out[2]=blocks in use, out[3]=free blocks
+fn heap_stats(out: *int) {
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+    var b = heap_start;
+    let end = heap_start + heap_size;
+    while (b < end) {
+        let sz = rd64(b);
+        if (rd64(b + 8) == MAGIC_USED) { out[0] = out[0] + sz; out[2] = out[2] + 1; }
+        else { out[1] = out[1] + sz; out[3] = out[3] + 1; }
+        b = b + 16 + sz;
+    }
+}

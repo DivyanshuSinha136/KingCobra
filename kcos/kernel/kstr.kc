@@ -1,0 +1,71 @@
+// kstr.kc -- freestanding string and memory helpers for the KCOS kernel.  Author: Divyanshu Sinha (MIT License)
+
+fn kstrlen(s: *u8) -> int { var n = 0; while (s[n] != 0) { n++; } return n; }
+
+fn kstreq(a: *u8, b: *u8) -> bool {
+    var i = 0;
+    while (a[i] == b[i]) { if (a[i] == 0) { return true; } i++; }
+    return false;
+}
+
+fn kstarts(s: *u8, p: *u8) -> bool {
+    var i = 0;
+    while (p[i] != 0) { if (s[i] != p[i]) { return false; } i++; }
+    return true;
+}
+
+fn kmemset(p: *u8, v: int, n: int) { var i = 0; while (i < n) { p[i] = v as u8; i++; } }
+
+fn kmemcpy(d: *u8, s: *u8, n: int) { var i = 0; while (i < n) { d[i] = s[i]; i++; } }
+
+fn kmemmove(d: *u8, s: *u8, n: int) {
+    if (d < s) { var i = 0; while (i < n) { d[i] = s[i]; i++; } }
+    else { var i = n; while (i > 0) { i--; d[i] = s[i]; } }
+}
+
+/// copy at most max-1 bytes and always terminate
+fn kstrncpy(d: *u8, s: *u8, max: int) {
+    var i = 0;
+    while (i < max - 1 && s[i] != 0) { d[i] = s[i]; i++; }
+    d[i] = 0;
+}
+
+fn kisdigit(c: int) -> bool { return c >= '0' && c <= '9'; }
+fn kisspace(c: int) -> bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+fn khexval(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+/// decimal, 0x-hex, optional leading '-'. Stops at the first character that is not part of the number.
+fn katoi(s: *u8) -> int {
+    var i = 0;
+    var neg = false;
+    var v = 0;
+    if (s[0] == '-') { neg = true; i = 1; }
+    if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i = i + 2;
+        while (khexval(s[i]) >= 0) { v = v * 16 + khexval(s[i]); i++; }
+    } else {
+        while (kisdigit(s[i])) { v = v * 10 + (s[i] - '0'); i++; }
+    }
+    return neg ? -v : v;
+}
+
+/// true when the whole string is a (possibly 0x) number
+fn kisnumber(s: *u8) -> bool {
+    var i = 0;
+    if (s[0] == '-') { i = 1; }
+    if (s[i] == 0) { return false; }
+    if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i = i + 2;
+        if (s[i] == 0) { return false; }
+        while (s[i] != 0) { if (khexval(s[i]) < 0) { return false; } i++; }
+        return true;
+    }
+    while (s[i] != 0) { if (!kisdigit(s[i])) { return false; } i++; }
+    return true;
+}

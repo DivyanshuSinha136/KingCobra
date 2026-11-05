@@ -1,0 +1,79 @@
+// showcase.kc -- exercises most of the native subset.
+struct Vec { x: float, y: float }
+struct Node { value: int, next: *Node, tag: u8, small: i16 }
+enum Color { Red, Green = 5, Blue }
+
+const LIMIT = 10 * 2;
+var counter: int = 100;
+let scale: float = 2.5;
+var table: int[8];
+let greeting: *u8 = "hello, kingcobra";
+static var hidden: int = 7;
+
+extern fn strlen(*u8) -> u64 from "libc.so.6";
+extern fn printf(*u8, ...) -> int from "libc.so.6";
+
+fn add(a: int, b: int) -> int { return a + b; }
+fn many(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, x: float, y: float) -> float {
+    return (a + b + c + d + e + f + g + h) as float * x + y;
+}
+fn fib(n: int) -> int { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+fn hyp(a: float, b: float) -> float { return sqrt(a * a + b * b); }
+fn sum_to(n: int) -> int { var s = 0; for (i in 0..n + 1) { s += i; } return s; }
+fn bump() -> int { counter += 1; return counter; }
+fn greet_len() -> int { return strlen(greeting) as int; }
+fn limit() -> int { return LIMIT + Color.Blue; }
+fn fill_table() -> int {
+    for (var i = 0; i < 8; i++) { table[i] = i * i; }
+    var s = 0;
+    for (i in 0..8) { s += table[i]; }
+    return s;
+}
+fn list_sum(n: *Node) -> int {
+    var s = 0;
+    while (n != null) { s += n->value; n = n->next; }
+    return s;
+}
+fn build_and_sum() -> int {
+    let a: Node; let b: Node; let c: Node;
+    a.value = 1; b.value = 20; c.value = 300;
+    a.next = &b; b.next = &c; c.next = null;
+    c.tag = 255; c.small = -5;
+    return list_sum(&a) + c.tag + c.small;
+}
+fn vec_len2(v: *Vec) -> float { return v->x * v->x + v->y * v->y; }
+fn vec_test() -> float { let v: Vec; v.x = 3.0; v.y = 4.0; return vec_len2(&v) + scale; }
+fn bits(x: int) -> int { return (x << 3 | 5) ^ (x >> 1) & 0xFF; }
+fn divmod(a: int, b: int) -> int { return a / b * 1000 + a % b; }
+fn ufun(a: u32, b: u8) -> int { return a + b; }
+fn narrow(x: int) -> int { let b: u8 = x as u8; let s: i8 = x as i8; return b * 1000 + s; }
+fn tern(x: int) -> int { return x > 5 ? x * 2 : -x; }
+fn logic(a: int, b: int) -> int {
+    if (a > 0 && b > 0 || a == 0) { return 1; }
+    if (!(a < b)) { return 2; }
+    return 3;
+}
+fn fneg(x: float) -> float { return -x + abs(-2.5); }
+fn fcmp(a: float, b: float) -> int {
+    var r = 0;
+    if (a < b) { r += 1; } if (a <= b) { r += 2; } if (a > b) { r += 4; } if (a >= b) { r += 8; } if (a == b) { r += 16; } if (a != b) { r += 32; }
+    return r;
+}
+fn loops() -> int {
+    var s = 0; var i = 0;
+    while (true) { i++; if (i > 50) { break; } if (i % 2 == 0) { continue; } s += i; }
+    do { s += 1; i -= 10; } while (i > 0);
+    return s;
+}
+fn ptrs() -> int {
+    let buf: u8[16];
+    for (i in 0..16) { buf[i] = i as u8 + 65; }
+    var p: *u8 = &buf[0];
+    p += 3;
+    let q = p + 4;
+    return *p + (q - p) as int * 1000 + sizeof(Node) * 100000 + sizeof(Vec);
+}
+fn say(n: int) -> int { return printf("n=%d f=%.2f s=%s\n", n, 1.5, greeting); }
+fn hidden_get() -> int { return hidden; }
+fn u64div(a: u64, b: u64) -> u64 { return a / b; }
+fn tofloat(a: u64) -> float { return a as float; }

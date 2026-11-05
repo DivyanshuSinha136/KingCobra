@@ -1,0 +1,32 @@
+union Word { i: u32, b: u8[4] }
+struct Big { a: int[40], tag: int }
+fn total(b: Big) -> int { var s = b.tag; for (x in b.a) { s += x; } return s; }
+fn grow(b: Big) -> Big { var c: Big = b; c.tag += 1; c.a[39] = 1000; return c; }
+fn main() -> int {
+    println(vowels("education"), vowels("rhythm"));
+    fn local_helper(x: int) -> int { return x + 1; }
+    struct Tmp { v: int }
+    let t = Tmp { v: local_helper(41) };
+    println(t.v);
+    unsafe { println("in unsafe"); }
+    var w: Word;
+    w.i = 0x01020304;
+    println(w.b[0], w.b[3], sizeof(Word));
+    var big: Big;
+    for (i in 0..40) { big.a[i] = i; }
+    big.tag = 5;
+    let g = grow(big);
+    println(total(big), total(g), g.a[39], big.a[39]);
+    var count = 0;
+    for (var i = 10; i > 0; i -= 3, count++) { }
+    println(count);
+    let neg = -5;
+    println(neg % 3, neg / 2, (neg as u8) as int);
+    return 0;
+}
+fn vowels(s: string) -> int {
+    var n = 0;
+    var i = 0;
+    while (char(s, i) != 0) { if (char(s, i) in "aeiou") { n++; } i++; }
+    return n;
+}

@@ -1,0 +1,27 @@
+// expressions: ++/--, comma, ??, in, assignment as expression, compound ops, casts, ternary
+struct P { x: int, y: int }
+fn first_nonnull(a: string, b: string) -> string { return a ?? b; }
+fn main() -> int {
+    var i = 5;
+    var j = i++;
+    var k = ++i;
+    println(i, j, k);
+    var a: int[5] = [10, 20, 30, 40, 50];
+    println(a[2], 3 in a, 30 in a, 99 in a);
+    var n = 0;
+    while ((n = n + 3) < 10) { println("n", n); }
+    var c = (i = 1, i + 41);
+    println(c, i);
+    let s: string = first_nonnull(null, "fallback");
+    println(s);
+    var q = 7;
+    q <<= 2; q |= 1; q ^= 3;
+    println(q, q > 20 ? "big" : "small");
+    var p: P = P { x: 3, y: 4 };
+    p.x++; --p.y;
+    println(p.x, p.y);
+    var u: u8 = 250;
+    u++; u++;
+    println(u as int, (u + 10) as int);
+    return 0;
+}

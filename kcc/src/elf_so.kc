@@ -1,0 +1,306 @@
+// elf_so.kc -- native ELF64 x86-64 shared-object linker (.so), no external tools.
+// Author: Divyanshu Sinha (MIT License)
+//
+// Takes the format-neutral module produced by codegen and lays it out as a loadable ET_DYN image:
+// two PT_LOAD segments (R+X and R+W), PT_DYNAMIC, PT_GNU_STACK, SysV hash table, dynamic symbol table,
+// RELA relocations (GLOB_DAT for imports, RELATIVE for absolute addresses), DT_NEEDED for every library.
+import std.fbin;
+import "util.kc" as util;
+import "elf_obj.kc" as eo;
+import "entry.kc" as entry;
+
+const INTERP = "/lib64/ld-linux-x86-64.so.2";
+
+const PAGE = 4096;
+
+fn elf_hash(name: string) -> int {
+    var h = 0;
+    for (c in util.str_bytes(name)) {
+        h = ((h << 4) + c) & 0xFFFFFFFF;
+        let g = h & 0xF0000000;
+        if (g != 0) { h = h ^ (g >> 24); }
+        h = h & ~g & 0xFFFFFFFF;
+    }
+    return h;
+}
+
+/// Build a shared object (`exe == false`) or a position-independent executable (`exe == true`).
+/// An executable has a PT_INTERP/PT_PHDR pair, an entry point (start-up stub that calls `main`) and no exports.
+fn build(mod, soname: string, exe: bool) {
+    let text_len = fbin.size(mod.text);
+    let ro_len = fbin.size(mod.rodata);
+    let data_len = fbin.size(mod.data);
+
+    // ---- import / export lists
+    var main_off = -1;
+    let imports = [];
+    for (u in mod.undef) { imports.push(u); }
+    let exports = [];
+    if (exe) {
+        for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { main_off = s.off; } }
+        if (main_off < 0) { util.fail("an executable needs a `fn main` (define `fn main() -> int { ... }`)", 0, 0); }
+        // with libraries: start through libc's __libc_start_main; without: raw syscalls, no libc at all
+        if (len(imports) > 0 && !imports.contains("__libc_start_main")) { imports.push("__libc_start_main"); }
+    } else {
+        for (s in mod.syms) { if (s.global) { exports.push(s); } }
+    }
+    let nsym = 1 + len(imports) + len(exports);
+    let dynstr = eo.new_strtab();
+    let dynsym_idx = {};
+    var k = 1;
+    for (u in imports) { dynsym_idx[u] = k; k = k + 1; }
+    for (s in exports) { dynsym_idx[s.name] = k; k = k + 1; }
+    let libs = [];
+    for (l in mod.libs) { libs.push(l); }
+    if (exe && len(imports) > 0 && !libs.contains("libc.so.6")) { libs.push("libc.so.6"); }
+    if (len(libs) == 0 && len(imports) > 0) { libs.push("libc.so.6"); }
+
+    // ---- GOT slots: one per import, then one per own symbol reached through rip_got
+    let got_of = {};
+    var ngot = 0;
+    for (u in imports) { got_of[u] = ngot; ngot = ngot + 1; }
+    for (r in mod.relocs) {
+        if (r.kind == "rip_got" && !got_of.has(r.sym)) { got_of[r.sym] = ngot; ngot = ngot + 1; }
+    }
+    var n_abs = 0;
+    for (r in mod.relocs) { if (r.kind == "abs64") { n_abs = n_abs + 1; } }
+    var n_rel_got_local = 0;
+    for (name in got_of.keys()) { if (!imports.contains(name)) { n_rel_got_local = n_rel_got_local + 1; } }
+    let nrela = len(imports) + n_rel_got_local + n_abs;
+
+    // ---- string table contents (needed before layout to know sizes)
+    for (u in imports) { eo.str_add(dynstr, u); }
+    for (s in exports) { eo.str_add(dynstr, s.name); }
+    for (l in libs) { eo.str_add(dynstr, l); }
+    if (!exe) { eo.str_add(dynstr, soname); }
+    let dynstr_len = fbin.size(dynstr.s);
+
+    // ---- layout
+    let nbucket = (idiv(nsym, 2) > 1) ? idiv(nsym, 2) : 1;
+    let hash_len = 4 * (2 + nbucket + nsym);
+    let ndyn = len(libs) + (exe ? 10 : 11) + 1;
+    let nph = exe ? 6 : 4;
+    var off = 64 + nph * 56;
+    let interp_off = off;
+    if (exe) { off = off + len(INTERP) + 1; }
+    let hash_off = util.align_up(off, 8);        off = hash_off + hash_len;
+    let dynsym_off = util.align_up(off, 8);      off = dynsym_off + 24 * nsym;
+    let dynstr_off = off;                        off = dynstr_off + dynstr_len;
+    let rela_off = util.align_up(off, 8);        off = rela_off + 24 * nrela;
+    let text_off = util.align_up(off, 16);
+    let stubs_off = util.align_up(text_off + text_len, 16);
+    off = stubs_off + 8 * len(imports);
+    let entry_off = util.align_up(off, 16);
+    var entry_len = 0;
+    if (exe) { entry_len = (len(imports) > 0) ? entry.LINUX_LIBC_LEN : entry.LINUX_RAW_LEN; off = entry_off + entry_len; }
+    let text_end = off;
+    let ro_off = util.align_up(off, 16);         off = ro_off + ro_len;
+    let seg1_end = off;
+    let seg2 = util.align_up(seg1_end, PAGE);
+    let dyn_off = seg2;                          off = dyn_off + 16 * ndyn;
+    let got_off = util.align_up(off, 8);         off = got_off + 8 * ngot;
+    let data_off = util.align_up(off, 16);       off = data_off + data_len;
+    let seg2_file_end = off;
+    let bss_off = util.align_up(off, 16);
+    let seg2_mem_end = bss_off + mod.bss;
+
+    var secbase = { text: text_off, rodata: ro_off, data: data_off, bss: bss_off };
+    fn_addr_of(secbase, mod);
+
+    // ---- patch relocations
+    let text = fbin.from_bytes(fbin.to_bytes(mod.text, 0, text_len));
+    let data = fbin.from_bytes(fbin.to_bytes(mod.data, 0, data_len));
+    let rela = fbin.buffer();
+    let symaddr = {};
+    for (s in mod.syms) { symaddr[s.name] = secbase[s.sec] + s.off; }
+    for (r in mod.relocs) {
+        if (r.kind == "abs64") {
+            let target = symaddr[r.sym] + r.addend;
+            let secoff = (r.sec == "data") ? data_off : ro_off;
+            util.patch_u64(data, r.off, target);
+            fbin.write_u64(rela, secoff + r.off);
+            fbin.write_u64(rela, 8);
+            fbin.write_i64(rela, target);
+            continue;
+        }
+        let place = text_off + r.off;
+        var s = 0;
+        if (r.kind == "call_ext") { s = stubs_off + 8 * (dynsym_idx[r.sym] - 1); }
+        else if (r.kind == "rip_local") { s = symaddr[r.sym]; }
+        else { s = got_off + 8 * got_of[r.sym]; }
+        util.patch_i32(text, r.off, s + r.addend - place);
+    }
+    for (u in imports) {
+        fbin.write_u64(rela, got_off + 8 * got_of[u]);
+        fbin.write_u64(rela, (dynsym_idx[u] << 32) | 6);        // R_X86_64_GLOB_DAT
+        fbin.write_i64(rela, 0);
+    }
+    for (name in got_of.keys()) {
+        if (!imports.contains(name)) {
+            fbin.write_u64(rela, got_off + 8 * got_of[name]);
+            fbin.write_u64(rela, 8);                              // R_X86_64_RELATIVE
+            fbin.write_i64(rela, symaddr[name]);
+        }
+    }
+    // import stubs:  jmp [rip + got slot]
+    let stubs = fbin.buffer();
+    var si = 0;
+    for (u in imports) {
+        let at = stubs_off + 8 * si;
+        fbin.write_u8(stubs, 0xFF); fbin.write_u8(stubs, 0x25);
+        fbin.write_i32(stubs, got_off + 8 * got_of[u] - (at + 6));
+        fbin.write_u8(stubs, 0xCC); fbin.write_u8(stubs, 0xCC);
+        si = si + 1;
+    }
+
+    // ---- dynsym, hash
+    let dynsym = fbin.buffer();
+    eo.fn_sym(dynsym, 0, 0, 0, 0, 0, 0);
+    for (u in imports) { eo.fn_sym(dynsym, eo.str_add(dynstr, u), (1 << 4) | 2, 0, 0, 0, 0); }
+    for (s in exports) {
+        eo.fn_sym(dynsym, eo.str_add(dynstr, s.name), (1 << 4) | (s.kind == "func" ? 2 : 1),
+                  secindex(s.sec), secbase[s.sec] + s.off, s.size, 0);
+    }
+    let buckets = [];
+    for (i in 0..nbucket) { buckets.push(0); }
+    let chains = [];
+    for (i in 0..nsym) { chains.push(0); }
+    let names = [""];
+    for (u in imports) { names.push(u); }
+    for (s in exports) { names.push(s.name); }
+    for (i in 1..nsym) {
+        let h = elf_hash(names[i]) % nbucket;
+        chains[i] = buckets[h];
+        buckets[h] = i;
+    }
+    let hash = fbin.buffer();
+    fbin.write_u32(hash, nbucket);
+    fbin.write_u32(hash, nsym);
+    for (b in buckets) { fbin.write_u32(hash, b); }
+    for (c in chains) { fbin.write_u32(hash, c); }
+
+    // ---- dynamic section
+    let dyn = fbin.buffer();
+    for (l in libs) { fbin.write_u64(dyn, 1); fbin.write_u64(dyn, eo.str_add(dynstr, l)); }
+    if (!exe) { fbin.write_u64(dyn, 14); fbin.write_u64(dyn, eo.str_add(dynstr, soname)); }    // SONAME
+    fbin.write_u64(dyn, 4);  fbin.write_u64(dyn, hash_off);                      // HASH
+    fbin.write_u64(dyn, 5);  fbin.write_u64(dyn, dynstr_off);                    // STRTAB
+    fbin.write_u64(dyn, 6);  fbin.write_u64(dyn, dynsym_off);                    // SYMTAB
+    fbin.write_u64(dyn, 10); fbin.write_u64(dyn, dynstr_len);                    // STRSZ
+    fbin.write_u64(dyn, 11); fbin.write_u64(dyn, 24);                            // SYMENT
+    fbin.write_u64(dyn, 7);  fbin.write_u64(dyn, rela_off);                      // RELA
+    fbin.write_u64(dyn, 8);  fbin.write_u64(dyn, 24 * nrela);                    // RELASZ
+    fbin.write_u64(dyn, 9);  fbin.write_u64(dyn, 24);                            // RELAENT
+    fbin.write_u64(dyn, 30); fbin.write_u64(dyn, 8);                             // FLAGS = BIND_NOW
+    fbin.write_u64(dyn, 0);  fbin.write_u64(dyn, 0);
+
+    // ---- assemble the file
+    let out = fbin.buffer();
+    fbin.fill(out, 0, seg2_file_end);
+    fn_put(out, hash_off, hash);
+    fn_put(out, dynsym_off, dynsym);
+    fn_put(out, dynstr_off, dynstr.s);
+    fn_put(out, rela_off, rela);
+    fn_put(out, text_off, text);
+    fn_put(out, stubs_off, stubs);
+    if (exe) {
+        fbin.seek(out, interp_off);
+        util.write_cstr(out, INTERP);
+        var code = null;
+        if (len(imports) > 0) { code = entry.linux_libc(entry_off, symaddr["main"], got_off + 8 * got_of["__libc_start_main"]); }
+        else { code = entry.linux_raw(entry_off, symaddr["main"]); }
+        fn_put(out, entry_off, code);
+    }
+    fn_put(out, ro_off, mod.rodata);
+    fn_put(out, dyn_off, dyn);
+    fn_put(out, data_off, data);
+    // section headers (for readelf / objdump / debuggers; the loader does not need them)
+    let shstr = eo.new_strtab();
+    let sh = [
+        ["", 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [".hash", 5, 2, hash_off, hash_off, hash_len, 2, 0, 8, 4],
+        [".dynsym", 11, 2, dynsym_off, dynsym_off, 24 * nsym, 3, 1, 8, 24],
+        [".dynstr", 3, 2, dynstr_off, dynstr_off, dynstr_len, 0, 0, 1, 0],
+        [".rela.dyn", 4, 2, rela_off, rela_off, 24 * nrela, 2, 0, 8, 24],
+        [".text", 1, 6, text_off, text_off, text_end - text_off, 0, 0, 16, 0],
+        [".rodata", 1, 2, ro_off, ro_off, ro_len, 0, 0, 16, 0],
+        [".dynamic", 6, 3, dyn_off, dyn_off, 16 * ndyn, 3, 0, 8, 16],
+        [".got", 1, 3, got_off, got_off, 8 * ngot, 0, 0, 8, 8],
+        [".data", 1, 3, data_off, data_off, data_len, 0, 0, 16, 0],
+        [".bss", 8, 3, bss_off, bss_off, mod.bss, 0, 0, 16, 0],
+        [".shstrtab", 3, 0, 0, 0, 0, 0, 0, 1, 0]
+    ];
+    for (s in sh) { eo.str_add(shstr, s[0]); }
+    let shstr_off = seg2_file_end;
+    fbin.seek(out, 0, "end");
+    fbin.write_bytes(out, fbin.to_bytes(shstr.s, 0, fbin.size(shstr.s)));
+    sh[11][5] = fbin.size(shstr.s);
+    sh[11][3] = shstr_off;
+    util.pad_to(out, 8, 0);
+    fbin.seek(out, 0, "end");
+    let shoff = fbin.tell(out);
+    for (s in sh) {
+        fbin.write_u32(out, eo.str_add(shstr, s[0]));
+        fbin.write_u32(out, s[1]);
+        fbin.write_u64(out, s[2]);
+        fbin.write_u64(out, s[3]);                      // addr
+        fbin.write_u64(out, s[1] == 0 ? 0 : (s[1] == 3 && s[0] == ".shstrtab" ? shstr_off : s[4]));   // file offset
+        fbin.write_u64(out, s[5]);
+        fbin.write_u32(out, s[6]);
+        fbin.write_u32(out, s[7]);
+        fbin.write_u64(out, s[8]);
+        fbin.write_u64(out, s[9]);
+    }
+    // ELF header + program headers
+    fbin.seek(out, 0);
+    fbin.write_bytes(out, [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    fbin.write_u16(out, 3);              // ET_DYN (a PIE for executables)
+    fbin.write_u16(out, 62);
+    fbin.write_u32(out, 1);
+    fbin.write_u64(out, exe ? entry_off : 0);              // entry
+    fbin.write_u64(out, 64);             // phoff
+    fbin.write_u64(out, shoff);
+    fbin.write_u32(out, 0);
+    fbin.write_u16(out, 64);
+    fbin.write_u16(out, 56);
+    fbin.write_u16(out, nph);
+    fbin.write_u16(out, 64);
+    fbin.write_u16(out, len(sh));
+    fbin.write_u16(out, 11);
+    if (exe) {
+        phdr(out, 6, 4, 64, nph * 56, nph * 56, 8);                                 // PT_PHDR (ld.so derives the load bias from it)
+        phdr(out, 3, 4, interp_off, len(INTERP) + 1, len(INTERP) + 1, 1);           // PT_INTERP
+    }
+    phdr(out, 1, 5, 0, seg1_end, seg1_end, PAGE);                                   // PT_LOAD R+X
+    phdr(out, 1, 6, seg2, seg2_file_end - seg2, seg2_mem_end - seg2, PAGE);         // PT_LOAD R+W
+    phdr(out, 2, 6, dyn_off, 16 * ndyn, 16 * ndyn, 8);                              // PT_DYNAMIC
+    phdr(out, 0x6474E551, 6, 0, 0, 0, 16);                                          // PT_GNU_STACK
+    return out;
+}
+
+fn phdr(out, type: int, flags: int, off: int, filesz: int, memsz: int, align: int) {
+    fbin.write_u32(out, type);
+    fbin.write_u32(out, flags);
+    fbin.write_u64(out, off);
+    fbin.write_u64(out, off);
+    fbin.write_u64(out, off);
+    fbin.write_u64(out, filesz);
+    fbin.write_u64(out, memsz);
+    fbin.write_u64(out, align);
+}
+
+fn secindex(sec: string) -> int {
+    if (sec == "text") { return 5; }
+    if (sec == "rodata") { return 6; }
+    if (sec == "data") { return 9; }
+    return 10;
+}
+
+fn fn_put(out, at: int, src) {
+    let n = fbin.size(src);
+    if (n == 0) { return; }
+    fbin.seek(out, at);
+    fbin.write_bytes(out, fbin.to_bytes(src, 0, n));
+}
+
+fn fn_addr_of(secbase, mod) { }

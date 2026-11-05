@@ -1,0 +1,153 @@
+// console.kc -- VGA text console (80x25) mirrored to COM1, plus the serial driver.  Author: Divyanshu Sinha (MIT License)
+const VGA_BASE = 0xB8000;
+const COLS = 80;
+const ROWS = 25;
+const COM1 = 0x3F8;
+
+var con_row = 0;
+var con_col = 0;
+var con_attr = 0x07;          // light grey on black
+var con_mirror = true;        // mirror everything to the serial port
+var ser_ready = false;
+
+// ---------------------------------------------------------------- serial (COM1, 115200 8N1)
+fn ser_init() {
+    outb(COM1 + 1, 0x00);     // no interrupts
+    outb(COM1 + 3, 0x80);     // DLAB
+    outb(COM1 + 0, 0x01);     // divisor 1 = 115200 baud
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);     // 8 bits, no parity, one stop
+    outb(COM1 + 2, 0xC7);     // FIFO on
+    outb(COM1 + 4, 0x0B);     // RTS/DSR, OUT2
+    ser_ready = true;
+}
+
+fn ser_putc(c: int) {
+    if (!ser_ready) { return; }
+    var spin = 0;
+    while ((inb(COM1 + 5) & 0x20) == 0 && spin < 200000) { spin++; }
+    outb(COM1, c);
+}
+
+fn ser_rx_ready() -> bool { return ser_ready && (inb(COM1 + 5) & 1) != 0; }
+fn ser_getc() -> int { return inb(COM1); }
+
+// ---------------------------------------------------------------- VGA
+fn con_cell(r: int, c: int) -> *u16 { return (VGA_BASE + (r * COLS + c) * 2) as *u16; }
+
+fn con_cursor() {
+    let pos = con_row * COLS + con_col;
+    outb(0x3D4, 0x0F); outb(0x3D5, pos & 0xFF);
+    outb(0x3D4, 0x0E); outb(0x3D5, (pos >> 8) & 0xFF);
+}
+
+fn con_setcolor(fg: int, bg: int) { con_attr = ((bg & 15) << 4) | (fg & 15); }
+
+fn con_clear_row(r: int) {
+    var c = 0;
+    let cell = (con_attr << 8) | ' ';
+    while (c < COLS) { con_cell(r, c)[0] = cell as u16; c++; }
+}
+
+fn con_clear() {
+    var r = 0;
+    while (r < ROWS) { con_clear_row(r); r++; }
+    con_row = 0; con_col = 0;
+    con_cursor();
+}
+
+fn con_scroll() {
+    var i = 0;
+    let p = VGA_BASE as *u16;
+    while (i < COLS * (ROWS - 1)) { p[i] = p[i + COLS]; i++; }
+    con_clear_row(ROWS - 1);
+    con_row = ROWS - 1;
+}
+
+fn con_putc_raw(c: int) {
+    if (c == '\n') { con_col = 0; con_row++; }
+    else if (c == '\r') { con_col = 0; }
+    else if (c == 8) { if (con_col > 0) { con_col--; } }
+    else if (c == '\t') { con_col = (con_col + 8) & ~7; }
+    else {
+        con_cell(con_row, con_col)[0] = ((con_attr << 8) | (c & 0xFF)) as u16;
+        con_col++;
+    }
+    if (con_col >= COLS) { con_col = 0; con_row++; }
+    if (con_row >= ROWS) { con_scroll(); }
+}
+
+fn con_putc(c: int) {
+    con_putc_raw(c);
+    con_cursor();
+    if (con_mirror) { if (c == '\n') { ser_putc('\r'); } ser_putc(c); }
+}
+
+fn con_puts(s: *u8) {
+    var i = 0;
+    while (s[i] != 0) {
+        let c = s[i] as int;
+        con_putc_raw(c);
+        if (con_mirror) { if (c == '\n') { ser_putc('\r'); } ser_putc(c); }
+        i++;
+    }
+    con_cursor();
+}
+
+fn con_putdec(n: int) {
+    if (n < 0) { con_putc('-'); con_putdec(-n); return; }
+    var buf: u8[24];
+    var i = 0;
+    var v = n;
+    if (v == 0) { buf[0] = '0'; i = 1; }
+    while (v > 0) { buf[i] = ('0' + v % 10) as u8; v = v / 10; i++; }
+    while (i > 0) { i--; con_putc(buf[i]); }
+}
+
+fn con_putudec_pad(n: int, width: int) {   // zero padded
+    var buf: u8[24];
+    var i = 0;
+    var v = n;
+    if (v == 0) { buf[0] = '0'; i = 1; }
+    while (v > 0) { buf[i] = ('0' + v % 10) as u8; v = v / 10; i++; }
+    var pad = width - i;
+    while (pad > 0) { con_putc('0'); pad--; }
+    while (i > 0) { i--; con_putc(buf[i]); }
+}
+
+/// hex without prefix, at least `width` digits
+fn con_puthex_w(n: int, width: int) {
+    var shift = 60;
+    var started = false;
+    var digits = 0;
+    while (shift >= 0) {
+        let d = (n >>> shift) & 15;
+        if (d != 0 || started || shift < width * 4) {
+            started = true;
+            con_putc(d < 10 ? '0' + d : 'a' + d - 10);
+            digits++;
+        }
+        shift = shift - 4;
+    }
+}
+
+fn con_puthex(n: int) { con_puts("0x"); con_puthex_w(n, 1); }
+
+/// right-aligned decimal in a field
+fn con_putdec_w(n: int, width: int) {
+    var len = 1;
+    var v = n < 0 ? -n : n;
+    if (n < 0) { len++; }
+    while (v >= 10) { v = v / 10; len++; }
+    while (len < width) { con_putc(' '); len++; }
+    con_putdec(n);
+}
+
+fn con_status(ok: bool, text: *u8) {
+    con_puts("[ ");
+    if (ok) { con_setcolor(10, 0); con_puts(" OK "); } else { con_setcolor(12, 0); con_puts("FAIL"); }
+    con_setcolor(7, 0);
+    con_puts(" ] ");
+    con_puts(text);
+    con_putc('\n');
+}

@@ -1,0 +1,1682 @@
+// check.kc -- name resolution + type checking for the native subset.
+// Author: Divyanshu Sinha (MIT License)
+//
+// check_program(items) annotates the AST in place (node.ty, node.sym, node.sig, ...) and returns the
+// program context the code generator consumes:
+//   { structs, funcs, globals, enums, fn_list, global_list, libs, methods, nsmap, uses_eh }
+//
+// Beyond the C-like core this stage gives native meaning to: namespaces (`import "f.kc" as ns`), impl methods,
+// generic functions (monomorphised per call), function pointers and non-capturing closures, default arguments,
+// array/struct initialisers and struct copies, switch / match / labels / goto, defer / try / throw, static locals,
+// destructuring, comptime constant blocks, unions, and implicit libc declarations (printf, malloc, ...).
+import "util.kc" as util;
+import "types.kc" as T;
+
+/// Freestanding intrinsics (bare-metal x86-64): name -> [argument count, result type]. Compiled inline by codegen.kc.
+const INTRIN = {
+    inb: [1, "int"], inw: [1, "int"], inl: [1, "int"],
+    outb: [2, "void"], outw: [2, "void"], outl: [2, "void"],
+    insw_rep: [3, "void"], outsw_rep: [3, "void"],
+    cli: [0, "void"], sti: [0, "void"], hlt: [0, "void"], pause: [0, "void"], int3: [0, "void"], ud2: [0, "void"],
+    mfence: [0, "void"], lfence: [0, "void"], sfence: [0, "void"], wbinvd: [0, "void"],
+    lidt: [1, "void"], lgdt: [1, "void"], ltr: [1, "void"], invlpg: [1, "void"],
+    rdtsc: [0, "int"], rdmsr: [1, "int"], wrmsr: [2, "void"],
+    read_cr0: [0, "int"], read_cr2: [0, "int"], read_cr3: [0, "int"], read_cr4: [0, "int"],
+    write_cr0: [1, "void"], write_cr3: [1, "void"], write_cr4: [1, "void"],
+    read_rflags: [0, "int"], read_rsp: [0, "int"],
+    popcnt: [1, "int"], bsf: [1, "int"], bsr: [1, "int"],
+    atomic_xchg: [2, "int"], atomic_add: [2, "int"], atomic_cas: [3, "int"],
+    cpuid: [2, "void"], isr_stub: [1, "int"],
+    callp: [1, "int", 7]
+};
+
+var ctx = {};
+var scopes = [];
+var cur_fn = null;
+var cur_ns = "";
+var loop_depth = 0;
+var break_depth = 0;
+var lstack = [];             // labels of the enclosing loops/switches: [{ label, loop }]
+var fn_labels = {};
+var fn_gotos = [];
+var next_sym = 0;
+var next_tmp = 0;
+var lambda_outer = null;     // while checking a closure: the enclosing function's scopes (to report captures)
+
+fn err(n, msg: string) { util.fail(msg, n.line, n.col); }
+
+fn is_wordch(c: string) -> bool {
+    if (c == "") { return false; }
+    let o = ord(c);
+    return (o >= 97 && o <= 122) || (o >= 65 && o <= 90) || (o >= 48 && o <= 57) || o == 95;
+}
+
+// ---------------------------------------------------------------- scopes and names
+fn qual(ns: string, name: string) -> string { return ns == "" ? name : ns + "__" + name; }
+
+fn push_scope() { scopes.push({}); }
+fn pop_scope() { scopes.pop(); }
+fn declare(n, name: string, sym) {
+    let top = scopes[len(scopes) - 1];
+    if (top.has(name)) { err(n, "'" + name + "' is already declared in this scope"); }
+    top[name] = sym;
+}
+fn find_global(name: string) {
+    if (cur_ns != "" && ctx.globals.has(qual(cur_ns, name))) { return ctx.globals[qual(cur_ns, name)]; }
+    if (ctx.globals.has(name)) { return ctx.globals[name]; }
+    return null;
+}
+fn lookup(name: string) {
+    var i = len(scopes) - 1;
+    while (i >= 0) {
+        if (scopes[i].has(name)) { return scopes[i][name]; }
+        i = i - 1;
+    }
+    return find_global(name);
+}
+fn find_fn(name: string) {
+    if (cur_ns != "" && ctx.funcs.has(qual(cur_ns, name))) { return ctx.funcs[qual(cur_ns, name)]; }
+    if (ctx.funcs.has(name)) { return ctx.funcs[name]; }
+    return implicit_extern(name);
+}
+fn find_generic(name: string) {
+    if (cur_ns != "" && ctx.generics.has(qual(cur_ns, name))) { return ctx.generics[qual(cur_ns, name)]; }
+    if (ctx.generics.has(name)) { return ctx.generics[name]; }
+    return null;
+}
+
+fn new_local(name: string, ty: string, mutable: bool) {
+    next_sym = next_sym + 1;
+    let agg = T.is_array(ty) || ctx.structs.has(ty);
+    return { kind: "local", name: name, ty: ty, mutable: mutable, id: next_sym, agg: agg, off: 0 };
+}
+
+fn hidden_name(prefix: string) -> string { next_tmp = next_tmp + 1; return "__" + prefix + str(next_tmp); }
+
+// ---------------------------------------------------------------- types
+fn strip_ns(ty: string) -> string {
+    // "alias.Name" -> "Name" (types share one namespace); identifiers followed by '.' are dropped
+    var out = "";
+    var i = 0;
+    var word = "";
+    while (i < len(ty)) {
+        let c = ty[i];
+        if (is_wordch(c)) { word = word + c; }
+        else {
+            if (c == ".") { word = ""; i = i + 1; continue; }
+            out = out + word + c;
+            word = "";
+        }
+        i = i + 1;
+    }
+    return out + word;
+}
+
+fn resolve_type(n, ty: string) -> string {
+    let c = T.canon(strip_ns(ty));
+    if (c == "void") { return c; }
+    if (!T.known_type(c, ctx.structs)) {
+        var base = c;
+        while (T.is_ptr(base)) { base = T.pointee(base); }
+        if (T.is_array(base)) { base = T.array_parts(base)[0]; }
+        if (T.is_fn(base)) { err(n, "unknown type inside '" + base + "'"); }
+        err(n, "unknown type '" + base + "'");
+    }
+    return c;
+}
+
+fn is_agg(ty: string) -> bool { return T.is_array(ty) || ctx.structs.has(ty); }
+fn is_struct(ty: string) -> bool { return ctx.structs.has(ty); }
+
+/// Type of a value when used as an rvalue: arrays decay to a pointer to their element.
+fn rv(ty: string) -> string {
+    if (T.is_array(ty)) { return "*" + T.elem_of(ty); }
+    return ty;
+}
+
+fn floaty(ty: string) -> bool { return ty == "float" || ty == "f32"; }
+fn ptrlike(ty: string) -> bool { return T.is_ptr(ty) || T.is_fn(ty) || ty == "null"; }
+
+fn assignable(fromty: string, to: string) -> bool {
+    if (fromty == to) { return true; }
+    if (to == "bool") { return T.is_int(fromty); }
+    if (T.is_int(to)) { return T.is_int(fromty); }
+    if (floaty(to)) { return T.is_int(fromty) || floaty(fromty); }
+    if (T.is_fn(to)) { return fromty == "null"; }
+    if (T.is_ptr(to)) {
+        if (fromty == "null") { return true; }
+        if (T.is_ptr(fromty)) {
+            return T.pointee(to) == "void" || T.pointee(fromty) == "void" || T.pointee(to) == T.pointee(fromty);
+        }
+        return false;
+    }
+    return false;
+}
+
+fn show(ty: string) -> string { return ty == "null" ? "null" : ty; }
+
+fn need_assignable(n, fromty: string, to: string, what: string) {
+    if (is_agg(to)) {
+        if (fromty == to) { return; }
+        err(n, "cannot " + what + " a value of type " + show(fromty) + " as " + show(to));
+    }
+    if (is_agg(fromty) && !T.is_array(fromty)) { err(n, "cannot " + what + " a struct (" + fromty + ") as " + show(to)); }
+    let f = rv(fromty);
+    if (!assignable(f, to)) {
+        var hint = "";
+        if (floaty(f) && T.is_int(to)) { hint = " (use 'as " + to + "' to convert)"; }
+        else if (T.is_ptr(f) && T.is_int(to)) { hint = " (use 'as " + to + "' to convert)"; }
+        else if (T.is_int(f) && T.is_ptr(to)) { hint = " (use 'as " + to + "' to convert)"; }
+        else if (T.is_ptr(f) && T.is_ptr(to)) { hint = " (use 'as " + to + "' to convert)"; }
+        err(n, "cannot " + what + " a value of type " + show(f) + " as " + show(to) + hint);
+    }
+}
+
+// ---------------------------------------------------------------- constants
+fn set_cv(n, v) { n["cv"] = v; }
+
+fn fold_bin(n) {
+    let a = n.l["cv"];
+    let b = n.r["cv"];
+    if (a == null || b == null) { return; }
+    let op = n.op;
+    if (n.ty == "float") {
+        if (op == "+") { set_cv(n, a + b); }
+        else if (op == "-") { set_cv(n, a - b); }
+        else if (op == "*") { set_cv(n, a * b); }
+        else if (op == "/") { set_cv(n, a / b); }
+        return;
+    }
+    if (!T.is_int(n.ty)) { return; }
+    if (op == "+") { set_cv(n, a + b); }
+    else if (op == "-") { set_cv(n, a - b); }
+    else if (op == "*") { set_cv(n, a * b); }
+    else if (op == "/") {
+        if (b == 0) { err(n, "division by zero in a constant expression"); }
+        set_cv(n, int(a / b));
+    }
+    else if (op == "%") {
+        if (b == 0) { err(n, "division by zero in a constant expression"); }
+        set_cv(n, a % b);
+    }
+    else if (op == "&") { set_cv(n, a & b); }
+    else if (op == "|") { set_cv(n, a | b); }
+    else if (op == "^") { set_cv(n, a ^ b); }
+    else if (op == "<<") { if (b >= 0 && b < 64) { set_cv(n, a << b); } }
+    else if (op == ">>") { if (b >= 0 && b < 64) { set_cv(n, n.ty == "u64" ? (a >>> b) : (a >> b)); } }
+    else if (op == ">>>") { if (b >= 0 && b < 64) { set_cv(n, a >>> b); } }
+}
+
+// ---------------------------------------------------------------- implicit libc declarations
+// "name|ret|params|flags"   flags: v = variadic, m = libm
+const LIBC = [
+    "printf|int|*u8|v", "sprintf|int|*u8,*u8|v", "snprintf|int|*u8,u64,*u8|v", "puts|int|*u8", "putchar|int|int", "getchar|int|",
+    "fflush|int|*void", "fputs|int|*u8,*void", "perror|void|*u8",
+    "malloc|*void|u64", "calloc|*void|u64,u64", "realloc|*void|*void,u64", "free|void|*void",
+    "memcpy|*void|*void,*void,u64", "memmove|*void|*void,*void,u64", "memset|*void|*void,int,u64", "memcmp|int|*void,*void,u64",
+    "strlen|u64|*u8", "strcmp|int|*u8,*u8", "strncmp|int|*u8,*u8,u64", "strcpy|*u8|*u8,*u8", "strncpy|*u8|*u8,*u8,u64",
+    "strcat|*u8|*u8,*u8", "strchr|*u8|*u8,int", "strrchr|*u8|*u8,int", "strstr|*u8|*u8,*u8", "strdup|*u8|*u8",
+    "atoi|int|*u8", "atol|int|*u8", "atof|float|*u8", "strtol|int|*u8,**u8,int",
+    "exit|void|int", "abort|void|", "rand|int|", "srand|void|u32", "time|int|*void", "getenv|*u8|*u8", "system|int|*u8",
+    "qsort|void|*void,u64,u64,fn(*void,*void)->int",
+    "isdigit|int|int", "isalpha|int|int", "isalnum|int|int", "isspace|int|int", "isupper|int|int", "islower|int|int",
+    "ispunct|int|int", "isxdigit|int|int", "isprint|int|int", "toupper|int|int", "tolower|int|int",
+    "floor|float|float|m", "ceil|float|float|m", "round|float|float|m", "trunc|float|float|m", "fabs|float|float|m",
+    "pow|float|float,float|m", "fmod|float|float,float|m", "hypot|float|float,float|m", "atan2|float|float,float|m",
+    "sin|float|float|m", "cos|float|float|m", "tan|float|float|m", "asin|float|float|m", "acos|float|float|m",
+    "atan|float|float|m", "exp|float|float|m", "log|float|float|m", "log2|float|float|m", "log10|float|float|m", "cbrt|float|float|m"
+];
+
+fn implicit_extern(name: string) {
+    for (spec in LIBC) {
+        let parts = spec.split("|");
+        if (parts[0] != name) { continue; }
+        let params = [];
+        if (parts[2] != "") {
+            // split on top-level commas (fn types contain commas inside parentheses)
+            var depth = 0;
+            var cur = "";
+            for (c in parts[2]) {
+                if (c == "(") { depth = depth + 1; }
+                if (c == ")") { depth = depth - 1; }
+                if (c == "," && depth == 0) { params.push(T.canon(cur)); cur = ""; } else { cur = cur + c; }
+            }
+            params.push(T.canon(cur));
+        }
+        let defs = [];
+        for (p in params) { defs.push(null); }
+        let flags = len(parts) > 3 ? parts[3] : "";
+        var sig = { name: name, display: name, params: params, ret: T.canon(parts[1]), is_ext: true, variadic: flags == "v",
+                    lib: flags == "m" ? "libm.so.6" : "", is_static: false, node: null, kind: "func", defs: defs, implicit: true,
+                    ns: "", has_self: false, checked: true };
+        ctx.funcs[name] = sig;
+        let lib = sig.lib;
+        if (lib != "" && !ctx.libs.contains(lib)) { ctx.libs.push(lib); }
+        return sig;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------- expressions
+fn num_result(a: string, b: string) -> string {
+    if (floaty(a) || floaty(b)) { return "float"; }
+    if (a == "u64" || b == "u64") { return "u64"; }
+    return "int";
+}
+
+fn check_scalar(n, ty: string, what: string) {
+    let t = rv(ty);
+    if (!T.is_scalar(t)) { err(n, what + " must be a number, bool, pointer or function, found " + ty); }
+}
+
+fn is_lvalue(n) -> bool {
+    if (n.t == "id") { return n.sym != null && n.sym.kind != "func"; }
+    if (n.t == "index" || n.t == "member") { return true; }
+    if (n.t == "un" && n.op == "*") { return true; }
+    return false;
+}
+
+fn fn_type_of(sig) -> string { return "fn(" + sig.params.join(",") + ")->" + sig.ret; }
+
+fn check_expr(n) -> string {
+    let t = n.t;
+    var ty = "";
+    if (t == "int") { ty = "int"; set_cv(n, n.v); }
+    else if (t == "float") { ty = "float"; set_cv(n, n.v); }
+    else if (t == "bool") { ty = "bool"; set_cv(n, n.v ? 1 : 0); }
+    else if (t == "null") { ty = "null"; }
+    else if (t == "str") { ty = "*u8"; }
+    else if (t == "id") { ty = check_id(n); }
+    else if (t == "fnref") { ty = n.ty; }
+    else if (t == "bin") { ty = check_bin(n); }
+    else if (t == "un") { ty = check_un(n); }
+    else if (t == "cast") { ty = check_cast(n); }
+    else if (t == "call") { ty = check_call(n); }
+    else if (t == "index") { ty = check_index(n); }
+    else if (t == "member") { ty = check_member(n); }
+    else if (t == "cond") { ty = check_cond(n); }
+    else if (t == "incdec") { ty = check_incdec(n); }
+    else if (t == "comma") { check_expr(n.l); ty = check_expr(n.r); if (is_agg(ty) && !T.is_array(ty)) { err(n, "a struct cannot be the value of a comma expression"); } }
+    else if (t == "coalesce") { ty = check_coalesce(n); }
+    else if (t == "in") { ty = check_in(n); }
+    else if (t == "assignx") { ty = check_assignx(n); }
+    else if (t == "arrlit" || t == "arrfill") { ty = check_arr_standalone(n); }
+    else if (t == "structlit") { ty = check_structlit(n, ""); }
+    else if (t == "match") { ty = check_match(n); }
+    else if (t == "closure") { ty = check_closure(n); }
+    else if (t == "sizeof" || t == "alignof") {
+        let ty2 = resolve_type(n, n.tname);
+        n["tyname"] = ty2;
+        let sz = (t == "sizeof") ? T.size_of(ty2, ctx.structs) : T.align_of(ty2, ctx.structs);
+        if (sz < 0) { err(n, "cannot take the size of type '" + ty2 + "'"); }
+        set_cv(n, sz);
+        ty = "u64";
+    }
+    else if (t == "offsetof") {
+        if (!ctx.structs.has(n.sname)) { err(n, "unknown struct '" + n.sname + "'"); }
+        var off = -1;
+        for (f in ctx.structs[n.sname].fields) { if (f.name == n.field) { off = f.off; } }
+        if (off < 0) { err(n, "struct '" + n.sname + "' has no field '" + n.field + "'"); }
+        set_cv(n, off);
+        ty = "u64";
+    }
+    else { err(n, "internal: cannot check expression kind '" + t + "'"); }
+    n["ty"] = ty;
+    return ty;
+}
+
+fn check_id(n) -> string {
+    let s = lookup(n.name);
+    if (s == null) {
+        let f = find_fn(n.name);
+        if (f != null) { return make_fnref(n, f); }
+        if (find_generic(n.name) != null) { err(n, "generic function '" + n.name + "' cannot be used as a value; call it so its type parameters can be inferred"); }
+        if (ctx.enums.has(n.name)) { err(n, "enum '" + n.name + "' needs a member (e.g. " + n.name + "." + ctx.enums[n.name][0].name + ")"); }
+        if (lambda_outer != null) {
+            for (sc in lambda_outer) {
+                if (sc.has(n.name)) { err(n, "this closure uses '" + n.name + "' from the enclosing function; native closures cannot capture variables -- pass it as a parameter, or use a global"); }
+            }
+        }
+        err(n, "undefined name '" + n.name + "'");
+    }
+    n["sym"] = s;
+    // immutable global with a constant initializer folds to a constant
+    if (s.kind == "global" && s.cval != null && !s.mutable && !T.is_array(s.ty)) { set_cv(n, s.cval); }
+    return s.ty;
+}
+
+/// a function used as a value: its address
+fn make_fnref(n, f) -> string {
+    if (f.is_ext) { err(n, "cannot take the address of extern function '" + f.name + "'; wrap it in a function of your own"); }
+    n["t"] = "fnref";
+    n["sig"] = f;
+    let ty = fn_type_of(f);
+    n["ty"] = ty;
+    return ty;
+}
+
+fn check_bin(n) -> string {
+    let lt0 = check_expr(n.l);
+    let rt0 = check_expr(n.r);
+    if (is_agg(lt0) && !T.is_array(lt0)) { err(n.l, "a struct value cannot be an operand; use a pointer or a field"); }
+    if (is_agg(rt0) && !T.is_array(rt0)) { err(n.r, "a struct value cannot be an operand; use a pointer or a field"); }
+    let lt = rv(lt0);
+    let rt = rv(rt0);
+    let op = n.op;
+    if (op == "&&" || op == "||") {
+        check_scalar(n.l, lt, "operand of '" + op + "'");
+        check_scalar(n.r, rt, "operand of '" + op + "'");
+        n["cls"] = "logic";
+        return "bool";
+    }
+    if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
+        if (!T.is_scalar(lt) || !T.is_scalar(rt)) { err(n, "cannot compare " + show(lt) + " with " + show(rt)); }
+        if (floaty(lt) || floaty(rt)) { n["cls"] = "cmp_float"; }
+        else if (ptrlike(lt) || ptrlike(rt) || lt == "u64" || rt == "u64") { n["cls"] = "cmp_uint"; }
+        else { n["cls"] = "cmp_int"; }
+        if (T.is_ptr(lt) && T.is_ptr(rt) && lt != rt && T.pointee(lt) != "void" && T.pointee(rt) != "void") {
+            err(n, "comparing unrelated pointer types " + lt + " and " + rt + " (cast one side)");
+        }
+        if (T.is_fn(lt) && T.is_fn(rt) && lt != rt) { err(n, "comparing different function types " + lt + " and " + rt); }
+        return "bool";
+    }
+    if (op == "+" || op == "-") {
+        if (T.is_ptr(lt) && T.is_int(rt)) {
+            if (T.pointee(lt) == "void") { n["scale"] = 1; } else { n["scale"] = T.size_of(T.pointee(lt), ctx.structs); }
+            n["cls"] = (op == "+") ? "ptr_add" : "ptr_sub";
+            return lt;
+        }
+        if (op == "+" && T.is_int(lt) && T.is_ptr(rt)) {
+            if (T.pointee(rt) == "void") { n["scale"] = 1; } else { n["scale"] = T.size_of(T.pointee(rt), ctx.structs); }
+            n["cls"] = "int_ptr_add";
+            return rt;
+        }
+        if (op == "-" && T.is_ptr(lt) && T.is_ptr(rt)) {
+            if (lt != rt) { err(n, "subtracting pointers of different types " + lt + " and " + rt); }
+            if (T.pointee(lt) == "void") { n["scale"] = 1; } else { n["scale"] = T.size_of(T.pointee(lt), ctx.structs); }
+            n["cls"] = "ptr_diff";
+            return "int";
+        }
+    }
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
+        if (!(T.is_int(lt) || floaty(lt)) || !(T.is_int(rt) || floaty(rt))) { err(n, "operator '" + op + "' cannot be applied to " + show(lt) + " and " + show(rt)); }
+        if (T.is_bool(lt) || T.is_bool(rt)) { err(n, "arithmetic on bool; convert with 'as int' first"); }
+        let r = num_result(lt, rt);
+        if (r == "float" && op == "%") { err(n, "'%' is not defined for floats"); }
+        n["cls"] = (r == "float") ? "float" : ((r == "u64") ? "uint" : "int");
+        fold_bin(withty(n, r));
+        return r;
+    }
+    // bitwise and shifts
+    if (!T.is_int(lt) || !T.is_int(rt)) { err(n, "operator '" + op + "' needs integer operands, found " + show(lt) + " and " + show(rt)); }
+    if (op == "<<" || op == ">>" || op == ">>>") {
+        let r = (lt == "u64") ? "u64" : "int";
+        n["cls"] = (op == ">>>" || r == "u64") && op != "<<" ? "shr" : (op == "<<" ? "shl" : "sar");
+        fold_bin(withty(n, r));
+        return r;
+    }
+    if (T.is_bool(lt) && T.is_bool(rt)) { n["cls"] = "int"; return "bool"; }
+    let r = num_result(lt, rt);
+    n["cls"] = "int";
+    fold_bin(withty(n, r));
+    return r;
+}
+
+fn withty(n, ty: string) { n["ty"] = ty; return n; }
+
+fn check_un(n) -> string {
+    // &function  ->  the function's address
+    if (n.op == "&" && n.e.t == "id" && lookup(n.e.name) == null && find_fn(n.e.name) != null) {
+        let f = find_fn(n.e.name);
+        let ty = make_fnref(n.e, f);
+        n["t"] = "fnref"; n["sig"] = f;
+        return ty;
+    }
+    let et0 = check_expr(n.e);
+    let op = n.op;
+    if (op == "&") {
+        if (!is_lvalue(n.e)) { err(n, "cannot take the address of this expression"); }
+        if (n.e.t == "id" && n.e.sym.kind == "local") { n.e.sym["addr_taken"] = true; }
+        if (T.is_array(et0)) { return "*" + T.elem_of(et0); }
+        return "*" + et0;
+    }
+    if (op == "*") {
+        let et = rv(et0);
+        if (!T.is_ptr(et)) { err(n, "cannot dereference a value of type " + show(et)); }
+        let p = T.pointee(et);
+        if (p == "void") { err(n, "cannot dereference a '*void' pointer; cast it first"); }
+        return p;
+    }
+    let et = rv(et0);
+    if (op == "-") {
+        if (!(T.is_int(et) || floaty(et)) || T.is_bool(et)) { err(n, "cannot negate " + show(et)); }
+        let r = floaty(et) ? "float" : (et == "u64" ? "u64" : "int");
+        if (n.e["cv"] != null) { set_cv(n, -n.e["cv"]); }
+        return r;
+    }
+    if (op == "!") {
+        check_scalar(n.e, et, "operand of '!'");
+        return "bool";
+    }
+    if (op == "~") {
+        if (!T.is_int(et)) { err(n, "'~' needs an integer, found " + show(et)); }
+        if (n.e["cv"] != null) { set_cv(n, ~n.e["cv"]); }
+        return et == "u64" ? "u64" : "int";
+    }
+    err(n, "unknown unary operator " + op);
+}
+
+fn check_cast(n) -> string {
+    let from0 = check_expr(n.e);
+    let to = resolve_type(n, n.to);
+    if (is_agg(from0) && !T.is_array(from0)) { err(n, "cannot cast a struct value"); }
+    let fromty = rv(from0);
+    var ok = false;
+    if ((T.is_int(fromty) || floaty(fromty)) && (T.is_int(to) || floaty(to))) { ok = true; }
+    if (T.is_ptr(fromty) && (T.is_ptr(to) || to == "u64" || to == "int")) { ok = true; }
+    if (fromty == "null" && (T.is_ptr(to) || T.is_fn(to))) { ok = true; }
+    if (T.is_int(fromty) && (T.is_ptr(to) || T.is_fn(to)) && T.size_of(fromty, ctx.structs) == 8) { ok = true; }
+    if (T.is_fn(fromty) && (T.is_ptr(to) || to == "u64" || to == "int" || T.is_fn(to))) { ok = true; }
+    if (!ok) { err(n, "cannot cast " + show(fromty) + " to " + to); }
+    n["fromty"] = fromty;
+    if (n.e["cv"] != null && (T.is_int(to) && T.is_int(fromty))) {
+        var v = n.e["cv"];
+        let sz = T.size_of(to, ctx.structs);
+        if (sz < 8) {
+            let bits = sz * 8;
+            v = v & ((1 << bits) - 1);
+            if (T.INTS[to][1] && (v & (1 << (bits - 1))) != 0) { v = v - (1 << bits); }
+            if (to == "bool") { v = (n.e["cv"] != 0) ? 1 : 0; }
+        }
+        set_cv(n, v);
+    } else if (n.e["cv"] != null && to == "float") { set_cv(n, float(n.e["cv"])); }
+    else if (n.e["cv"] != null && T.is_int(to) && floaty(fromty)) { set_cv(n, int(n.e["cv"])); }
+    return to;
+}
+
+/// the common type of two branch types, or "" when there is none
+fn unify_types(a: string, b: string) -> string {
+    if (a == b) { return a; }
+    if ((T.is_int(a) || floaty(a)) && (T.is_int(b) || floaty(b))) {
+        if (T.is_bool(a) || T.is_bool(b)) { return T.is_bool(a) ? b : a; }
+        return num_result(a, b);
+    }
+    if ((T.is_ptr(a) || T.is_fn(a)) && b == "null") { return a; }
+    if ((T.is_ptr(b) || T.is_fn(b)) && a == "null") { return b; }
+    if (T.is_ptr(a) && T.is_ptr(b) && (T.pointee(a) == "void" || T.pointee(b) == "void")) { return T.pointee(a) == "void" ? b : a; }
+    return "";
+}
+
+fn check_cond(n) -> string {
+    let ct = check_expr(n.c);
+    check_scalar(n.c, rv(ct), "condition");
+    let a = rv(check_expr(n.a));
+    let b = rv(check_expr(n.b));
+    let u = unify_types(a, b);
+    if (u == "") { err(n, "the two branches of '?:' have different types (" + show(a) + " and " + show(b) + ")"); }
+    return u;
+}
+
+fn check_incdec(n) -> string {
+    let tt = check_expr(n.e);
+    if (!is_lvalue(n.e)) { err(n, "'" + n.op + "' needs a variable, element or field"); }
+    if (n.e.t == "id" && !n.e.sym.mutable) { err(n, "cannot modify '" + n.e.sym.name + "': it was declared with let/const (use var)"); }
+    if (is_agg(tt)) { err(n, "'" + n.op + "' cannot be applied to " + show(tt)); }
+    if (T.is_ptr(tt)) { n["step"] = (T.pointee(tt) == "void") ? 1 : T.size_of(T.pointee(tt), ctx.structs); }
+    else if (floaty(tt)) { n["step"] = 1; }
+    else if (T.is_int(tt) && !T.is_bool(tt)) { n["step"] = 1; }
+    else { err(n, "'" + n.op + "' cannot be applied to " + show(tt)); }
+    return tt;
+}
+
+fn check_coalesce(n) -> string {
+    let a = rv(check_expr(n.l));
+    let b = rv(check_expr(n.r));
+    if (!ptrlike(a) || a == "null") { err(n, "'??' needs a pointer or function on the left (a native value is 'null' only when it is a pointer), found " + show(a)); }
+    if (!assignable(b, a)) { err(n.r, "the right side of '??' (" + show(b) + ") does not fit the left side (" + show(a) + ")"); }
+    return a;
+}
+
+fn check_in(n) -> string {
+    let lt = rv(check_expr(n.l));
+    let rt0 = check_expr(n.r);
+    if (T.is_array(rt0)) {
+        let el = T.elem_of(rt0);
+        if (T.is_array(el) || is_struct(el) || floaty(el)) { err(n, "'in' searches arrays of integers or pointers"); }
+        if (!(T.is_int(lt) || ptrlike(lt))) { err(n.l, "cannot look for a " + show(lt) + " in an array of " + el); }
+        n["mode"] = "arr"; n["esize"] = T.size_of(el, ctx.structs); n["ety"] = el; n["alen"] = T.array_len(rt0);
+        return "bool";
+    }
+    if (T.is_ptr(rt0) && T.pointee(rt0) == "u8" && T.is_int(lt)) { n["mode"] = "cstr"; return "bool"; }
+    err(n, "'in' needs an array (T[N]) or a string on the right, found " + show(rt0));
+}
+
+fn check_index(n) -> string {
+    let bt = check_expr(n.e);
+    let it = rv(check_expr(n.i));
+    if (!T.is_int(it)) { err(n.i, "array index must be an integer, found " + show(it)); }
+    var el = "";
+    if (T.is_array(bt)) { el = T.elem_of(bt); n["arr"] = true; }
+    else if (T.is_ptr(bt)) {
+        el = T.pointee(bt);
+        if (el == "void") { err(n, "cannot index a '*void' pointer; cast it first"); }
+        n["arr"] = false;
+    } else { err(n, "cannot index a value of type " + show(bt)); }
+    n["esize"] = T.size_of(el, ctx.structs);
+    return el;
+}
+
+fn check_member(n) -> string {
+    if (n.e.t == "id" && lookup(n.e.name) == null) {
+        // namespace.name -> that module's function / global
+        if (ctx.nsmap.has(n.e.name)) {
+            let q = qual(ctx.nsmap[n.e.name], n.name);
+            if (ctx.globals.has(q)) {
+                let g = ctx.globals[q];
+                n["t"] = "id"; n["name"] = q; n["sym"] = g;
+                if (g.cval != null && !g.mutable && !T.is_array(g.ty)) { set_cv(n, g.cval); }
+                return g.ty;
+            }
+            if (ctx.funcs.has(q)) { return make_fnref(n, ctx.funcs[q]); }
+            err(n, "module '" + n.e.name + "' has no function or variable '" + n.name + "'");
+        }
+        // Enum.Member
+        if (ctx.enums.has(n.e.name)) {
+            for (m in ctx.enums[n.e.name]) {
+                if (m.name == n.name) { set_cv(n, m.v); n["enum"] = true; return "int"; }
+            }
+            err(n, "enum '" + n.e.name + "' has no member '" + n.name + "'");
+        }
+        // Type.method used as a value
+        if (ctx.methods.has(n.e.name) && ctx.methods[n.e.name].has(n.name)) { return make_fnref(n, ctx.methods[n.e.name][n.name]); }
+    }
+    let bt = check_expr(n.e);
+    var sname = bt;
+    var via_ptr = false;
+    if (T.is_ptr(bt)) { sname = T.pointee(bt); via_ptr = true; }
+    if (n.arrow && !via_ptr) { err(n, "'->' needs a pointer to a struct, found " + show(bt)); }
+    if (!ctx.structs.has(sname)) { err(n, "type " + show(bt) + " has no fields"); }
+    for (f in ctx.structs[sname].fields) {
+        if (f.name == n.name) {
+            n["off"] = f.off;
+            n["via_ptr"] = via_ptr;
+            return f.ty;
+        }
+    }
+    var names = [];
+    for (f in ctx.structs[sname].fields) { names.push(f.name); }
+    err(n, "struct '" + sname + "' has no field '" + n.name + "' (fields: " + names.join(", ") + ")");
+}
+
+// ---------------------------------------------------------------- initialisers (arrays, structs)
+fn check_arr_standalone(n) -> string {
+    if (n.t == "arrfill") {
+        let vt0 = check_expr(n.v);
+        let ct = check_expr(n.count);
+        if (n.count["cv"] == null || !T.is_int(rv(ct))) { err(n.count, "the length of [value; count] must be a constant integer"); }
+        if (n.count["cv"] <= 0) { err(n.count, "the length of [value; count] must be positive"); }
+        let ety = is_agg(vt0) ? vt0 : rv(vt0);
+        n["ety"] = ety; n["cnt"] = n.count["cv"];
+        return ety + "[" + str(n.count["cv"]) + "]";
+    }
+    let first = check_expr(n.elems[0]);
+    let ety = is_agg(first) ? first : rv(first);
+    var i = 1;
+    while (i < len(n.elems)) {
+        let et = check_expr(n.elems[i]);
+        if (is_agg(ety)) { if (et != ety) { err(n.elems[i], "array elements must all have type " + ety); } }
+        else { need_assignable(n.elems[i], et, ety, "store"); }
+        i = i + 1;
+    }
+    if (ety == "null") { err(n, "cannot infer an element type from null; declare the array with a type"); }
+    n["ety"] = ety; n["cnt"] = len(n.elems);
+    return ety + "[" + str(len(n.elems)) + "]";
+}
+
+fn check_structlit(n, expect: string) -> string {
+    if (!ctx.structs.has(n.name)) { err(n, "unknown struct '" + n.name + "'"); }
+    let st = ctx.structs[n.name];
+    let out = [];
+    let seen = {};
+    for (f in n.fields) {
+        if (seen.has(f.name)) { err(f, "field '" + f.name + "' given twice"); }
+        seen[f.name] = true;
+        var found = null;
+        for (sf in st.fields) { if (sf.name == f.name) { found = sf; } }
+        if (found == null) {
+            var names = [];
+            for (sf in st.fields) { names.push(sf.name); }
+            err(f, "struct '" + n.name + "' has no field '" + f.name + "' (fields: " + names.join(", ") + ")");
+        }
+        check_init(f.e, found.ty, "store");
+        out.push({ name: f.name, off: found.off, ty: found.ty, e: f.e });
+    }
+    if (st.union && len(out) > 1) { err(n, "a union literal initialises exactly one field"); }
+    n["sfields"] = out;
+    n["complete"] = (len(out) == len(st.fields)) && !st.union;
+    return n.name;
+}
+
+/// Check `e` as an initialiser of type `to` (array and struct literals take their shape from `to`).
+fn check_init(e, to: string, what: string) {
+    if (e.t == "arrlit" && T.is_array(to)) {
+        let ety = T.elem_of(to);
+        let cap = T.array_len(to);
+        if (len(e.elems) > cap) { err(e, "too many initialisers (" + str(len(e.elems)) + ") for " + to); }
+        for (x in e.elems) { check_init(x, ety, what); }
+        e["ety"] = ety; e["cnt"] = len(e.elems); e["ty"] = to;
+        return;
+    }
+    if (e.t == "arrfill" && T.is_array(to)) {
+        let ety = T.elem_of(to);
+        let cap = T.array_len(to);
+        let ct = check_expr(e.count);
+        if (e.count["cv"] == null || !T.is_int(rv(ct))) { err(e.count, "the length of [value; count] must be a constant integer"); }
+        if (e.count["cv"] > cap) { err(e, "[value; " + str(e.count["cv"]) + "] is longer than " + to); }
+        check_init(e.v, ety, what);
+        e["ety"] = ety; e["cnt"] = e.count["cv"]; e["ty"] = to;
+        return;
+    }
+    if (e.t == "structlit") {
+        check_structlit(e, to);
+        e["ty"] = e.name;
+        if (e.name != to) { err(e, "cannot " + what + " a " + e.name + " as " + to); }
+        return;
+    }
+    let it = check_expr(e);
+    need_assignable(e, it, to, what);
+}
+
+// ---------------------------------------------------------------- calls
+fn arity_error(n, name: string, lo: int, hi: int, got: int) {
+    var want = str(lo);
+    if (hi < 0) { want = "at least " + str(lo); }
+    else if (hi != lo) { want = str(lo) + " to " + str(hi); }
+    err(n, "'" + name + "' expects " + want + " argument(s) but got " + str(got));
+}
+
+fn method_key(ty: string) -> string {
+    if (ty == "*u8") { return "string"; }
+    if (T.is_ptr(ty) && ctx.structs.has(T.pointee(ty))) { return T.pointee(ty); }
+    if (ctx.structs.has(ty)) { return ty; }
+    if (ty == "float" || ty == "f32") { return "float"; }
+    if (ty == "bool") { return "bool"; }
+    if (T.is_int(ty)) { return "int"; }
+    return ty;
+}
+
+/// a default argument is checked where the function lives (its own module's names), not in the caller
+fn check_default(sig, i: int) {
+    let d = sig.defs[i];
+    let sv = scopes;
+    let sn = cur_ns;
+    scopes = [{}];
+    cur_ns = sig.ns;
+    let dt = check_expr(d);
+    need_assignable(d, dt, sig.params[i], "use as a default for");
+    scopes = sv;
+    cur_ns = sn;
+}
+
+/// call of a known function / method: sig, explicit argument nodes, optional leading `self` node
+fn finish_direct(n, sig, args, selfn) -> string {
+    let np = len(sig.params);
+    let all = [];
+    if (selfn != null) { all.push(selfn); }
+    for (a in args) { all.push(a); }
+    var lo = np;
+    if (!sig.variadic) {
+        var k = np;
+        while (k > 0 && sig.defs[k - 1] != null) { k = k - 1; }
+        lo = k;
+    }
+    if (len(all) < lo || (len(all) > np && !sig.variadic)) {
+        arity_error(n, sig.display, lo, sig.variadic ? -1 : np, len(all));
+    }
+    var i = 0;
+    while (i < len(all)) {
+        let a = all[i];
+        if (!(selfn != null && i == 0)) { check_expr(a); }
+        let at = a["ty"];
+        if (i < np) { need_assignable(a, at, sig.params[i], "pass"); }
+        else {
+            if (is_agg(at) && !T.is_array(at)) { err(a, "structs cannot be passed by value"); }
+            let r = rv(at);
+            if (!T.is_scalar(r)) { err(a, "cannot pass " + show(r) + " as a variadic argument"); }
+        }
+        i = i + 1;
+    }
+    while (len(all) < np) {
+        check_default(sig, len(all));
+        all.push(sig.defs[len(all)]);
+    }
+    n["kind"] = "direct";
+    n["sig"] = sig;
+    n["cargs"] = all;
+    return sig.ret;
+}
+
+fn infer_generics(n, g, args) -> string {
+    let tps = g.tparams;
+    let binds = {};
+    if (len(args) != len(g.params)) { arity_error(n, g.name, len(g.params), len(g.params), len(args)); }
+    var i = 0;
+    while (i < len(args)) {
+        let at = rv(check_expr(args[i]));
+        let pt = T.canon(strip_ns(g.params[i].ty));
+        if (!unify(n, pt, at, tps, binds)) {
+            err(args[i], "argument " + str(i + 1) + " of '" + g.name + "' has type " + show(at) + ", which does not match the parameter type " + g.params[i].ty);
+        }
+        i = i + 1;
+    }
+    var key = qual(g["ns"], g.name) + "<";
+    for (tp in tps) {
+        if (!binds.has(tp)) { err(n, "cannot infer type parameter '" + tp + "' of '" + g.name + "' from the arguments"); }
+        key = key + binds[tp] + ";";
+    }
+    key = key + ">";
+    if (ctx.insts.has(key)) { return key; }
+    // instantiate: clone the template with the type names replaced, then register it like any function
+    let clone = clone_node(g, binds);
+    var suffix = "";
+    for (tp in tps) { suffix = suffix + "_" + mangle_type(binds[tp]); }
+    clone["name"] = g.name + "$" + suffix;
+    clone["tparams"] = [];
+    clone["ns"] = g["ns"];
+    let sig = register_fn(clone);
+    ctx.insts[key] = sig;
+    return key;
+}
+
+fn mangle_type(ty: string) -> string {
+    var out = "";
+    for (c in ty) {
+        if (c == "*") { out = out + "P"; }
+        else if (is_wordch(c)) { out = out + c; }
+        else { out = out + "_"; }
+    }
+    return out;
+}
+
+fn unify(n, p: string, a: string, tps, binds) -> bool {
+    var pp = p;
+    var aa = a;
+    while (len(pp) > 0 && pp[0] == "*") {
+        if (len(aa) == 0 || aa[0] != "*") { return false; }
+        pp = pp[1..len(pp)];
+        aa = aa[1..len(aa)];
+    }
+    if (tps.contains(pp)) {
+        if (T.is_array(aa)) { err(n, "a generic parameter cannot be bound to the array type " + aa); }
+        if (aa == "null") { err(n, "cannot infer a type parameter from null"); }
+        if (binds.has(pp)) {
+            if (binds[pp] == aa) { return true; }
+            if ((T.is_int(binds[pp]) || floaty(binds[pp])) && (T.is_int(aa) || floaty(aa))) {
+                if (floaty(aa) && !floaty(binds[pp])) { binds[pp] = aa; }
+                return true;
+            }
+            err(n, "conflicting types for type parameter '" + pp + "': " + binds[pp] + " and " + aa);
+        }
+        binds[pp] = aa;
+        return true;
+    }
+    return true;
+}
+
+fn subst_type(ty: string, binds) -> string {
+    var out = "";
+    var word = "";
+    var i = 0;
+    while (i <= len(ty)) {
+        let c = i < len(ty) ? ty[i] : "";
+        if (is_wordch(c)) { word = word + c; }
+        else {
+            if (word != "") { out = out + (binds.has(word) ? binds[word] : word); word = ""; }
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn clone_node(x, binds) {
+    let ty = typeof(x);
+    if (ty == "array") {
+        let out = [];
+        for (e in x) { out.push(clone_node(e, binds)); }
+        return out;
+    }
+    if (ty == "object") {
+        let out = {};
+        for (k in x.keys()) {
+            let v = x[k];
+            if ((k == "ty" || k == "to" || k == "ret" || k == "tname") && typeof(v) == "string") { out[k] = subst_type(v, binds); }
+            else { out[k] = clone_node(v, binds); }
+        }
+        return out;
+    }
+    return x;
+}
+
+fn check_call(n) -> string {
+    let f = n.f;
+    // module.func(...)  /  Type.func(...)  (static method)
+    if (f.t == "member" && f.e.t == "id" && lookup(f.e.name) == null) {
+        if (ctx.nsmap.has(f.e.name)) {
+            let q = qual(ctx.nsmap[f.e.name], f.name);
+            if (ctx.generics.has(q)) { return call_generic(n, ctx.generics[q], n.args); }
+            if (ctx.funcs.has(q)) { return finish_direct(n, ctx.funcs[q], n.args, null); }
+            if (ctx.globals.has(q)) { return check_indirect(n); }
+            err(f, "module '" + f.e.name + "' has no function '" + f.name + "'");
+        } else if (ctx.methods.has(f.e.name) && ctx.methods[f.e.name].has(f.name)) {
+            return finish_direct(n, ctx.methods[f.e.name][f.name], n.args, null);
+        } else if (ctx.structs.has(f.e.name)) {
+            err(f, "type '" + f.e.name + "' has no function '" + f.name + "' (declare it in an impl block)");
+        }
+    }
+    if (f.t == "id") {
+        let name = f.name;
+        let local = lookup(name);
+        if (local == null) {
+            if (find_generic(name) != null) { return call_generic(n, find_generic(name), n.args); }
+            let sig = find_fn(name);
+            if (sig != null) { return finish_direct(n, sig, n.args, null); }
+            let bt = check_builtin(n, name);
+            if (bt != "") { return bt; }
+            err(n, "undefined function '" + name + "'");
+        }
+        return check_indirect(n);          // a variable holding a function pointer
+    }
+    if (f.t == "member") {
+        // value.method(...)  or a struct field that holds a function pointer
+        let bt = check_expr(f.e);
+        let vt = rv(bt);
+        var sname = vt;
+        if (T.is_ptr(vt)) { sname = T.pointee(vt); }
+        if (ctx.structs.has(sname)) {
+            for (fl in ctx.structs[sname].fields) { if (fl.name == f.name) { return check_indirect(n); } }
+        }
+        let key = method_key(is_struct(bt) ? bt : vt);
+        if (ctx.methods.has(key) && ctx.methods[key].has(f.name)) {
+            let m = ctx.methods[key][f.name];
+            if (!m.has_self) { err(f, "'" + f.name + "' is a static function; call it as " + key + "." + f.name + "(...)"); }
+            var selfn = f.e;
+            if (is_struct(bt)) {
+                if (!is_lvalue(f.e) && !(f.e.t == "call" || f.e.t == "structlit")) { err(f.e, "a method that takes 'self' needs a variable, element, field or struct value to act on"); }
+                if (f.e.t == "id" && f.e.sym.kind == "local") { f.e.sym["addr_taken"] = true; }
+                selfn = { t: "un", op: "&", e: f.e, line: f.e.line, col: f.e.col, ty: "*" + bt };
+            }
+            return finish_direct(n, m, n.args, selfn);
+        }
+        err(f, "type " + show(bt) + " has no method or function field '" + f.name + "'");
+    }
+    return check_indirect(n);
+}
+
+fn check_indirect(n) -> string {
+    let ft = check_expr(n.f);
+    if (!T.is_fn(ft)) { err(n, "this is not a function (its type is " + show(ft) + ")"); }
+    let p = T.fn_parts(ft);
+    if (len(n.args) != len(p[0])) { arity_error(n, "function pointer", len(p[0]), len(p[0]), len(n.args)); }
+    var i = 0;
+    while (i < len(n.args)) {
+        need_assignable(n.args[i], check_expr(n.args[i]), p[0][i], "pass");
+        i = i + 1;
+    }
+    n["kind"] = "indirect";
+    n["fparams"] = p[0];
+    n["cargs"] = n.args;
+    return p[1];
+}
+
+fn call_generic(n, g, args) -> string {
+    let key = infer_generics(n, g, args);
+    return finish_direct(n, ctx.insts[key], args, null);
+}
+
+/// B passes strings as plain words: an integer first argument of char()/lchar() is a byte address
+fn bword(e) {
+    let t = rv(check_expr(e));
+    if (T.is_int(t)) { return { t: "cast", e: e, to: "*u8", line: e.line, col: e.col }; }
+    return e;
+}
+
+/// built-in pseudo functions: sqrt abs char lchar print println
+fn check_builtin(n, name: string) -> string {
+    if (name == "fnaddr") {
+        if (len(n.args) != 1 || n.args[0].t != "id" || !ctx.funcs.has(n.args[0].name) || ctx.funcs[n.args[0].name].is_ext) {
+            err(n, "fnaddr takes the name of a function defined in this program, e.g. fnaddr(handler)");
+        }
+        n["builtin"] = "k:fnaddr"; n["kind"] = "builtin";
+        n["fn"] = ctx.funcs[n.args[0].name].name;
+        return "int";
+    }
+    if (INTRIN.has(name)) {
+        let spec = INTRIN[name];
+        let mx = len(spec) > 2 ? spec[2] : spec[0];
+        if (len(n.args) < spec[0] || len(n.args) > mx) { err(n, name + " takes " + (mx == spec[0] ? "exactly " + str(spec[0]) : str(spec[0]) + " to " + str(mx)) + " argument(s)"); }
+        for (a in n.args) {
+            let at = rv(check_expr(a));
+            if (!(T.is_int(at) || T.is_ptr(at) || at == "bool")) { err(a, name + " needs integer or pointer arguments, found " + show(at)); }
+        }
+        n["builtin"] = "k:" + name; n["kind"] = "builtin";
+        return spec[1];
+    }
+    if (name == "sqrt") {
+        if (len(n.args) != 1) { err(n, "sqrt takes exactly 1 argument"); }
+        need_assignable(n.args[0], check_expr(n.args[0]), "float", "pass");
+        n["builtin"] = "sqrt"; n["kind"] = "builtin";
+        return "float";
+    }
+    if (name == "abs") {
+        if (len(n.args) != 1) { err(n, "abs takes exactly 1 argument"); }
+        let at = rv(check_expr(n.args[0]));
+        n["kind"] = "builtin";
+        if (floaty(at)) { n["builtin"] = "fabs"; return "float"; }
+        if (!T.is_int(at)) { err(n, "abs needs a number"); }
+        n["builtin"] = "iabs";
+        return "int";
+    }
+    if (name == "char") {        // B: char(s, i) reads byte i of a string
+        if (len(n.args) != 2) { err(n, "char(string, index) takes 2 arguments"); }
+        n["t"] = "index"; n["e"] = bword(n.args[0]); n["i"] = n.args[1];
+        let st = check_expr(n.e);
+        if (!(T.is_ptr(st) || T.is_array(st))) { err(n, "char() needs a string or pointer"); }
+        return check_index(n);
+    }
+    if (name == "lchar") {       // B: lchar(s, i, c) stores byte i
+        if (len(n.args) != 3) { err(n, "lchar(string, index, char) takes 3 arguments"); }
+        let ix = { t: "index", e: bword(n.args[0]), i: n.args[1], line: n.line, col: n.col };
+        n["t"] = "assignx"; n["op"] = "="; n["target"] = ix; n["value"] = n.args[2];
+        return check_assignx(n);
+    }
+    if (name == "print" || name == "println") {
+        let fmt = [];
+        let args = [];
+        var first = true;
+        for (a in n.args) {
+            let at = rv(check_expr(a));
+            if (!first) { fmt.push(32); }
+            first = false;
+            if (T.is_bool(at)) {
+                fmt.push(37); fmt.push(115);
+                let tn = { t: "str", v: [116, 114, 117, 101], line: a.line, col: a.col };
+                let fn2 = { t: "str", v: [102, 97, 108, 115, 101], line: a.line, col: a.col };
+                args.push({ t: "cond", c: a, a: tn, b: fn2, line: a.line, col: a.col });
+            } else if (T.is_int(at)) {
+                fmt.push(37); fmt.push(108); fmt.push(at == "u64" ? 117 : 100);
+                args.push(a);
+            } else if (floaty(at)) { fmt.push(37); fmt.push(103); args.push(a); }
+            else if (at == "*u8") { fmt.push(37); fmt.push(115); args.push(a); }
+            else if (T.is_ptr(at) || T.is_fn(at)) { fmt.push(37); fmt.push(112); args.push(a); }
+            else { err(a, "cannot print a value of type " + show(at) + " natively"); }
+        }
+        fmt.push(10);
+        n["f"] = { t: "id", name: "printf", line: n.line, col: n.col };
+        let sargs = [{ t: "str", v: fmt, line: n.line, col: n.col }];
+        for (a in args) { sargs.push(a); }
+        n["args"] = sargs;
+        return check_call(n);
+    }
+    return "";
+}
+
+fn check_closure(n) -> string {
+    // lift to a static function; it can see globals but not the enclosing function's locals
+    next_tmp = next_tmp + 1;
+    for (p in n.params) { if (p.ty == "") { err(p, "closure parameter '" + p.name + "' needs a type"); } }
+    let fnode = { t: "fn", line: n.line, col: n.col, name: "__lambda" + str(next_tmp), params: n.params, ret: n.ret, body: n.body,
+                  is_static: true, tparams: [], ns: cur_ns };
+    let sig = register_fn(fnode);
+    var saved = { scopes: scopes, cur_fn: cur_fn, cur_ns: cur_ns, loop_depth: loop_depth, break_depth: break_depth, lstack: lstack,
+                  fn_labels: fn_labels, fn_gotos: fn_gotos, outer: lambda_outer };
+    lambda_outer = scopes;
+    scopes = [{}];
+    check_function_body(sig);
+    scopes = saved.scopes; cur_fn = saved.cur_fn; cur_ns = saved.cur_ns; loop_depth = saved.loop_depth; break_depth = saved.break_depth;
+    lstack = saved.lstack; fn_labels = saved.fn_labels; fn_gotos = saved.fn_gotos; lambda_outer = saved.outer;
+    n["t"] = "fnref";
+    n["sig"] = sig;
+    return fn_type_of(sig);
+}
+
+// ---------------------------------------------------------------- match
+fn pattern_value(p, scrut: string) {
+    let pt = check_expr(p);
+    if (p.t == "str") { err(p, "string patterns compare text at run time; use strcmp in an if/else chain"); }
+    if (p.t == "float" || floaty(pt)) { err(p, "floating-point patterns are not supported in a native match"); }
+    if (p.t == "null") {
+        if (!(T.is_ptr(scrut) || T.is_fn(scrut))) { err(p, "'null' can only match a pointer"); }
+        return 0;
+    }
+    if (p["cv"] == null) { err(p, "a match pattern must be a constant (a number, character, bool, enum member or constant)"); }
+    return p["cv"];
+}
+
+fn check_match(n) -> string {
+    let st = rv(check_expr(n.e));
+    if (!(T.is_int(st) || T.is_ptr(st) || T.is_fn(st))) { err(n.e, "'match' needs an integer, bool, enum or pointer, found " + show(st)); }
+    n["sty"] = st;
+    let seen = {};
+    var vals = true;
+    var rty = "";
+    var has_wild = false;
+    for (arm in n.arms) {
+        let consts = [];
+        arm["wild"] = false;
+        for (p in arm.pats) {
+            if (p.t == "wild") { arm["wild"] = true; has_wild = true; consts.push(0); continue; }
+            let v = pattern_value(p, st);
+            if (seen.has(str(v))) { err(p, "this pattern is already covered by an earlier arm"); }
+            seen[str(v)] = true;
+            consts.push(v);
+        }
+        arm["consts"] = consts;
+        let b = arm.body;
+        arm["is_stmt"] = false;
+        if (b.t == "block") { vals = false; check_block(b); arm["is_stmt"] = true; }
+        else if (b.t == "assign") { vals = false; check_assign(b); arm["is_stmt"] = true; }
+        else {
+            let bt = check_expr(b);
+            if (bt == "void") { vals = false; arm["is_stmt"] = true; continue; }
+            if (is_agg(bt) && !T.is_array(bt)) { err(b, "a match arm cannot produce a struct value"); }
+            let r = rv(bt);
+            if (rty == "") { rty = r; }
+            else {
+                let u = unify_types(rty, r);
+                if (u == "") { err(b, "the arms of this match have different types (" + show(rty) + " and " + show(r) + ")"); }
+                rty = u;
+            }
+        }
+    }
+    n["has_wild"] = has_wild;
+    if (!vals || rty == "") { n["is_value"] = false; return "void"; }
+    n["is_value"] = true;
+    return rty;
+}
+
+// ---------------------------------------------------------------- statements
+fn check_block(b) {
+    push_scope();
+    for (s in b.body) { check_stmt(s); }
+    pop_scope();
+}
+
+fn check_cond_expr(e, what: string) {
+    let t = check_expr(e);
+    check_scalar(e, rv(t), what);
+}
+
+fn expr_ok_as_stmt(e) -> bool {
+    return e.t == "call" || e.t == "incdec" || e.t == "comma" || e.t == "match" || e.t == "assignx";
+}
+
+fn check_loop_body(body, label: string) {
+    loop_depth = loop_depth + 1; break_depth = break_depth + 1;
+    lstack.push({ label: label, loop: true });
+    check_block(body);
+    lstack.pop();
+    loop_depth = loop_depth - 1; break_depth = break_depth - 1;
+}
+
+fn check_stmt(s) {
+    let t = s.t;
+    if (t == "block") { check_block(s); }
+    else if (t == "multi") { for (x in s.body) { check_stmt(x); } }
+    else if (t == "decl") { check_decl(s); }
+    else if (t == "destruct") { check_destruct(s); }
+    else if (t == "assign") { check_assign(s); }
+    else if (t == "expr") {
+        if (!expr_ok_as_stmt(s.e)) { err(s, "this expression has no effect (only calls, assignments, ++/-- and match can be used as statements)"); }
+        check_expr(s.e);
+    }
+    else if (t == "if") {
+        check_cond_expr(s.c, "'if' condition");
+        check_block(s.a);
+        if (s.b != null) { check_stmt(s.b); }
+    }
+    else if (t == "while") {
+        check_cond_expr(s.c, "'while' condition");
+        check_loop_body(s.body, s.label);
+    }
+    else if (t == "dowhile") {
+        check_loop_body(s.body, s.label);
+        check_cond_expr(s.c, "'while' condition");
+    }
+    else if (t == "for") {
+        push_scope();
+        if (s.init != null) { check_stmt(s.init); }
+        if (s.cond != null) { check_cond_expr(s.cond, "'for' condition"); }
+        if (s.step != null) { check_stmt(s.step); }
+        check_loop_body(s.body, s.label);
+        pop_scope();
+    }
+    else if (t == "forrange") {
+        let lt = rv(check_expr(s.lo));
+        let ht = rv(check_expr(s.hi));
+        if (!T.is_int(lt) || !T.is_int(ht)) { err(s, "range bounds must be integers, found " + show(lt) + ".." + show(ht)); }
+        push_scope();
+        let vty = (lt == "u64" || ht == "u64") ? "u64" : "int";
+        let sym = new_local(s.vname, vty, false);
+        declare({ line: s.vline, col: s.vcol }, s.vname, sym);
+        s["sym"] = sym;
+        check_loop_body(s.body, s.label);
+        pop_scope();
+    }
+    else if (t == "forin") { check_forin(s); }
+    else if (t == "switch") { check_switch(s); }
+    else if (t == "label") {
+        if (fn_labels.has(s.name)) { err(s, "label '" + s.name + "' is defined twice in this function"); }
+        fn_labels[s.name] = true;
+        check_stmt(s.stmt);
+    }
+    else if (t == "goto") { fn_gotos.push(s); }
+    else if (t == "return") {
+        if (s.e == null) {
+            if (cur_fn.ret != "void") { err(s, "this function returns " + cur_fn.ret + "; 'return' needs a value"); }
+        } else {
+            if (cur_fn.ret == "void") { err(s, "this function returns nothing; remove the value after 'return'"); }
+            check_init(s.e, cur_fn.ret, "return");
+        }
+    }
+    else if (t == "break" || t == "continue") { check_jump(s); }
+    else if (t == "defer") { ctx["uses_eh"] = true; check_block(s.body); }
+    else if (t == "throw") {
+        ctx["uses_eh"] = true;
+        let et = rv(check_expr(s.e));
+        if (!(T.is_int(et) || T.is_ptr(et) || T.is_fn(et))) { err(s.e, "a native 'throw' carries an integer or pointer (a 64-bit value), found " + show(et)); }
+    }
+    else if (t == "try") {
+        ctx["uses_eh"] = true;
+        check_block(s.body);
+        push_scope();
+        if (s.vname != "") {
+            let sym = new_local(s.vname, "int", false);
+            declare(s, s.vname, sym);
+            s["vsym"] = sym;
+        }
+        for (x in s.handler.body) { check_stmt(x); }
+        pop_scope();
+    }
+    else if (t == "comptime") { check_comptime(s); }
+    else if (t == "extrn") {
+        for (nm in s.names) {
+            if (lookup(nm) == null && find_fn(nm) == null) { err(s, "extrn: '" + nm + "' is not a global variable or function"); }
+        }
+        s["t"] = "block"; s["body"] = [];
+    }
+    else { err(s, "internal: cannot check statement kind '" + t + "'"); }
+}
+
+fn check_jump(s) {
+    if (s.label != "") {
+        var found = false;
+        var i = len(lstack) - 1;
+        while (i >= 0) {
+            if (lstack[i].label == s.label) {
+                found = true;
+                if (s.t == "continue" && !lstack[i].loop) { err(s, "'continue " + s.label + "' needs a loop label"); }
+                break;
+            }
+            i = i - 1;
+        }
+        if (!found) { err(s, "no enclosing loop or switch is labeled '" + s.label + "'"); }
+        return;
+    }
+    if (s.t == "continue") { if (loop_depth == 0) { err(s, "'continue' outside of a loop"); } }
+    else if (break_depth == 0) { err(s, "'break' outside of a loop or switch"); }
+}
+
+fn check_forin(s) {
+    let at = check_expr(s.e);
+    if (!T.is_array(at)) { err(s.e, "the native 'for (x in ...)' iterates a fixed array (T[N]), found " + show(at) + "; use for (i in 0..n) with a pointer"); }
+    if (!is_lvalue(s.e)) { err(s.e, "iterate over an array variable, element or field"); }
+    let el = T.elem_of(at);
+    s["alen"] = T.array_len(at);
+    s["ety"] = el;
+    push_scope();
+    let sym = new_local(s.vname, T.is_array(el) ? "*" + T.elem_of(el) : el, false);
+    declare({ line: s.vline, col: s.vcol }, s.vname, sym);
+    s["sym"] = sym;
+    s["hid"] = new_local(hidden_name("fi"), "int", true);
+    s["hbase"] = new_local(hidden_name("fb"), "*u8", true);
+    s["isym"] = null;
+    if (s.iname != "") {
+        let isym = new_local(s.iname, "int", false);
+        declare({ line: s.vline, col: s.vcol }, s.iname, isym);
+        s["isym"] = isym;
+    }
+    check_loop_body(s.body, s.label);
+    pop_scope();
+}
+
+fn check_switch(s) {
+    let st = rv(check_expr(s.e));
+    if (!(T.is_int(st) || T.is_ptr(st) || T.is_fn(st))) { err(s.e, "'switch' needs an integer, bool, enum or pointer, found " + show(st)); }
+    s["sty"] = st;
+    let seen = {};
+    var ndef = 0;
+    break_depth = break_depth + 1;
+    lstack.push({ label: "", loop: false });
+    push_scope();                                  // all cases share one scope
+    for (c in s.cases) {
+        if (c.vals == null) {
+            ndef = ndef + 1;
+            if (ndef > 1) { err(c, "a switch has at most one 'default'"); }
+        } else {
+            for (v in c.vals) {
+                let vt = rv(check_expr(v));
+                if (!(T.is_int(vt) || ptrlike(vt))) { err(v, "a case value must be an integer, enum member or pointer, found " + show(vt)); }
+                if (v["cv"] != null) {
+                    if (seen.has(str(v["cv"]))) { err(v, "duplicate case value " + str(v["cv"])); }
+                    seen[str(v["cv"])] = true;
+                }
+            }
+        }
+        for (x in c.body) { check_stmt(x); }
+    }
+    pop_scope();
+    lstack.pop();
+    break_depth = break_depth - 1;
+}
+
+fn check_comptime(s) {
+    // comptime blocks hold constant declarations; their bindings escape to the enclosing scope
+    comptime_items(s.body);
+    s["t"] = "multi";
+}
+
+fn comptime_items(body) {
+    for (x in body) {
+        if (x.t == "decl" && x.init != null) {
+            check_decl(x);
+            let c = x.init["cv"];
+            if (c == null && x.init.t != "str" && x.init.t != "null") { err(x, "comptime: the initialiser of '" + x.name + "' must be a constant expression the native compiler can fold"); }
+        } else if (x.t == "multi") { comptime_items(x.body); }
+        else if (x.t == "block" && len(x.body) == 0) { continue; }
+        else { err(x, "a comptime block can only declare constants for the native compiler; run-time code belongs outside it"); }
+    }
+}
+
+fn check_decl(s) {
+    var ty = "";
+    if (s.ty != "") { ty = resolve_type(s, s.ty); }
+    if (s.static) { check_static_local(s, ty); return; }
+    if (s.init != null) {
+        if (ty == "") {
+            let it = check_expr(s.init);
+            if (it == "null") { err(s, "'" + s.name + "' is initialised with null; give it a pointer type"); }
+            if (it == "void") { err(s, "cannot initialise '" + s.name + "' with a function that returns nothing"); }
+            ty = is_agg(it) ? it : rv(it);
+            if (T.is_array(it) && s.init.t != "arrlit" && s.init.t != "arrfill") { ty = rv(it); }
+        } else { check_init(s.init, ty, "initialise a '" + ty + "' with"); }
+    }
+    if (ty == "void") { err(s, "a variable cannot have type void"); }
+    if (T.size_of(ty, ctx.structs) < 0) { err(s, "type '" + ty + "' has unknown size"); }
+    let sym = new_local(s.name, ty, s.mutable);
+    declare(s, s.name, sym);
+    s["sym"] = sym;
+}
+
+fn check_static_local(s, ty0: string) {
+    var ty = ty0;
+    if (s.init != null) {
+        let it = check_expr(s.init);
+        if (ty == "") {
+            ty = is_agg(it) ? it : rv(it);
+            if (ty == "null") { err(s, "give the static '" + s.name + "' a pointer type"); }
+        }
+    }
+    if (ty == "") { err(s, "static '" + s.name + "' needs a type"); }
+    next_tmp = next_tmp + 1;
+    let g = { kind: "global", name: cur_fn.name + "__" + s.name + "$" + str(next_tmp), ty: ty, mutable: s.mutable || s.kind == "var", is_static: true,
+              agg: is_agg(ty), init_kind: "zero", cval: null, line: s.line, shown: s.name };
+    if (s.init != null) { const_init(g, s.init); }
+    ctx.global_list.push(g);
+    declare(s, s.name, g);
+    s["skip"] = true;
+}
+
+fn check_destruct(s) {
+    let it = check_expr(s.init);
+    var base = null;
+    let hn = hidden_name("d");
+    var hty = "";
+    let zero = { t: "int", v: 0, line: s.line, col: s.col, ty: "int", cv: 0 };
+    let pre = [];
+    var src = s.init;
+    if (is_agg(it) && !is_lvalue(s.init)) {
+        // a literal (or other rvalue): keep it in a hidden local first
+        let tn = hidden_name("t");
+        let tsym = new_local(tn, it, false);
+        declare(s, tn, tsym);
+        pre.push({ t: "decl", line: s.line, col: s.col, name: tn, ty: "", init: s.init, mutable: false, kind: "let", sym: tsym, static: false });
+        src = { t: "id", name: tn, sym: tsym, ty: it, line: s.line, col: s.col };
+    }
+    if (T.is_array(it)) {
+        hty = "*" + T.elem_of(it);
+        let first = { t: "index", e: src, i: zero, line: s.line, col: s.col, ty: T.elem_of(it), arr: true, esize: T.size_of(T.elem_of(it), ctx.structs) };
+        base = { t: "un", op: "&", e: first, line: s.line, col: s.col, ty: hty };
+    } else if (ctx.structs.has(it)) {
+        hty = "*" + it;
+        base = { t: "un", op: "&", e: src, line: s.line, col: s.col, ty: hty };
+    } else if (T.is_ptr(it) && T.pointee(it) != "void") {
+        hty = it;
+        base = s.init;
+    } else { err(s.init, "cannot destructure a value of type " + show(it)); }
+    if (s.rest != "") { err(s, "'...rest' collects into a runtime array; list the elements you need instead"); }
+    if (s.obj && !(ctx.structs.has(T.is_ptr(hty) ? T.pointee(hty) : hty))) { err(s, "{ a, b } destructuring needs a struct"); }
+    let hsym = new_local(hn, hty, false);
+    declare(s, hn, hsym);
+    let decls = pre;
+    decls.push({ t: "decl", line: s.line, col: s.col, name: hn, ty: "", init: base, mutable: false, kind: "let", sym: hsym, static: false });
+    var i = 0;
+    for (nm in s.names) {
+        if (nm.name == "_") { i = i + 1; continue; }
+        var init = null;
+        let idn = { t: "id", name: hn, line: nm.line, col: nm.col };
+        if (s.obj) { init = { t: "member", e: idn, name: nm.name, arrow: true, line: nm.line, col: nm.col }; }
+        else { init = { t: "index", e: idn, i: { t: "int", v: i, line: nm.line, col: nm.col }, line: nm.line, col: nm.col }; }
+        let d = { t: "decl", line: nm.line, col: nm.col, name: nm.bind, ty: "", init: init, mutable: s.kind == "var", kind: s.kind, static: false };
+        check_decl(d);
+        decls.push(d);
+        i = i + 1;
+    }
+    s["t"] = "multi";
+    s["body"] = decls;
+}
+
+fn check_assign(s) {
+    let tt = check_expr(s.target);
+    if (!is_lvalue(s.target)) { err(s, "the left side of '" + s.op + "' is not assignable"); }
+    if (s.target.t == "id") {
+        let sy = s.target.sym;
+        if (!sy.mutable) { err(s, "cannot assign to '" + (sy["shown"] != null ? sy["shown"] : sy.name) + "': it was declared with " + (sy.kind == "global" ? "const/let" : "let") + " (use var for a mutable binding)"); }
+    }
+    if (s.op == "=") {
+        if (is_agg(tt)) { check_init(s.value, tt, "assign"); s["agg"] = true; return; }
+        let vt = check_expr(s.value);
+        need_assignable(s.value, vt, tt, "assign");
+        return;
+    }
+    if (is_agg(tt)) { err(s, "cannot apply '" + s.op + "' to a whole " + (T.is_array(tt) ? "array" : "struct")); }
+    let vt = check_expr(s.value);
+    // compound: target op= value
+    let op = s.op[0..len(s.op) - 1];
+    let v = rv(vt);
+    if (T.is_ptr(tt)) {
+        if ((op == "+" || op == "-") && T.is_int(v)) {
+            s["scale"] = (T.pointee(tt) == "void") ? 1 : T.size_of(T.pointee(tt), ctx.structs);
+            s["cls"] = "ptr";
+            return;
+        }
+        err(s, "'" + s.op + "' on a pointer needs an integer operand");
+    }
+    if (floaty(tt)) {
+        if (!(T.is_int(v) || floaty(v))) { err(s, "cannot apply '" + s.op + "' to a float with " + show(v)); }
+        if (op != "+" && op != "-" && op != "*" && op != "/") { err(s, "'" + s.op + "' is not defined for floats"); }
+        s["cls"] = "float";
+        return;
+    }
+    if (T.is_int(tt)) {
+        if (!T.is_int(v)) { err(s, "cannot apply '" + s.op + "' to " + tt + " with " + show(v) + " (use 'as " + tt + "')"); }
+        if (T.is_bool(tt) && op != "&" && op != "|" && op != "^") { err(s, "arithmetic on bool"); }
+        s["cls"] = (tt == "u64") ? "uint" : "int";
+        if (op == ">>") { s["cls"] = (tt == "u64") ? "ushr" : "int"; }
+        return;
+    }
+    err(s, "'" + s.op + "' cannot be applied to " + tt);
+}
+
+fn check_assignx(n) -> string {
+    check_assign(n);
+    if (n["agg"] == true) { err(n, "an assignment of a whole array or struct cannot be used as a value; write it as a statement"); }
+    return n.target["ty"];
+}
+
+// ---------------------------------------------------------------- global initialisers
+fn const_scalar(n, ty: string) {
+    let it = check_expr(n);
+    need_assignable(n, it, ty, "initialise a '" + ty + "' with");
+    if (n.t == "str" && T.is_ptr(ty)) { return { kind: "str", v: n.v }; }
+    if (n.t == "null") { return { kind: "int", v: 0 }; }
+    if (n.t == "fnref") { return { kind: "fn", v: n.sig.name }; }
+    if (n["cv"] == null) { err(n, "an initialiser of a global must be a constant expression"); }
+    if (floaty(ty)) { return { kind: "float", v: float(n["cv"]) }; }
+    return { kind: "int", v: n["cv"] };
+}
+
+/// flatten a constant aggregate initialiser into [{ off, ty, kind, v }]
+fn const_flat(n, ty: string, base: int, out) {
+    if (T.is_array(ty)) {
+        let el = T.elem_of(ty);
+        let esz = T.size_of(el, ctx.structs);
+        if (n.t == "arrlit") {
+            if (len(n.elems) > T.array_len(ty)) { err(n, "too many initialisers for " + ty); }
+            var i = 0;
+            for (x in n.elems) { const_flat(x, el, base + i * esz, out); i = i + 1; }
+            return;
+        }
+        if (n.t == "arrfill") {
+            check_expr(n.count);
+            if (n.count["cv"] == null) { err(n.count, "the length of [value; count] must be constant"); }
+            if (n.count["cv"] > T.array_len(ty)) { err(n, "[value; count] is longer than " + ty); }
+            var i = 0;
+            while (i < n.count["cv"]) { const_flat(n.v, el, base + i * esz, out); i = i + 1; }
+            return;
+        }
+        err(n, "the initialiser of an array global must be an array literal");
+    }
+    if (ctx.structs.has(ty)) {
+        if (n.t != "structlit") { err(n, "the initialiser of a struct global must be a struct literal"); }
+        check_structlit(n, ty);
+        if (n.name != ty) { err(n, "expected a " + ty + " literal"); }
+        for (f in n.sfields) { const_flat(f.e, f.ty, base + f.off, out); }
+        return;
+    }
+    let c = const_scalar(n, ty);
+    out.push({ off: base, ty: ty, kind: c.kind, v: c.v });
+}
+
+fn const_init(g, n) {
+    if (is_agg(g.ty)) {
+        let items = [];
+        const_flat(n, g.ty, 0, items);
+        g["init_kind"] = "agg"; g["init_items"] = items;
+        return;
+    }
+    let c = const_scalar(n, g.ty);
+    if (c.kind == "str") { g["init_kind"] = "str"; g["init_bytes"] = c.v; return; }
+    if (c.kind == "fn") { g["init_kind"] = "fn"; g["init_fn"] = c.v; return; }
+    if (c.kind == "float") { g["init_kind"] = "float"; g["init_val"] = c.v; g["cval"] = c.v; return; }
+    g["init_kind"] = "int"; g["init_val"] = c.v; g["cval"] = c.v;
+    if (T.is_int(g.ty) && T.size_of(g.ty, ctx.structs) < 8) {
+        let bits = T.size_of(g.ty, ctx.structs) * 8;
+        var v = c.v & ((1 << bits) - 1);
+        if (T.INTS[g.ty][1] && (v & (1 << (bits - 1))) != 0) { v = v - (1 << bits); }
+        g["cval"] = v;
+    }
+}
+
+// ---------------------------------------------------------------- program
+fn layout_struct(s) {
+    var off = 0;
+    var maxa = 1;
+    var maxsz = 0;
+    let fields = [];
+    let seen = {};
+    for (f in s.fields) {
+        if (seen.has(f.name)) { util.fail("duplicate field '" + f.name + "' in " + (s.union ? "union " : "struct ") + s.name, f.line, f.col); }
+        seen[f.name] = true;
+        let fty = resolve_type(f, f.ty);
+        if (fty == "void") { util.fail("field '" + f.name + "' cannot be void", f.line, f.col); }
+        let fsz = T.size_of(fty, ctx.structs);
+        if (fsz < 0) { util.fail("field '" + f.name + "' has type " + fty + " whose size is not known yet (declare it earlier, or use a pointer)", f.line, f.col); }
+        let fa = s.packed ? 1 : T.align_of(fty, ctx.structs);
+        if (s.union) {
+            fields.push({ name: f.name, ty: fty, off: 0 });
+            if (fsz > maxsz) { maxsz = fsz; }
+        } else {
+            off = util.align_up(off, fa);
+            fields.push({ name: f.name, ty: fty, off: off });
+            off = off + fsz;
+        }
+        if (fa > maxa) { maxa = fa; }
+    }
+    let size = util.align_up(s.union ? maxsz : off, maxa);
+    ctx.structs[s.name] = { name: s.name, size: size, align: maxa, fields: fields, union: s.union, packed: s.packed };
+}
+
+fn register_fn(it) {
+    let isext = it.t == "extern";
+    let ns = it["ns"] == null ? "" : it["ns"];
+    it["ns"] = ns;
+    let qn = qual(ns, it.name);
+    if ((ctx.funcs.has(qn) && !(ctx.funcs[qn].implicit == true)) || ctx.generics.has(qn)) { err(it, "function '" + it.name + "' is declared twice"); }
+    if (!isext && it["tparams"] != null && len(it.tparams) > 0) {
+        ctx.generics[qn] = it;
+        return null;
+    }
+    let params = [];
+    let defs = [];
+    if (!isext) {
+        var idx = 0;
+        for (p in it.params) {
+            var pty = p.ty;
+            if (pty == "" && p.name == "self" && idx == 0 && it["owner"] != null) {
+                pty = ctx.structs.has(it.owner) ? "*" + it.owner : it.owner;
+            }
+            if (pty == "") { err(p, "parameter '" + p.name + "' needs a type annotation for native code"); }
+            params.push(resolve_type(p, pty));
+            defs.push(p.def);
+            idx = idx + 1;
+        }
+    } else {
+        for (p in it.params) { params.push(resolve_type(it, p)); defs.push(null); }
+    }
+    let ps = [];
+    for (p in params) { ps.push(rv(p)); }
+    let ret = resolve_type(it, it.ret);
+    for (p in params) { if (p == "f32") { err(it, "'f32' parameters are not supported; use float (f64)"); } }
+    if (ret == "f32") { err(it, "'f32' return values are not supported; use float (f64)"); }
+    if (T.is_array(ret)) { err(it, "functions cannot return arrays by value; return a pointer"); }
+    let sig = { name: qn, display: it.name, params: ps, ret: ret, is_ext: isext, variadic: isext && it.variadic,
+                lib: isext ? it.lib : "", is_static: it.t == "fn" && it.is_static, node: it, kind: "func", defs: defs,
+                ns: ns, has_self: false, checked: isext };
+    if (!isext && it["owner"] != null) {
+        sig["has_self"] = len(it.params) > 0 && it.params[0].name == "self";
+        let key = ctx.structs.has(it.owner) ? it.owner : method_key(T.canon(it.owner));
+        if (!ctx.methods.has(key)) { ctx.methods[key] = {}; }
+        if (ctx.methods[key].has(it.method)) { err(it, "'" + it.owner + "' already has a function named '" + it.method + "'"); }
+        ctx.methods[key][it.method] = sig;
+    }
+    ctx.funcs[qn] = sig;
+    if (!isext) { ctx.fn_list.push(sig); }
+    else if (it.lib != "" && !ctx.libs.contains(it.lib)) { ctx.libs.push(it.lib); }
+    return sig;
+}
+
+fn check_function_body(sig) {
+    let f = sig.node;
+    sig["checked"] = true;
+    cur_fn = sig;
+    cur_ns = sig.ns;
+    loop_depth = 0; break_depth = 0; lstack = [];
+    fn_labels = {}; fn_gotos = [];
+    push_scope();
+    let psyms = [];
+    var i = 0;
+    for (p in f.params) {
+        let sym = new_local(p.name, sig.params[i], true);
+        declare(p, p.name, sym);
+        psyms.push(sym);
+        i = i + 1;
+    }
+    f["psyms"] = psyms;
+    for (s in f.body.body) { check_stmt(s); }
+    pop_scope();
+    for (g in fn_gotos) {
+        if (!fn_labels.has(g.name)) { err(g, "goto: no label '" + g.name + "' in this function"); }
+    }
+}
+
+fn check_program(items) {
+    ctx = { structs: {}, funcs: {}, globals: {}, enums: {}, fn_list: [], global_list: [], libs: [], methods: {}, nsmap: {},
+            generics: {}, insts: {}, uses_eh: false };
+    scopes = [{}];
+    next_sym = 0;
+    next_tmp = 0;
+    cur_ns = "";
+    lambda_outer = null;
+    // pass 0: namespaces, comptime blocks at the top level
+    let flat = [];
+    for (it in items) {
+        if (it.t == "nsalias") { ctx.nsmap[it.alias] = it.ns; }
+        else if (it.t == "comptime") {
+            for (d in it.body) {
+                if (d.t != "decl") { if (d.t == "block" && len(d.body) == 0) { continue; } err(d, "a top-level comptime block can only declare constants"); }
+                flat.push({ t: "global", line: d.line, col: d.col, name: d.name, ty: d.ty, init: d.init, mutable: false, is_static: false, ns: it["ns"] });
+            }
+        } else { flat.push(it); }
+    }
+    // pass 1: struct names, then layouts in order
+    for (it in flat) {
+        if (it.t == "struct") {
+            if (ctx.structs.has(it.name)) { err(it, "'" + it.name + "' is defined twice"); }
+            ctx.structs[it.name] = { name: it.name, size: -1, align: 1, fields: [], union: it.union, packed: it.packed };
+        }
+    }
+    for (it in flat) { if (it.t == "struct") { layout_struct(it); } }
+    // pass 2: enums, signatures, globals
+    for (it in flat) {
+        if (it.t == "enum") {
+            if (ctx.enums.has(it.name) || ctx.structs.has(it.name)) { err(it, "'" + it.name + "' is already declared"); }
+            let members = [];
+            ctx.enums[it.name] = members;
+            var next = 0;
+            for (m in it.members) {
+                var v = next;
+                if (m.e != null) {
+                    check_expr(m.e);
+                    if (m.e["cv"] == null || floaty(m.e["ty"])) { err(m.e, "enum values must be constant integers"); }
+                    v = m.e["cv"];
+                }
+                members.push({ name: m.name, v: v });
+                next = v + 1;
+            }
+        }
+    }
+    for (it in flat) {
+        if (it.t == "fn" || it.t == "extern") { register_fn(it); }
+    }
+    for (it in flat) {
+        if (it.t == "global") {
+            cur_ns = it["ns"] == null ? "" : it["ns"];
+            let qn = qual(cur_ns, it.name);
+            if (ctx.globals.has(qn) || ctx.funcs.has(qn)) { err(it, "'" + it.name + "' is already declared"); }
+            var ty = it.ty == "" ? "" : resolve_type(it, it.ty);
+            if (ty == "") {
+                if (it.init == null) { err(it, "global '" + it.name + "' needs a type"); }
+                let it2 = check_expr(it.init);
+                if (it2 == "null" || it2 == "void") { err(it, "global '" + it.name + "' needs an explicit type"); }
+                ty = is_agg(it2) && !T.is_array(it2) ? it2 : rv(it2);
+                if (T.is_array(it2) && (it.init.t == "arrlit" || it.init.t == "arrfill")) { ty = it2; }
+            }
+            if (T.size_of(ty, ctx.structs) < 0) { err(it, "type '" + ty + "' has unknown size"); }
+            let g = { kind: "global", name: qn, ty: ty, mutable: it.mutable, is_static: it.is_static, agg: is_agg(ty),
+                      init_kind: "zero", cval: null, line: it.line, shown: it.name };
+            if (it.init != null) { const_init(g, it.init); }
+            ctx.globals[qn] = g;
+            ctx.global_list.push(g);
+        }
+    }
+    cur_ns = "";
+    // pass 3: function bodies (instantiated generics and closures append to fn_list while we go)
+    var i = 0;
+    while (i < len(ctx.fn_list)) {
+        let sig = ctx.fn_list[i];
+        if (!sig.checked) { check_function_body(sig); }
+        i = i + 1;
+    }
+    return ctx;
+}

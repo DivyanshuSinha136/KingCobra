@@ -1,0 +1,113 @@
+// types.kc -- the type model of the native subset (types are plain strings).
+// Author: Divyanshu Sinha (MIT License)
+//
+//   "int" i64   "i8".."i32" "u8".."u64"   "bool"   "float" f64   "f32" (storage only)
+//   "*T" pointer   "T[N]" array of N T   "Name" struct   "void"   "null" (type of the null literal)
+import "util.kc" as util;
+
+const INTS = {
+    "int": [8, true], "i64": [8, true], "isize": [8, true], "u64": [8, false], "usize": [8, false],
+    "i32": [4, true], "u32": [4, false], "i16": [2, true], "u16": [2, false],
+    "i8": [1, true], "u8": [1, false], "bool": [1, false]
+};
+
+/// Function types are spelled "fn(int,*u8)->float". Split into [params[], ret] (nesting-aware).
+fn is_fn(ty: string) -> bool { return len(ty) >= 3 && ty[0..3] == "fn("; }
+
+fn fn_parts(ty: string) {
+    // ty starts with "fn(" -- find the matching ")" then "->" ret
+    var depth = 0;
+    var i = 2;
+    var start = 3;
+    let ps = [];
+    while (i < len(ty)) {
+        let c = ty[i];
+        if (c == "(") { depth = depth + 1; }
+        else if (c == ")") {
+            depth = depth - 1;
+            if (depth == 0) {
+                if (i > start) { ps.push(ty[start..i]); }
+                return [ps, ty[i + 3..len(ty)]];
+            }
+        }
+        else if (c == "," && depth == 1) { ps.push(ty[start..i]); start = i + 1; }
+        i = i + 1;
+    }
+    return [ps, "void"];
+}
+
+/// Canonical spelling of a type name (aliases collapsed).
+fn canon(ty: string) -> string {
+    var stars = "";
+    var i = 0;
+    while (i < len(ty) && ty[i] == "*") { stars = stars + "*"; i = i + 1; }
+    if (is_fn(ty[i..len(ty)])) {
+        let p = fn_parts(ty[i..len(ty)]);
+        let cp = [];
+        for (x in p[0]) { cp.push(canon(x)); }
+        return stars + "fn(" + cp.join(",") + ")->" + canon(p[1]);
+    }
+    var j = i;
+    while (j < len(ty) && ty[j] != "[") { j = j + 1; }
+    var base = ty[i..j];
+    let dims = ty[j..len(ty)];
+    if (base == "i64" || base == "isize") { base = "int"; }
+    else if (base == "usize") { base = "u64"; }
+    else if (base == "f64") { base = "float"; }
+    else if (base == "string" || base == "cstr") { base = "u8"; stars = stars + "*"; }
+    return stars + base + dims;
+}
+
+fn is_ptr(ty: string) -> bool { return len(ty) > 0 && ty[0] == "*"; }
+fn is_array(ty: string) -> bool { return len(ty) > 0 && ty[len(ty) - 1] == "]"; }
+fn pointee(ty: string) -> string { return ty[1..len(ty)]; }
+fn is_float(ty: string) -> bool { return ty == "float"; }
+fn is_int(ty: string) -> bool { return INTS.has(ty); }
+fn is_bool(ty: string) -> bool { return ty == "bool"; }
+fn is_scalar(ty: string) -> bool { return is_int(ty) || ty == "float" || ty == "f32" || is_ptr(ty) || ty == "null" || is_fn(ty); }
+fn is_unsigned64(ty: string) -> bool { return ty == "u64"; }
+fn is_unsigned(ty: string) -> bool { return INTS.has(ty) && !INTS[ty][1]; }
+
+/// Split "T[N][M]" into [elem, N] where elem = "T[M]".
+fn array_parts(ty: string) {
+    var i = 0;
+    while (i < len(ty) && ty[i] != "[") { i = i + 1; }
+    var j = i;
+    while (ty[j] != "]") { j = j + 1; }
+    let n = int(ty[i + 1..j]);
+    return [ty[0..i] + ty[j + 1..len(ty)], n];
+}
+fn elem_of(ty: string) -> string { return array_parts(ty)[0]; }
+fn array_len(ty: string) -> int { return array_parts(ty)[1]; }
+
+/// Size and alignment; `structs` maps name -> { size, align, fields }.
+fn size_of(ty: string, structs) -> int {
+    if (is_ptr(ty) || is_fn(ty)) { return 8; }
+    if (is_array(ty)) { let p = array_parts(ty); return p[1] * size_of(p[0], structs); }
+    if (INTS.has(ty)) { return INTS[ty][0]; }
+    if (ty == "float") { return 8; }
+    if (ty == "f32") { return 4; }
+    if (structs.has(ty)) { return structs[ty].size; }
+    return -1;
+}
+
+fn align_of(ty: string, structs) -> int {
+    if (is_ptr(ty) || is_fn(ty)) { return 8; }
+    if (is_array(ty)) { return align_of(array_parts(ty)[0], structs); }
+    if (INTS.has(ty)) { return INTS[ty][0]; }
+    if (ty == "float") { return 8; }
+    if (ty == "f32") { return 4; }
+    if (structs.has(ty)) { return structs[ty].align; }
+    return 1;
+}
+
+fn known_type(ty: string, structs) -> bool {
+    if (is_fn(ty)) {
+        let p = fn_parts(ty);
+        for (x in p[0]) { if (!(x == "void" || known_type(x, structs))) { return false; } }
+        return p[1] == "void" || known_type(p[1], structs);
+    }
+    if (is_ptr(ty)) { return pointee(ty) == "void" || known_type(pointee(ty), structs); }
+    if (is_array(ty)) { return known_type(array_parts(ty)[0], structs); }
+    return INTS.has(ty) || ty == "float" || ty == "f32" || structs.has(ty);
+}

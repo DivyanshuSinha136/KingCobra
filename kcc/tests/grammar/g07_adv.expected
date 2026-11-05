@@ -1,0 +1,16 @@
+3 5 5
+49 90
+26 7.5 3
+9 7 2.5
+2 50 11.5 11.5
+1.5 2.25 -1
+1105
+inner defer 1
+outer defer 1
+2
+inner defer 2
+outer defer 2
+caught 42
+2 1 -4 15
+12
+4

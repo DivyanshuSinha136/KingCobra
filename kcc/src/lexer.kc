@@ -1,0 +1,219 @@
+// lexer.kc -- KingCobra source text -> token array.
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import "util.kc" as util;
+
+// Hard keywords. `type enum impl const try catch throw defer packed static do union export switch case default goto
+// typedef auto extrn` are *contextual* (still usable as names), so the lexer yields them as ordinary identifiers and
+// the parser recognises them by shape, exactly as the interpreter's parser does.
+const KEYWORDS = {
+    "fn": true, "let": true, "var": true, "if": true, "else": true, "while": true,
+    "for": true, "in": true, "return": true, "break": true, "continue": true, "struct": true,
+    "extern": true, "from": true, "true": true, "false": true, "null": true,
+    "as": true, "sizeof": true, "alignof": true, "offsetof": true, "unsafe": true, "import": true,
+    "comptime": true, "match": true
+};
+
+const OPS3 = ["<<=", ">>=", ">>>", "..."];
+const OPS2 = ["??", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+              "++", "--", "->", "=>", ".."];
+
+fn is_alpha(c: int) -> bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95; }
+fn is_digit(c: int) -> bool { return c >= 48 && c <= 57; }
+fn is_hex(c: int) -> bool { return is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+fn hex_val(c: int) -> int {
+    if (c >= 97) { return c - 87; }
+    if (c >= 65) { return c - 55; }
+    return c - 48;
+}
+
+fn utf8_push(bytes, cp: int) {
+    if (cp < 0x80) { bytes.push(cp); }
+    else if (cp < 0x800) { bytes.push(0xC0 | (cp >> 6)); bytes.push(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { bytes.push(0xE0 | (cp >> 12)); bytes.push(0x80 | ((cp >> 6) & 0x3F)); bytes.push(0x80 | (cp & 0x3F)); }
+    else { bytes.push(0xF0 | (cp >> 18)); bytes.push(0x80 | ((cp >> 12) & 0x3F)); bytes.push(0x80 | ((cp >> 6) & 0x3F)); bytes.push(0x80 | (cp & 0x3F)); }
+}
+
+/// Tokenize `src`. Each token is { k, v, line, col }:
+///   k = "id" | "kw" | "int" | "float" | "str" | "op" | "eof"
+///   v = text (id/kw/op), int value, float value, or an array of bytes (str)
+fn lex(src: string) {
+    let b = fbin.to_bytes(fbin.from_string(src));
+    let n = len(b);
+    let toks = [];
+    var i = 0;
+    var line = 1;
+    var ls = 0;           // offset of the start of the current line
+    while (i < n) {
+        let c = b[i];
+        let col = i - ls + 1;
+        if (c == 10) { line = line + 1; i = i + 1; ls = i; continue; }
+        if (c == 32 || c == 9 || c == 13) { i = i + 1; continue; }
+        // comments
+        if (c == 47 && i + 1 < n && b[i + 1] == 47) {
+            while (i < n && b[i] != 10) { i = i + 1; }
+            continue;
+        }
+        if (c == 47 && i + 1 < n && b[i + 1] == 42) {
+            i = i + 2;
+            var closed = false;
+            while (i < n) {
+                if (b[i] == 42 && i + 1 < n && b[i + 1] == 47) { i = i + 2; closed = true; break; }
+                if (b[i] == 10) { line = line + 1; ls = i + 1; }
+                i = i + 1;
+            }
+            if (!closed) { util.fail("unterminated block comment", line, col); }
+            continue;
+        }
+        // identifiers / keywords
+        if (is_alpha(c)) {
+            let st = i;
+            while (i < n && (is_alpha(b[i]) || is_digit(b[i]))) { i = i + 1; }
+            let w = src[st..i];
+            if (w == "f" && i < n && b[i] == 34) {
+                util.fail("f-strings build strings at run time; the native compiler has no string runtime (use printf with a format string)", line, col);
+            }
+            if (KEYWORDS.has(w)) { toks.push({ k: "kw", v: w, line: line, col: col }); }
+            else { toks.push({ k: "id", v: w, line: line, col: col }); }
+            continue;
+        }
+        // numbers
+        if (is_digit(c)) {
+            var base = 10;
+            var st = i;
+            if (c == 48 && i + 1 < n && (b[i + 1] == 120 || b[i + 1] == 88)) { base = 16; i = i + 2; }
+            else if (c == 48 && i + 1 < n && (b[i + 1] == 98 || b[i + 1] == 66)) { base = 2; i = i + 2; }
+            else if (c == 48 && i + 1 < n && (b[i + 1] == 111 || b[i + 1] == 79)) { base = 8; i = i + 2; }
+            if (base != 10) {
+                var v = 0;
+                var nd = 0;
+                while (i < n && (is_hex(b[i]) || b[i] == 95)) {
+                    if (b[i] != 95) {
+                        let d = hex_val(b[i]);
+                        if (d >= base) { util.fail("digit out of range for base " + str(base), line, i - ls + 1); }
+                        v = v * base + d;
+                        nd = nd + 1;
+                    }
+                    i = i + 1;
+                }
+                if (nd == 0) { util.fail("missing digits after base prefix", line, col); }
+                toks.push({ k: "int", v: v, line: line, col: col });
+                continue;
+            }
+            while (i < n && (is_digit(b[i]) || b[i] == 95)) { i = i + 1; }
+            var is_float = false;
+            if (i + 1 < n && b[i] == 46 && is_digit(b[i + 1])) {
+                is_float = true;
+                i = i + 1;
+                while (i < n && (is_digit(b[i]) || b[i] == 95)) { i = i + 1; }
+            }
+            if (i < n && (b[i] == 101 || b[i] == 69)) {
+                var j = i + 1;
+                if (j < n && (b[j] == 43 || b[j] == 45)) { j = j + 1; }
+                if (j < n && is_digit(b[j])) {
+                    is_float = true;
+                    i = j;
+                    while (i < n && is_digit(b[i])) { i = i + 1; }
+                }
+            }
+            let text = src[st..i].replace("_", "");
+            if (is_float) { toks.push({ k: "float", v: float(text), line: line, col: col }); }
+            else { toks.push({ k: "int", v: int(text), line: line, col: col }); }
+            continue;
+        }
+        // string literal -> byte array
+        if (c == 34) {
+            i = i + 1;
+            let bytes = [];
+            var done = false;
+            while (i < n) {
+                let d = b[i];
+                if (d == 34) { i = i + 1; done = true; break; }
+                if (d == 10) { line = line + 1; ls = i + 1; }
+                if (d == 92) {
+                    i = i + 1;
+                    if (i >= n) { break; }
+                    let e = b[i];
+                    if (e == 110) { bytes.push(10); }
+                    else if (e == 116) { bytes.push(9); }
+                    else if (e == 114) { bytes.push(13); }
+                    else if (e == 48) { bytes.push(0); }
+                    else if (e == 92) { bytes.push(92); }
+                    else if (e == 34) { bytes.push(34); }
+                    else if (e == 39) { bytes.push(39); }
+                    else if (e == 120 && i + 2 < n && is_hex(b[i + 1]) && is_hex(b[i + 2])) {
+                        bytes.push(hex_val(b[i + 1]) * 16 + hex_val(b[i + 2]));
+                        i = i + 2;
+                    } else if (e == 117 && i + 1 < n && b[i + 1] == 123) {
+                        var cp = 0;
+                        var k = i + 2;
+                        while (k < n && is_hex(b[k])) { cp = cp * 16 + hex_val(b[k]); k = k + 1; }
+                        if (k >= n || b[k] != 125 || k == i + 2) { util.fail("bad \\u{...} escape", line, i - ls + 1); }
+                        utf8_push(bytes, cp);
+                        i = k;
+                    } else { util.fail("unknown escape sequence in string", line, i - ls + 1); }
+                    i = i + 1;
+                    continue;
+                }
+                bytes.push(d);
+                i = i + 1;
+            }
+            if (!done) { util.fail("unterminated string literal", line, col); }
+            toks.push({ k: "str", v: bytes, line: line, col: col });
+            continue;
+        }
+        // character literal -> int
+        if (c == 39) {
+            i = i + 1;
+            var v = 0;
+            if (i < n && b[i] == 92) {
+                i = i + 1;
+                let e = b[i];
+                if (e == 110) { v = 10; } else if (e == 116) { v = 9; } else if (e == 114) { v = 13; }
+                else if (e == 48) { v = 0; } else if (e == 92) { v = 92; } else if (e == 39) { v = 39; }
+                else if (e == 34) { v = 34; }
+                else if (e == 117 && i + 1 < n && b[i + 1] == 123) {
+                    var k = i + 2;
+                    while (k < n && is_hex(b[k])) { v = v * 16 + hex_val(b[k]); k = k + 1; }
+                    if (k >= n || b[k] != 125 || k == i + 2) { util.fail("bad \\u{...} escape", line, col); }
+                    i = k;
+                }
+                else if (e == 120 && is_hex(b[i + 1]) && is_hex(b[i + 2])) {
+                    v = hex_val(b[i + 1]) * 16 + hex_val(b[i + 2]);
+                    i = i + 2;
+                } else { util.fail("unknown escape sequence in character literal", line, col); }
+                i = i + 1;
+            } else if (i < n) {
+                // decode one UTF-8 code point
+                let c0 = b[i];
+                if (c0 < 0x80) { v = c0; i = i + 1; }
+                else if (c0 < 0xE0) { v = ((c0 & 0x1F) << 6) | (b[i + 1] & 0x3F); i = i + 2; }
+                else if (c0 < 0xF0) { v = ((c0 & 0x0F) << 12) | ((b[i + 1] & 0x3F) << 6) | (b[i + 2] & 0x3F); i = i + 3; }
+                else { v = ((c0 & 0x07) << 18) | ((b[i + 1] & 0x3F) << 12) | ((b[i + 2] & 0x3F) << 6) | (b[i + 3] & 0x3F); i = i + 4; }
+            }
+            if (i >= n || b[i] != 39) { util.fail("unterminated character literal", line, col); }
+            i = i + 1;
+            toks.push({ k: "int", v: v, line: line, col: col });
+            continue;
+        }
+        // operators: longest match
+        var matched = "";
+        if (i + 2 < n) {
+            let t3 = src[i..i + 3];
+            if (OPS3.contains(t3)) { matched = t3; }
+        }
+        if (matched == "" && i + 1 < n) {
+            let t2 = src[i..i + 2];
+            if (OPS2.contains(t2)) { matched = t2; }
+        }
+        if (matched == "") {
+            let ch = src[i..i + 1];
+            if ("+-*/%&|^~!<>=(){}[],;:.?@#".contains(ch)) { matched = ch; }
+        }
+        if (matched == "") { util.fail("unexpected character '" + src[i..i + 1] + "'", line, col); }
+        toks.push({ k: "op", v: matched, line: line, col: col });
+        i = i + len(matched);
+    }
+    toks.push({ k: "eof", v: "<eof>", line: line, col: i - ls + 1 });
+    return toks;
+}

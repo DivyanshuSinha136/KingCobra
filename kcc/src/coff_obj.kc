@@ -1,0 +1,114 @@
+// coff_obj.kc -- COFF (AMD64) relocatable object writer (.obj / .o for Windows).
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import "util.kc" as util;
+
+const IMAGE_REL_AMD64_ADDR64 = 1;
+const IMAGE_REL_AMD64_REL32 = 4;
+
+/// Append one 18-byte COFF symbol record (names over 8 bytes go to the string table).
+fn add_sym(syms, strtab, name: string, value: int, sec: int, ty: int, cls: int) {
+    if (len(name) <= 8) {
+        fbin.write_string(syms, name);
+        if (len(name) < 8) { fbin.fill(syms, 0, 8 - len(name)); }
+    } else {
+        fbin.write_u32(syms, 0);
+        fbin.seek(strtab, 0, "end");
+        fbin.write_u32(syms, fbin.tell(strtab));
+        util.write_cstr(strtab, name);
+    }
+    fbin.write_u32(syms, value);
+    fbin.write_u16(syms, sec & 0xFFFF);
+    fbin.write_u16(syms, ty);
+    fbin.write_u8(syms, cls);
+    fbin.write_u8(syms, 0);
+    return 0;
+}
+
+fn build(mod) {
+    // section order: .text .rdata .data .bss  (1-based numbers in symbols)
+    var secnum = { text: 1, rodata: 2, data: 3, bss: 4 };
+    let raw = [mod.text, mod.rodata, mod.data, null];
+    // data with relocation fields filled in (COFF stores the addend in the field)
+    let text = fbin.from_bytes(fbin.to_bytes(mod.text, 0, fbin.size(mod.text)));
+    let data = fbin.from_bytes(fbin.to_bytes(mod.data, 0, fbin.size(mod.data)));
+    let rodata = fbin.from_bytes(fbin.to_bytes(mod.rodata, 0, fbin.size(mod.rodata)));
+    let rtext = []; let rdata = []; let rro = [];
+
+    util.trace("coff: symbol table");
+    // symbol table
+    let strtab = fbin.buffer();
+    fbin.write_u32(strtab, 0);
+    let syms = fbin.buffer();
+    let symidx = {};
+    var n = 0;
+    for (s in mod.syms) {
+        add_sym(syms, strtab, s.name, s.off, secnum[s.sec], s.kind == "func" ? 0x20 : 0, s.global ? 2 : 3);
+        symidx[s.name] = n; n = n + 1;
+    }
+    for (u in mod.undef) {
+        if (!symidx.has(u)) { add_sym(syms, strtab, u, 0, 0, 0x20, 2); symidx[u] = n; n = n + 1; }
+    }
+    util.trace("coff: relocations");
+    for (r in mod.relocs) {
+        let field = (r.kind == "abs64") ? r.addend : r.addend + 4;
+        let target = (r.sec == "text") ? text : (r.sec == "data" ? data : rodata);
+        let save = fbin.tell(target);
+        fbin.seek(target, r.off);
+        if (r.kind == "abs64") { fbin.write_u64(target, field); } else { fbin.write_i32(target, field); }
+        fbin.seek(target, save);
+        let ent = { off: r.off, sym: symidx[r.sym], type: r.kind == "abs64" ? IMAGE_REL_AMD64_ADDR64 : IMAGE_REL_AMD64_REL32 };
+        if (r.sec == "text") { rtext.push(ent); } else if (r.sec == "data") { rdata.push(ent); } else { rro.push(ent); }
+    }
+    fbin.seek(strtab, 0, "end");
+    util.patch_u32(strtab, 0, fbin.size(strtab));
+
+    util.trace("coff: section headers");
+    let secs = [
+        { name: ".text", data: text, size: fbin.size(text), relocs: rtext, chars: 0x60500020 },
+        { name: ".rdata", data: rodata, size: fbin.size(rodata), relocs: rro, chars: 0x40500040 },
+        { name: ".data", data: data, size: fbin.size(data), relocs: rdata, chars: 0xC0500040 },
+        { name: ".bss", data: null, size: mod.bss, relocs: [], chars: 0xC0500080 }
+    ];
+    var off = 20 + 40 * len(secs);
+    for (s in secs) {
+        s["raw_off"] = 0; s["rel_off"] = 0;
+        if (s.data != null && s.size > 0) { s["raw_off"] = off; off = off + s.size; }
+        if (len(s.relocs) > 0) { s["rel_off"] = off; off = off + 10 * len(s.relocs); }
+    }
+    let symoff = off;
+    let out = fbin.buffer();
+    fbin.write_u16(out, 0x8664);
+    fbin.write_u16(out, len(secs));
+    fbin.write_u32(out, 0);
+    fbin.write_u32(out, symoff);
+    fbin.write_u32(out, n);
+    fbin.write_u16(out, 0);
+    fbin.write_u16(out, 0);
+    for (s in secs) {
+        var nm = s.name;
+        fbin.write_string(out, nm);
+        fbin.fill(out, 0, 8 - len(nm));
+        fbin.write_u32(out, 0);                 // virtual size
+        fbin.write_u32(out, 0);                 // virtual address
+        fbin.write_u32(out, s.data != null ? s.size : s.size);
+        fbin.write_u32(out, s.raw_off);
+        fbin.write_u32(out, s.rel_off);
+        fbin.write_u32(out, 0);
+        fbin.write_u16(out, len(s.relocs));
+        fbin.write_u16(out, 0);
+        fbin.write_u32(out, s.chars);
+    }
+    util.trace("coff: section data");
+    for (s in secs) {
+        if (s.raw_off > 0) { fbin.write_bytes(out, fbin.to_bytes(s.data, 0, s.size)); }
+        for (r in s.relocs) {
+            fbin.write_u32(out, r.off);
+            fbin.write_u32(out, r.sym);
+            fbin.write_u16(out, r.type);
+        }
+    }
+    fbin.write_bytes(out, fbin.to_bytes(syms, 0, fbin.size(syms)));
+    fbin.write_bytes(out, fbin.to_bytes(strtab, 0, fbin.size(strtab)));
+    return out;
+}

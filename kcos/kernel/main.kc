@@ -1,0 +1,48 @@
+// main.kc -- KCOS kernel entry point.  Author: Divyanshu Sinha (MIT License)
+//
+// Build:   kcc kcos/kernel/main.kc -o build/kernel.bin --target kcos
+// Needs:   fn kmain()  (called by the entry stub on a fresh stack)  and  fn kc_interrupt(frame: *u64)  (hw.kc)
+import "kstr.kc";
+import "console.kc";
+import "hw.kc";
+import "mm.kc";
+import "fs.kc";
+import "sched.kc";
+import "disk.kc";
+import "shell.kc";
+
+fn banner() {
+    con_setcolor(10, 0);
+    con_puts("  _  __ _             ____      _              ___  ____\n");
+    con_puts(" | |/ /(_)_ __   __ _ / ___|___ | |__  _ __ __ _/ _ \\/ ___|\n");
+    con_puts(" | ' / | | '_ \\ / _` | |   / _ \\| '_ \\| '__/ _` | | | \\___ \\\n");
+    con_puts(" | . \\ | | | | | (_| | |__| (_) | |_) | | | (_| | |_| |___) |\n");
+    con_puts(" |_|\\_\\|_|_| |_|\\__, |\\____\\___/|_.__/|_|  \\__,_|\\___/|____/\n");
+    con_puts("                |___/                         v0.1  x86-64\n");
+    con_setcolor(7, 0);
+    con_puts("\n");
+}
+
+fn kmain() {
+    ser_init();
+    con_clear();
+    banner();
+    gdt_init();  con_status(true, "GDT + TSS (double-fault IST stack)");
+    idt_init();  con_status(true, "IDT: 256 gates, exception + IRQ stubs from kcc");
+    pic_init();  pit_init(); kb_init();
+    con_status(true, "PIC remapped, PIT at 100 Hz, PS/2 keyboard");
+    pmm_init();  con_status(pm_frames > 0, "physical memory manager (E820 bitmap)");
+    heap_init(); con_status(heap_size > 0, "kernel heap");
+    if (heap_size == 0) { con_puts("not enough memory (KCOS needs at least 6 MiB)\n"); cli(); while (true) { hlt(); } }
+    fs_init();
+    disk_init();
+    if (disk_present) { con_status(true, "ATA disk found"); } else { con_status(false, "no ATA disk (filesystem will not persist)"); }
+    if (fs_load()) { con_status(true, "KCFS restored from disk"); } else { fs_seed(); con_status(true, "KCFS created (use 'sync' to save it to disk)"); }
+    sched_init(); con_status(true, "scheduler: preemptive kernel threads");
+    sti();
+    con_puts("\n");
+    shell_run();
+    con_puts("shell exited\n");
+    cli();
+    while (true) { hlt(); }
+}

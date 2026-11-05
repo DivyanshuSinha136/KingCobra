@@ -1,0 +1,56 @@
+struct Vec2 { x: float, y: float }
+struct Rec { id: int, tag: u8, v: Vec2 }
+impl Vec2 {
+    fn add(self, o: Vec2) -> Vec2 { return Vec2 { x: self.x + o.x, y: self.y + o.y }; }
+    fn scale(self, k: float) -> Vec2 { return Vec2 { x: self.x * k, y: self.y * k }; }
+    fn len2(self) -> float { return self.x * self.x + self.y * self.y; }
+}
+impl int { fn square(self) -> int { return self * self; } }
+impl string { fn first(self) -> int { return char(self, 0); } }
+fn pair_max<A, B>(a: A, b: B, flag: bool) -> A { if (flag) { return a; } return a; }
+fn sum_arr<T>(p: *T, n: int) -> T { var s = *p; for (i in 1..n) { s = s + p[i]; } return s; }
+fn make(id: int) -> Rec { return Rec { id: id, tag: 7, v: Vec2 { x: 1.5, y: 2.5 } }; }
+fn pick(c: int) -> float { return match (c) { 1 => 1.5, 2 => 2.25, _ => -1.0 }; }
+fn cleanup_demo(n: int) -> int {
+    var r = 0;
+    {
+        defer r = r + 1000;
+        defer r = r + 100;
+        r = n;
+    }
+    return r;
+}
+fn inner(n: int) -> int { defer println("inner defer", n); if (n == 2) { throw 42; } return n; }
+fn outer(n: int) -> int { defer println("outer defer", n); return inner(n) + 1; }
+fn main() -> int {
+    let a = Vec2 { x: 1.0, y: 2.0 };
+    let b = a.add(Vec2 { x: 0.5, y: 0.5 }).scale(2.0);
+    println(b.x, b.y, a.len2());
+    println(7.square(), "Z".first());
+    let xs: int[4] = [5, 6, 7, 8];
+    let fs: float[3] = [1.5, 2.5, 3.5];
+    println(sum_arr(&xs[0], 4), sum_arr(&fs[0], 3), pair_max(3, 4.5, true));
+    let r = make(9);
+    println(r.id, r.tag as int, r.v.y);
+    var recs: Rec[2] = [make(1), make(2)];
+    recs[1].v.x += 10.0;
+    var q = recs[1];
+    q.id = 50;
+    println(recs[1].id, q.id, recs[1].v.x, q.v.x);
+    println(pick(1), pick(2), pick(3));
+    println(cleanup_demo(5));
+    println(outer(1));
+    try { println(outer(2)); } catch (e) { println("caught", e); }
+    var u: u64 = 1;
+    u = u << 63;
+    println(u >> 62, u >>> 63, -8 >> 1, -8 >>> 60);
+    var fp: fn(int) -> int = fn(x: int) -> int { return x * 3; };
+    let table: fn(int) -> int[2] = [fp, fp];
+    println(fp(4));
+    let s: string = "text";
+    var cnt = 0;
+    var i = 0;
+    while (char(s, i) != 0) { cnt++; i++; }
+    println(cnt);
+    return 0;
+}

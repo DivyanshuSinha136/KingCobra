@@ -1,0 +1,1043 @@
+// parser.kc -- tokens -> AST for KingCobra (the whole grammar; the checker decides what has a native meaning).
+// Author: Divyanshu Sinha (MIT License)
+//
+// Every node is an open object { t: "<kind>", line, col, ... }.
+//   Expressions: int float bool null str id bin un cast call index member cond sizeof alignof offsetof
+//                incdec comma coalesce in assignx arrlit arrfill structlit match closure
+//   Statements : block multi decl destruct assign expr if while dowhile for forrange forin switch label goto
+//                return break continue defer try throw comptime extrn
+//   Items      : fn extern struct enum global import   (impl blocks become `fn`s named Type__method;
+//                local fn/struct/enum/type/impl declarations are hoisted to the top level)
+import "util.kc" as util;
+import "lexer.kc" as lexer;
+
+var toks = [];
+var pos = 0;
+var aliases = {};        // type / typedef aliases, shared by every file of one compilation
+var hoisted = [];        // declarations found inside function bodies, moved to the top level
+var anon = 0;            // counter for closure names
+
+fn reset() { aliases = {}; hoisted = []; anon = 0; }
+
+fn peek() { return toks[pos]; }
+fn peek_at(k: int) {
+    let j = pos + k;
+    if (j >= len(toks)) { return toks[len(toks) - 1]; }
+    return toks[j];
+}
+fn advance() {
+    let t = toks[pos];
+    if (t.k != "eof") { pos = pos + 1; }
+    return t;
+}
+fn is_op(v: string) -> bool { let t = toks[pos]; return t.k == "op" && t.v == v; }
+fn is_kw(v: string) -> bool { let t = toks[pos]; return t.k == "kw" && t.v == v; }
+fn is_id(v: string) -> bool { let t = toks[pos]; return t.k == "id" && t.v == v; }
+fn op_at(k: int, v: string) -> bool { let t = peek_at(k); return t.k == "op" && t.v == v; }
+fn id_at(k: int) -> bool { return peek_at(k).k == "id"; }
+fn accept_op(v: string) -> bool { if (is_op(v)) { pos = pos + 1; return true; } return false; }
+fn accept_kw(v: string) -> bool { if (is_kw(v)) { pos = pos + 1; return true; } return false; }
+/// a contextual word (an `id` token with this spelling)
+fn is_word(v: string) -> bool { return is_id(v); }
+
+fn describe(t) -> string {
+    if (t.k == "eof") { return "end of file"; }
+    if (t.k == "str") { return "a string literal"; }
+    if (t.k == "int" || t.k == "float") { return "number " + str(t.v); }
+    return "'" + str(t.v) + "'";
+}
+fn err_here(msg: string) { let t = peek(); util.fail(msg, t.line, t.col); }
+fn expect_op(v: string) {
+    if (!is_op(v)) { err_here("expected '" + v + "' but found " + describe(peek())); }
+    return advance();
+}
+fn expect_kw(v: string) {
+    if (!is_kw(v)) { err_here("expected '" + v + "' but found " + describe(peek())); }
+    return advance();
+}
+fn expect_id() -> string {
+    let t = peek();
+    if (t.k != "id") { err_here("expected a name but found " + describe(t)); }
+    advance();
+    return t.v;
+}
+fn empty_block(tok) { return { t: "block", line: tok.line, col: tok.col, body: [] }; }
+fn node(t: string, tok) { return { t: t, line: tok.line, col: tok.col }; }
+fn bytes_to_str(bs) -> string {
+    var out = "";
+    for (c in bs) { out = out + chr(c); }
+    return out;
+}
+
+// ---------------------------------------------------------------- types
+// Types are plain strings: "int" "u8" "*u8" "Point" "u8[16]" "*Point" "fn(int,*u8)->int".
+fn parse_type() -> string {
+    var stars = "";
+    while (accept_op("*")) { stars = stars + "*"; }
+    if (is_kw("fn")) {
+        advance();
+        expect_op("(");
+        let ps = [];
+        if (!is_op(")")) {
+            ps.push(parse_type());
+            while (accept_op(",")) { ps.push(parse_type()); }
+        }
+        expect_op(")");
+        var r = "void";
+        if (accept_op("->")) { r = parse_type(); }
+        return stars + "fn(" + ps.join(",") + ")->" + r;
+    }
+    let t = peek();
+    if (t.k != "id") { err_here("expected a type but found " + describe(t)); }
+    advance();
+    var base = t.v;
+    if (is_op(".") && id_at(1)) { advance(); base = base + "." + expect_id(); }     // alias.Type (checker resolves)
+    if (aliases.has(base)) { base = aliases[base]; }
+    var dims = "";
+    while (is_op("[")) {
+        advance();
+        let nt = peek();
+        if (nt.k != "int") { err_here("array length must be an integer literal"); }
+        advance();
+        expect_op("]");
+        dims = dims + "[" + str(nt.v) + "]";
+    }
+    return stars + base + dims;
+}
+
+// ---------------------------------------------------------------- expressions
+fn parse_expr() { return parse_assignment(); }
+
+const ASSIGN_OPS = ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="];
+
+fn parse_assignment() {
+    let e = parse_ternary();
+    let u = peek();
+    if (u.k == "op" && ASSIGN_OPS.contains(u.v)) {
+        advance();
+        let v = parse_assignment();
+        let n = node("assignx", u);
+        n["op"] = u.v; n["target"] = e; n["value"] = v;
+        return n;
+    }
+    return e;
+}
+
+fn parse_ternary() {
+    let c = parse_binary(0);
+    if (is_op("?")) {
+        let t = advance();
+        let a = parse_ternary();
+        expect_op(":");
+        let b = parse_ternary();
+        let n = node("cond", t);
+        n["c"] = c; n["a"] = a; n["b"] = b;
+        return n;
+    }
+    return c;
+}
+
+// binary precedence levels, low to high (matches docs/GRAMMAR.md)
+const LEVELS = [
+    ["??"], ["||"], ["&&"], ["==", "!="], ["<", "<=", ">", ">=", "in"], ["|"], ["^"], ["&"], ["<<", ">>", ">>>"],
+    ["+", "-"], ["*", "/", "%"]
+];
+const LV_AND = 2;
+
+fn parse_binary(level: int) {
+    if (level >= len(LEVELS)) { return parse_cast(); }
+    var l = parse_binary(level + 1);
+    while (true) {
+        let t = peek();
+        if ((t.k == "op" || (t.k == "kw" && t.v == "in")) && LEVELS[level].contains(t.v)) {
+            advance();
+            let r = parse_binary(level + 1);
+            var n = null;
+            if (t.v == "??") { n = node("coalesce", t); }
+            else if (t.v == "in") { n = node("in", t); }
+            else { n = node("bin", t); n["op"] = t.v; }
+            n["l"] = l; n["r"] = r;
+            l = n;
+        } else { break; }
+    }
+    return l;
+}
+
+fn parse_cast() {
+    var e = parse_unary();
+    while (is_kw("as")) {
+        let t = advance();
+        let ty = parse_type();
+        let n = node("cast", t);
+        n["e"] = e; n["to"] = ty;
+        e = n;
+    }
+    return e;
+}
+
+fn parse_unary() {
+    let t = peek();
+    if (t.k == "op" && (t.v == "++" || t.v == "--")) {
+        advance();
+        let e = parse_unary();
+        let n = node("incdec", t);
+        n["op"] = t.v; n["prefix"] = true; n["e"] = e;
+        return n;
+    }
+    if (t.k == "op" && (t.v == "-" || t.v == "!" || t.v == "~" || t.v == "&" || t.v == "*")) {
+        advance();
+        let e = parse_unary();
+        if (t.v == "-" && e.t == "int") { e["v"] = -e.v; return e; }     // fold negative literals
+        if (t.v == "-" && e.t == "float") { e["v"] = -e.v; return e; }
+        let n = node("un", t);
+        n["op"] = t.v; n["e"] = e;
+        return n;
+    }
+    return parse_postfix();
+}
+
+fn parse_postfix() {
+    var e = parse_primary();
+    while (true) {
+        let t = peek();
+        if (t.k != "op") { break; }
+        if (t.v == "(") {
+            advance();
+            let args = [];
+            if (!is_op(")")) {
+                args.push(parse_expr());
+                while (accept_op(",")) { args.push(parse_expr()); }
+            }
+            expect_op(")");
+            let n = { t: "call", line: e.line, col: e.col };
+            n["f"] = e; n["args"] = args;
+            e = n;
+        } else if (t.v == "[") {
+            advance();
+            if (is_op("..")) { util.fail("slices build a new array/string at run time; the native compiler indexes with a[i] or pointer arithmetic", t.line, t.col); }
+            let i = parse_expr();
+            if (is_op("..")) { util.fail("slices build a new array/string at run time; the native compiler indexes with a[i] or pointer arithmetic", t.line, t.col); }
+            expect_op("]");
+            let n = node("index", t);
+            n["e"] = e; n["i"] = i;
+            e = n;
+        } else if (t.v == ".") {
+            advance();
+            let name = expect_id();
+            let n = node("member", t);
+            n["e"] = e; n["name"] = name; n["arrow"] = false;
+            e = n;
+        } else if (t.v == "->") {
+            advance();
+            let name = expect_id();
+            let n = node("member", t);
+            n["e"] = e; n["name"] = name; n["arrow"] = true;
+            e = n;
+        } else if (t.v == "++" || t.v == "--") {
+            advance();
+            let n = node("incdec", t);
+            n["op"] = t.v; n["prefix"] = false; n["e"] = e;
+            e = n;
+        } else { break; }
+    }
+    return e;
+}
+
+fn parse_closure() {
+    let t = expect_kw("fn");
+    let params = parse_params();
+    var ret = "void";
+    if (accept_op("->")) { ret = parse_type(); }
+    let body = parse_block();
+    let n = node("closure", t);
+    n["params"] = params; n["ret"] = ret; n["body"] = body;
+    return n;
+}
+
+fn parse_pattern() {
+    let t = peek();
+    if (t.k == "int") { advance(); let n = node("int", t); n["v"] = t.v; return n; }
+    if (t.k == "float") { advance(); let n = node("float", t); n["v"] = t.v; return n; }
+    if (t.k == "str") { advance(); let n = node("str", t); n["v"] = t.v; return n; }
+    if (t.k == "kw" && (t.v == "true" || t.v == "false")) { advance(); let n = node("bool", t); n["v"] = (t.v == "true"); return n; }
+    if (t.k == "kw" && t.v == "null") { advance(); return node("null", t); }
+    if (t.k == "op" && t.v == "-") {
+        advance();
+        let u = peek();
+        if (u.k == "int") { advance(); let n = node("int", u); n["v"] = -u.v; return n; }
+        if (u.k == "float") { advance(); let n = node("float", u); n["v"] = -u.v; return n; }
+        err_here("expected a number after '-' in a pattern");
+    }
+    if (t.k == "id") {
+        advance();
+        if (t.v == "_") { return node("wild", t); }
+        var e = node("id", t); e["name"] = t.v;
+        while (is_op(".") && id_at(1)) {
+            let d = advance();
+            let m = node("member", d);
+            m["e"] = e; m["name"] = expect_id(); m["arrow"] = false;
+            e = m;
+        }
+        return e;
+    }
+    err_here("expected a pattern but found " + describe(t));
+}
+
+fn parse_match() {
+    let t = expect_kw("match");
+    expect_op("(");
+    let e = parse_expr();
+    expect_op(")");
+    expect_op("{");
+    let arms = [];
+    while (!is_op("}")) {
+        let at = peek();
+        let pats = [parse_pattern()];
+        while (accept_op("|")) { pats.push(parse_pattern()); }
+        expect_op("=>");
+        var body = null;
+        if (is_op("{")) { body = parse_block(); }
+        else {
+            let x = parse_expr();
+            if (x.t == "assignx") { body = assign_stmt(x); }
+            else { body = x; }
+        }
+        arms.push({ pats: pats, body: body, line: at.line, col: at.col });
+        if (!accept_op(",")) { break; }
+    }
+    expect_op("}");
+    let n = node("match", t);
+    n["e"] = e; n["arms"] = arms;
+    return n;
+}
+
+fn parse_primary() {
+    let t = peek();
+    if (t.k == "int") { advance(); let n = node("int", t); n["v"] = t.v; return n; }
+    if (t.k == "float") { advance(); let n = node("float", t); n["v"] = t.v; return n; }
+    if (t.k == "str") {
+        advance();
+        var bytes = t.v;
+        while (peek().k == "str") { bytes = bytes + advance().v; }      // adjacent literals join
+        let n = node("str", t);
+        n["v"] = bytes;
+        return n;
+    }
+    if (t.k == "kw") {
+        if (t.v == "true" || t.v == "false") { advance(); let n = node("bool", t); n["v"] = (t.v == "true"); return n; }
+        if (t.v == "null") { advance(); return node("null", t); }
+        if (t.v == "sizeof" || t.v == "alignof") {
+            advance();
+            expect_op("(");
+            let ty = parse_type();
+            expect_op(")");
+            let n = node(t.v, t);
+            n["tname"] = ty;
+            return n;
+        }
+        if (t.v == "offsetof") {
+            advance();
+            expect_op("(");
+            let sname = expect_id();
+            expect_op(",");
+            let fname = expect_id();
+            expect_op(")");
+            let n = node("offsetof", t);
+            n["sname"] = sname; n["field"] = fname;
+            return n;
+        }
+        if (t.v == "match") { return parse_match(); }
+        if (t.v == "fn") { return parse_closure(); }
+        if (t.v == "unsafe") {
+            util.fail("an 'unsafe { }' expression yields a runtime value; use an unsafe { } statement (every native operation is already unchecked)", t.line, t.col);
+        }
+        err_here("unexpected " + describe(t) + " in expression");
+    }
+    if (t.k == "id") {
+        // struct literal:  Name { field: value, ... }
+        if (op_at(1, "{") && (op_at(2, "}") || (id_at(2) && op_at(3, ":")))) {
+            advance(); advance();
+            let fields = [];
+            while (!is_op("}")) {
+                let ft = peek();
+                let fname = expect_id();
+                expect_op(":");
+                fields.push({ name: fname, e: parse_expr(), line: ft.line, col: ft.col });
+                if (!accept_op(",")) { break; }
+            }
+            expect_op("}");
+            let n = node("structlit", t);
+            n["name"] = t.v; n["fields"] = fields;
+            return n;
+        }
+        advance();
+        let n = node("id", t);
+        n["name"] = t.v;
+        return n;
+    }
+    if (t.k == "op" && t.v == "(") {
+        advance();
+        var e = parse_expr();
+        while (is_op(",")) {
+            let c = advance();
+            let r = parse_expr();
+            let n = node("comma", c);
+            n["l"] = e; n["r"] = r;
+            e = n;
+        }
+        expect_op(")");
+        return e;
+    }
+    if (t.k == "op" && t.v == "[") {
+        advance();
+        if (is_op("]")) { util.fail("an empty array literal has no element type; declare a fixed array: let a: int[4];", t.line, t.col); }
+        let first = parse_expr();
+        if (accept_op(";")) {
+            let cnt = parse_expr();
+            expect_op("]");
+            let n = node("arrfill", t);
+            n["v"] = first; n["count"] = cnt;
+            return n;
+        }
+        let elems = [first];
+        while (accept_op(",")) {
+            if (is_op("]")) { break; }
+            elems.push(parse_expr());
+        }
+        expect_op("]");
+        let n = node("arrlit", t);
+        n["elems"] = elems;
+        return n;
+    }
+    if (t.k == "op" && t.v == "{") {
+        util.fail("object literals are dynamic objects (they need the KingCobra runtime); declare a struct and write Name { field: value }", t.line, t.col);
+    }
+    err_here("unexpected " + describe(t) + " in expression");
+}
+
+// ---------------------------------------------------------------- statements
+fn parse_block() {
+    let t = expect_op("{");
+    let body = [];
+    while (!is_op("}")) {
+        if (peek().k == "eof") { util.fail("unterminated block (missing '}')", t.line, t.col); }
+        body.push(parse_stmt());
+    }
+    expect_op("}");
+    let n = empty_block(t);
+    n["body"] = body;
+    return n;
+}
+
+/// A loop/if body: a block, or a single statement (C style).
+fn parse_body() {
+    if (is_op("{")) { return parse_block(); }
+    let s = parse_stmt();
+    let n = { t: "block", line: s.line, col: s.col, body: [s] };
+    return n;
+}
+
+fn assign_stmt(x, at = null) {
+    let n = { t: "assign", line: at == null ? x.line : at.line, col: at == null ? x.col : at.col };
+    n["op"] = x.op; n["target"] = x.target; n["value"] = x.value;
+    return n;
+}
+
+/// expression statement: assignment, ++/--, or an expression.
+fn parse_simple_stmt() {
+    let t = peek();
+    let e = parse_expr();
+    if (e.t == "assignx") { return assign_stmt(e, t); }
+    if (e.t == "incdec") {
+        let n = node("assign", t);
+        n["op"] = (e.op == "++") ? "+=" : "-="; n["target"] = e.e;
+        let one = node("int", t); one["v"] = 1;
+        n["value"] = one;
+        return n;
+    }
+    let n = node("expr", t);
+    n["e"] = e;
+    return n;
+}
+
+/// let/var/const [destructuring pattern | name [: type] [= expr] {, name ...}] ;   -> a list of statements
+fn parse_decl_list(kind: string, stat: bool) {
+    let t = peek();
+    if (is_op("[") || is_op("{")) {
+        let obj = is_op("{");
+        advance();
+        let names = [];
+        var rest = "";
+        while (!(is_op("]") || is_op("}"))) {
+            if (is_op("...")) { advance(); rest = expect_id(); break; }
+            let it = peek();
+            var nm = expect_id();
+            var as_name = nm;
+            if (obj && accept_op(":")) { as_name = expect_id(); }
+            names.push({ name: nm, bind: as_name, line: it.line, col: it.col });
+            if (!accept_op(",")) { break; }
+        }
+        if (obj) { expect_op("}"); } else { expect_op("]"); }
+        expect_op("=");
+        let init = parse_expr();
+        expect_op(";");
+        let n = node("destruct", t);
+        n["kind"] = kind; n["obj"] = obj; n["names"] = names; n["rest"] = rest; n["init"] = init;
+        return [n];
+    }
+    let out = [];
+    while (true) {
+        let nt = peek();
+        let name = expect_id();
+        var ty = "";
+        if (accept_op(":")) { ty = parse_type(); }
+        var init = null;
+        if (accept_op("=")) { init = parse_expr(); }
+        if (ty == "" && init == null) { util.fail("'" + name + "' needs a type or an initial value", nt.line, nt.col); }
+        let n = node("decl", nt);
+        n["name"] = name; n["ty"] = ty; n["init"] = init; n["mutable"] = (kind != "let" && kind != "const"); n["kind"] = kind;
+        n["static"] = stat;
+        out.push(n);
+        if (!accept_op(",")) { break; }
+    }
+    expect_op(";");
+    return out;
+}
+
+fn as_stmt(list) {
+    if (len(list) == 1) { return list[0]; }
+    let n = { t: "multi", line: list[0].line, col: list[0].col, body: list };
+    return n;
+}
+
+fn parse_decl(kind: string) {
+    advance();
+    return as_stmt(parse_decl_list(kind, false));
+}
+
+fn parse_label_target() -> string { return expect_id(); }
+
+/// `name ( a, b ) {` -- a B-style function definition (no `fn`, untyped parameters)
+fn looks_like_bfn() -> bool {
+    if (!(peek().k == "id" && op_at(1, "("))) { return false; }
+    var k = 2;
+    if (op_at(k, ")")) { return op_at(k + 1, "{"); }
+    while (true) {
+        if (!id_at(k)) { return false; }
+        k = k + 1;
+        if (op_at(k, ",")) { k = k + 1; continue; }
+        if (op_at(k, ")")) { return op_at(k + 1, "{"); }
+        return false;
+    }
+    return false;
+}
+
+fn parse_bfn() {
+    let t = peek();
+    let name = expect_id();
+    expect_op("(");
+    let params = [];
+    if (!is_op(")")) {
+        while (true) {
+            let pt = peek();
+            params.push({ name: expect_id(), ty: "int", line: pt.line, col: pt.col, def: null });
+            if (!accept_op(",")) { break; }
+        }
+    }
+    expect_op(")");
+    let body = parse_block();
+    let n = node("fn", t);
+    n["name"] = name; n["params"] = params; n["ret"] = "int"; n["body"] = body; n["is_static"] = false; n["tparams"] = [];
+    return n;
+}
+
+fn hoist(it) { hoisted.push(it); }
+
+fn parse_stmt() {
+    let t = peek();
+    if (t.k == "op") {
+        if (t.v == "{") { return parse_block(); }
+        if (t.v == ";") { advance(); return empty_block(t); }
+    }
+    if (t.k == "kw") {
+        if (t.v == "let" || t.v == "var") { return parse_decl(t.v); }
+        if (t.v == "if") { return parse_if(); }
+        if (t.v == "while") { return parse_while(""); }
+        if (t.v == "for") { return parse_for(""); }
+        if (t.v == "return") {
+            advance();
+            let n = node("return", t);
+            n["e"] = null;
+            if (!is_op(";")) { n["e"] = parse_expr(); }
+            expect_op(";");
+            return n;
+        }
+        if (t.v == "break" || t.v == "continue") {
+            advance();
+            let n = node(t.v, t);
+            n["label"] = "";
+            if (peek().k == "id") { n["label"] = expect_id(); }
+            expect_op(";");
+            return n;
+        }
+        if (t.v == "unsafe" && op_at(1, "{")) { advance(); return parse_block(); }
+        if (t.v == "comptime" && op_at(1, "{")) {
+            advance();
+            let b = parse_block();
+            let n = node("comptime", t);
+            n["body"] = b.body;
+            return n;
+        }
+        if (t.v == "match") {
+            let m = parse_match();
+            if (is_op(";")) { advance(); }
+            let n = node("expr", t);
+            n["e"] = m;
+            return n;
+        }
+        if (t.v == "fn" && id_at(1)) { hoist(parse_fn(false)); return empty_block(t); }
+        if (t.v == "extern") { for (x in parse_extern()) { hoist(x); } return empty_block(t); }
+        if (t.v == "struct") { hoist(parse_struct(false, false)); return empty_block(t); }
+        if (t.v == "import") { err_here("'import' is only allowed at the top level"); }
+    }
+    if (t.k == "id") {
+        let w = t.v;
+        if (w == "const" && (id_at(1) || op_at(1, "[") || op_at(1, "{"))) { return parse_decl("const"); }
+        if (w == "do" && op_at(1, "{")) {
+            advance();
+            let body = parse_block();
+            expect_kw("while");
+            expect_op("(");
+            let c = parse_expr();
+            expect_op(")");
+            accept_op(";");
+            let n = node("dowhile", t);
+            n["c"] = c; n["body"] = body; n["label"] = "";
+            return n;
+        }
+        if (w == "switch" && op_at(1, "(")) { return parse_switch(); }
+        if (w == "goto" && id_at(1) && op_at(2, ";")) {
+            advance();
+            let n = node("goto", t);
+            n["name"] = expect_id();
+            expect_op(";");
+            return n;
+        }
+        if (w == "static" && !op_at(1, "=") && !op_at(1, "(") && !op_at(1, ".")) {
+            advance();
+            if (is_kw("let") || is_kw("var") || is_id("const")) { let k = advance().v; return as_stmt(parse_decl_list(k, true)); }
+            return as_stmt(parse_decl_list("var", true));
+        }
+        if (w == "typedef" && id_at(1)) { advance(); parse_typedef(); return empty_block(t); }
+        if (w == "type" && id_at(1) && op_at(2, "=")) { advance(); parse_alias(); return empty_block(t); }
+        if (w == "enum" && id_at(1) && op_at(2, "{")) { hoist(parse_enum()); return empty_block(t); }
+        if (w == "union" && id_at(1) && op_at(2, "{")) { advance(); hoist(parse_struct(false, true)); return empty_block(t); }
+        if (w == "packed" && peek_at(1).k == "kw" && peek_at(1).v == "struct") { advance(); hoist(parse_struct(true, false)); return empty_block(t); }
+        if (w == "impl" && id_at(1) && op_at(2, "{")) { for (f in parse_impl()) { hoist(f); } return empty_block(t); }
+        if (w == "try" && op_at(1, "{")) { return parse_try(); }
+        if (w == "throw" && !op_at(1, "=") && !op_at(1, ".") && !op_at(1, "(") && !op_at(1, "[")) {
+            advance();
+            let n = node("throw", t);
+            n["e"] = parse_expr();
+            expect_op(";");
+            return n;
+        }
+        if (w == "defer" && (id_at(1) || op_at(1, "{") || peek_at(1).k == "str" || peek_at(1).k == "int")) {
+            advance();
+            let n = node("defer", t);
+            if (is_op("{")) { n["body"] = parse_block(); }
+            else { let e = parse_simple_stmt(); expect_op(";"); n["body"] = { t: "block", line: e.line, col: e.col, body: [e] }; }
+            return n;
+        }
+        if (w == "auto" && id_at(1)) { return parse_auto(); }
+        if (w == "extrn" && id_at(1)) {
+            advance();
+            let names = [expect_id()];
+            while (accept_op(",")) { names.push(expect_id()); }
+            expect_op(";");
+            let n = node("extrn", t);
+            n["names"] = names;
+            return n;
+        }
+        // label:  (loops pick the label up for `break label;` / `continue label;`)
+        if (op_at(1, ":") && !op_at(2, ":") && w != "case" && w != "default") {
+            advance(); advance();
+            let ln = node("label", t);
+            ln["name"] = w;
+            if (is_kw("while")) { ln["stmt"] = parse_while(w); }
+            else if (is_kw("for")) { ln["stmt"] = parse_for(w); }
+            else if (is_id("do") && op_at(1, "{")) { let d = parse_stmt(); d["label"] = w; ln["stmt"] = d; }
+            else if (is_op("}")) { ln["stmt"] = empty_block(t); }
+            else { ln["stmt"] = parse_stmt(); }
+            return ln;
+        }
+        if (looks_like_bfn()) { hoist(parse_bfn()); return empty_block(t); }
+    }
+    let s = parse_simple_stmt();
+    expect_op(";");
+    return s;
+}
+
+fn parse_auto() {
+    let t = advance();
+    let out = [];
+    while (true) {
+        let nt = peek();
+        let name = expect_id();
+        var ty = "int";
+        if (accept_op("[")) {
+            let c = peek();
+            if (c.k != "int") { err_here("a B vector size must be an integer literal"); }
+            advance();
+            expect_op("]");
+            ty = "int[" + str(c.v + 1) + "]";             // B: auto v[n] has n+1 words
+        }
+        let n = node("decl", nt);
+        n["name"] = name; n["ty"] = ty; n["init"] = null; n["mutable"] = true; n["kind"] = "var"; n["static"] = false;
+        out.push(n);
+        if (!accept_op(",")) { break; }
+    }
+    expect_op(";");
+    return as_stmt(out);
+}
+
+fn parse_while(label: string) {
+    let t = expect_kw("while");
+    expect_op("(");
+    let c = parse_expr();
+    expect_op(")");
+    let body = parse_body();
+    let n = node("while", t);
+    n["c"] = c; n["body"] = body; n["label"] = label;
+    return n;
+}
+
+fn parse_if() {
+    let t = expect_kw("if");
+    expect_op("(");
+    let c = parse_expr();
+    expect_op(")");
+    let a = parse_body();
+    var b = null;
+    if (accept_kw("else")) {
+        if (is_kw("if")) { b = parse_if(); } else { b = parse_body(); }
+    }
+    let n = node("if", t);
+    n["c"] = c; n["a"] = a; n["b"] = b;
+    return n;
+}
+
+fn parse_for(label: string) {
+    let t = expect_kw("for");
+    expect_op("(");
+    // for (i in lo..hi)  |  for (x in array)  |  for (i, x in array)
+    var two = false;
+    if (peek().k == "id" && peek_at(1).k == "kw" && peek_at(1).v == "in") { two = false; }
+    else if (peek().k == "id" && op_at(1, ",") && id_at(2) && peek_at(3).k == "kw" && peek_at(3).v == "in") { two = true; }
+    else { two = false; }
+    if ((peek().k == "id" && peek_at(1).k == "kw" && peek_at(1).v == "in") || (two)) {
+        let v = advance();
+        var v2 = null;
+        if (two) { advance(); v2 = advance(); }
+        advance();                                   // 'in'
+        let lo = parse_binary(LV_AND);
+        if (is_op("..")) {
+            if (two) { util.fail("a range has no second loop variable; use for (i in lo..hi)", t.line, t.col); }
+            advance();
+            let hi = parse_binary(LV_AND);
+            expect_op(")");
+            let body = parse_body();
+            let n = node("forrange", t);
+            n["vname"] = v.v; n["lo"] = lo; n["hi"] = hi; n["body"] = body; n["vline"] = v.line; n["vcol"] = v.col; n["label"] = label;
+            return n;
+        }
+        expect_op(")");
+        let body = parse_body();
+        let n = node("forin", t);
+        n["e"] = lo; n["body"] = body; n["label"] = label;
+        n["vname"] = two ? v2.v : v.v; n["vline"] = two ? v2.line : v.line; n["vcol"] = two ? v2.col : v.col;
+        n["iname"] = two ? v.v : "";
+        return n;
+    }
+    // C style: for (init; cond; step)
+    var init = null;
+    var cond = null;
+    let steps = [];
+    if (!is_op(";")) {
+        if (is_kw("let") || is_kw("var") || is_id("const")) { advance(); init = as_stmt(parse_decl_list(toks[pos - 1].v, false)); }
+        else {
+            let inits = [parse_simple_stmt()];
+            while (accept_op(",")) { inits.push(parse_simple_stmt()); }
+            expect_op(";");
+            init = as_stmt(inits);
+        }
+    } else { advance(); }
+    if (!is_op(";")) { cond = parse_expr(); }
+    expect_op(";");
+    if (!is_op(")")) {
+        steps.push(parse_simple_stmt());
+        while (accept_op(",")) { steps.push(parse_simple_stmt()); }
+    }
+    expect_op(")");
+    let body = parse_body();
+    let n = node("for", t);
+    n["init"] = init; n["cond"] = cond; n["step"] = len(steps) == 0 ? null : as_stmt(steps); n["body"] = body; n["label"] = label;
+    return n;
+}
+
+fn parse_switch() {
+    let t = advance();
+    expect_op("(");
+    let e = parse_expr();
+    expect_op(")");
+    expect_op("{");
+    let cases = [];
+    var curc = null;
+    while (!is_op("}")) {
+        let u = peek();
+        if (u.k == "eof") { util.fail("unterminated switch (missing '}')", t.line, t.col); }
+        if (is_id("case") && !op_at(1, "=")) {
+            advance();
+            let vals = [parse_expr()];
+            while (accept_op(",")) { vals.push(parse_expr()); }
+            expect_op(":");
+            curc = { vals: vals, body: [], line: u.line, col: u.col };
+            cases.push(curc);
+        } else if (is_id("default") && op_at(1, ":")) {
+            advance(); advance();
+            curc = { vals: null, body: [], line: u.line, col: u.col };
+            cases.push(curc);
+        } else {
+            if (curc == null) { util.fail("a statement inside 'switch' must follow a 'case' or 'default' label", u.line, u.col); }
+            curc.body.push(parse_stmt());
+        }
+    }
+    expect_op("}");
+    let n = node("switch", t);
+    n["e"] = e; n["cases"] = cases;
+    return n;
+}
+
+fn parse_try() {
+    let t = advance();
+    let body = parse_block();
+    if (!is_id("catch")) { err_here("expected 'catch' after the try block"); }
+    advance();
+    var vname = "";
+    var vt = null;
+    if (accept_op("(")) { vt = peek(); vname = expect_id(); expect_op(")"); }
+    let handler = parse_block();
+    let n = node("try", t);
+    n["body"] = body; n["vname"] = vname; n["handler"] = handler;
+    return n;
+}
+
+// ---------------------------------------------------------------- declarations
+fn parse_params() {
+    let params = [];
+    expect_op("(");
+    if (!is_op(")")) {
+        while (true) {
+            let t = peek();
+            if (is_op("...")) { util.fail("variadic parameters collect their arguments into a runtime array; only 'extern fn' declarations may be variadic natively", t.line, t.col); }
+            let name = expect_id();
+            var ty = "";
+            if (accept_op(":")) { ty = parse_type(); }
+            var def = null;
+            if (accept_op("=")) { def = parse_expr(); }
+            params.push({ name: name, ty: ty, line: t.line, col: t.col, def: def });
+            if (!accept_op(",")) { break; }
+        }
+    }
+    expect_op(")");
+    return params;
+}
+
+fn parse_fn(is_static: bool) {
+    let t = expect_kw("fn");
+    let name = expect_id();
+    let tparams = [];
+    if (accept_op("<")) {
+        tparams.push(expect_id());
+        while (accept_op(",")) { tparams.push(expect_id()); }
+        expect_op(">");
+    }
+    let params = parse_params();
+    var ret = "void";
+    if (accept_op("->")) { ret = parse_type(); }
+    let body = parse_block();
+    let n = node("fn", t);
+    n["name"] = name; n["params"] = params; n["ret"] = ret; n["body"] = body; n["is_static"] = is_static; n["tparams"] = tparams;
+    return n;
+}
+
+fn parse_impl() {
+    advance();                         // 'impl'
+    let owner = expect_id();
+    expect_op("{");
+    let fns = [];
+    while (!is_op("}")) {
+        if (!is_kw("fn")) { err_here("an impl block contains only functions"); }
+        let f = parse_fn(false);
+        f["owner"] = owner;
+        f["method"] = f.name;
+        f["name"] = owner + "__" + f.name;
+        fns.push(f);
+    }
+    expect_op("}");
+    return fns;
+}
+
+fn parse_extern() {
+    let t = expect_kw("extern");
+    if (peek().k == "str") { advance(); }          // extern "C" { ... } / extern "C" fn
+    let items = [];
+    var braces = false;
+    if (accept_op("{")) { braces = true; }
+    while (true) {
+        let ft = expect_kw("fn");
+        let name = expect_id();
+        expect_op("(");
+        let params = [];
+        var variadic = false;
+        if (!is_op(")")) {
+            while (true) {
+                if (accept_op("...")) { variadic = true; break; }
+                // either `type` or `name: type`
+                if (peek().k == "id" && peek_at(1).k == "op" && peek_at(1).v == ":") { advance(); advance(); }
+                params.push(parse_type());
+                if (!accept_op(",")) { break; }
+            }
+        }
+        expect_op(")");
+        var ret = "void";
+        if (accept_op("->")) { ret = parse_type(); }
+        var lib = "";
+        if (accept_kw("from")) {
+            let lt = peek();
+            if (lt.k != "str") { err_here("expected a library name string after 'from'"); }
+            advance();
+            lib = bytes_to_str(lt.v);
+        }
+        expect_op(";");
+        let n = node("extern", ft);
+        n["name"] = name; n["params"] = params; n["ret"] = ret; n["lib"] = lib; n["variadic"] = variadic;
+        items.push(n);
+        if (!braces) { break; }
+        if (is_op("}")) { advance(); break; }
+    }
+    return items;
+}
+
+fn parse_struct(packed: bool, is_union: bool) {
+    var t = peek();
+    if (is_kw("struct")) { advance(); }
+    let name = expect_id();
+    expect_op("{");
+    let fields = [];
+    while (!is_op("}")) {
+        let ft = peek();
+        let fname = expect_id();
+        expect_op(":");
+        let fty = parse_type();
+        fields.push({ name: fname, ty: fty, line: ft.line, col: ft.col });
+        if (!accept_op(",")) { break; }
+    }
+    expect_op("}");
+    let n = node("struct", t);
+    n["name"] = name; n["fields"] = fields; n["packed"] = packed; n["union"] = is_union;
+    return n;
+}
+
+fn parse_enum() {
+    let t = advance();         // 'enum'
+    let name = expect_id();
+    expect_op("{");
+    let members = [];
+    while (!is_op("}")) {
+        let mt = peek();
+        let mname = expect_id();
+        var e = null;
+        if (accept_op("=")) { e = parse_ternary(); }
+        members.push({ name: mname, e: e, line: mt.line, col: mt.col });
+        if (!accept_op(",")) { break; }
+    }
+    expect_op("}");
+    let n = node("enum", t);
+    n["name"] = name; n["members"] = members;
+    return n;
+}
+
+fn parse_alias() {
+    let name = expect_id();
+    expect_op("=");
+    let ty = parse_type();
+    expect_op(";");
+    aliases[name] = ty;
+}
+
+fn parse_typedef() {
+    // typedef <type> Name;
+    let ty = parse_type();
+    let name = expect_id();
+    expect_op(";");
+    aliases[name] = ty;
+}
+
+fn globals_of(list, is_static: bool) {
+    let out = [];
+    for (d in list) {
+        if (d.t == "destruct") { util.fail("destructuring is only allowed inside a function", d.line, d.col); }
+        out.push({ t: "global", line: d.line, col: d.col, name: d.name, ty: d.ty, init: d.init, mutable: d.mutable, is_static: is_static });
+    }
+    return out;
+}
+
+/// Parse one file's tokens into a list of top-level items.
+fn parse_program(source: string) {
+    toks = lexer.lex(source);
+    pos = 0;
+    let items = [];
+    while (peek().k != "eof") {
+        let t = peek();
+        var is_static = false;
+        if (is_id("export")) { advance(); }
+        if (is_id("static") && !op_at(1, "=") && !op_at(1, "(")) { advance(); is_static = true; }
+        let u = peek();
+        if (u.k == "kw" && u.v == "fn") { items.push(parse_fn(is_static)); }
+        else if (u.k == "kw" && u.v == "extern") { for (x in parse_extern()) { items.push(x); } }
+        else if (u.k == "kw" && u.v == "struct") { items.push(parse_struct(false, false)); }
+        else if (u.k == "id" && u.v == "packed") { advance(); items.push(parse_struct(true, false)); }
+        else if (u.k == "id" && u.v == "union" && id_at(1)) { advance(); items.push(parse_struct(false, true)); }
+        else if (u.k == "id" && u.v == "enum" && id_at(1)) { items.push(parse_enum()); }
+        else if (u.k == "id" && u.v == "impl" && id_at(1)) { for (f in parse_impl()) { items.push(f); } }
+        else if (u.k == "id" && u.v == "type" && id_at(1) && op_at(2, "=")) { advance(); parse_alias(); }
+        else if (u.k == "id" && u.v == "typedef") { advance(); parse_typedef(); }
+        else if (u.k == "kw" && (u.v == "let" || u.v == "var")) { advance(); for (g in globals_of(parse_decl_list(u.v, false), is_static)) { items.push(g); } }
+        else if (u.k == "id" && u.v == "const" && (id_at(1))) { advance(); for (g in globals_of(parse_decl_list("const", false), is_static)) { items.push(g); } }
+        else if (u.k == "kw" && u.v == "comptime" && op_at(1, "{")) {
+            advance();
+            let b = parse_block();
+            let n = node("comptime", u);
+            n["body"] = b.body; n["top"] = true;
+            items.push(n);
+        }
+        else if (u.k == "kw" && u.v == "import") {
+            advance();
+            let it = peek();
+            if (it.k == "str") {
+                advance();
+                var alias = "";
+                if (is_kw("as")) { advance(); alias = expect_id(); }
+                expect_op(";");
+                items.push({ t: "import", line: it.line, col: it.col, path: bytes_to_str(it.v), alias: alias });
+            } else {
+                util.fail("std.* modules are implemented by the KingCobra runtime and cannot be used in native code; declare the C functions you need with 'extern fn'", it.line, it.col);
+            }
+        }
+        else if (looks_like_bfn()) { items.push(parse_bfn()); }
+        else { util.fail("unexpected " + describe(u) + " at the top level (expected fn, struct, enum, union, impl, extern, let, var, const, type or import)", u.line, u.col); }
+        if (len(hoisted) > 0) { for (h in hoisted) { items.push(h); } hoisted = []; }
+    }
+    return items;
+}

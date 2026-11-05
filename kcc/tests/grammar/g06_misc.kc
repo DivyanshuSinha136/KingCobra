@@ -1,0 +1,40 @@
+import "g06_mod_util.kc" as u;
+#define SQUARE(x) ((x) * (x))
+#define DEBUG 1
+#define N 4
+#if DEBUG
+fn mode() -> int { return 1; }
+#else
+fn mode() -> int { return 0; }
+#endif
+comptime { const SIZE = N * 2; let MASK = SIZE - 1; }
+struct Item { name: string, qty: int, price: int }
+struct Op { f: fn(int, int) -> int, tag: int }
+fn add(a: int, b: int) -> int { return a + b; }
+fn mul(a: int, b: int) -> int { return a * b; }
+let TABLE: Item[3] = [Item { name: "apple", qty: 3, price: 5 }, Item { name: "pear", qty: 1, price: 9 }, Item { name: "fig", qty: 12, price: 2 }];
+let PRIMES: int[5] = [2, 3, 5, 7, 11];
+let OPS: Op[2] = [Op { f: add, tag: 1 }, Op { f: mul, tag: 2 }];
+var greeting: string = "hello";
+fact(n) { if (n < 2) { return 1; } return n * fact(n - 1); }
+fill(s, n) { auto i; i = 0; while (i < n) { lchar(s, i, 65 + i); i++; } lchar(s, n, 0); return 0; }
+fn main() -> int {
+    println(SQUARE(7), mode(), SIZE, MASK);
+    println(u.twice(5), u.counter, u.LIMIT);
+    u.counter = 100;
+    println(u.twice(5));
+    var total = 0;
+    for (it in TABLE) { total += 0; }
+    for (i in 0..3) { total += TABLE[i].qty * TABLE[i].price; println(TABLE[i].name, TABLE[i].qty); }
+    println("total", total, PRIMES[4]);
+    for (o in OPS) { println(o.tag, o.f(6, 7)); }
+    println(OPS[1].f(3, 4), greeting);
+    println(fact(10));
+    var buf: u8[8];
+    fill(buf as int, 5);
+    println(buf, char(buf, 2));
+    var xs: int[4] = [1, 2, 3, 4];
+    var p: *int = xs;
+    println(*(p + 2), p[3]);
+    return 0;
+}

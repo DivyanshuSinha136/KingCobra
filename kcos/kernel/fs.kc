@@ -1,0 +1,191 @@
+// fs.kc -- KCFS: a small in-memory hierarchical filesystem (directories and files stored on the kernel heap).
+// Author: Divyanshu Sinha (MIT License)
+const FS_MAX = 128;
+const FS_NAME = 28;
+const K_FREE = 0;
+const K_FILE = 1;
+const K_DIR = 2;
+
+struct FsNode {
+    name: u8[28],
+    kind: int,
+    parent: int,
+    size: int,
+    cap: int,
+    data: *u8,
+    mtime: int
+}
+
+var fs_nodes: FsNode[128];
+var fs_cwd = 0;
+
+fn fs_init() {
+    var i = 0;
+    while (i < FS_MAX) { fs_nodes[i].kind = K_FREE; i++; }
+    fs_nodes[0].kind = K_DIR;
+    fs_nodes[0].parent = 0;
+    fs_nodes[0].name[0] = 0;
+    fs_cwd = 0;
+}
+
+fn fs_child(dir: int, name: *u8) -> int {
+    var i = 0;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && i != 0 && fs_nodes[i].parent == dir && kstreq(&fs_nodes[i].name[0], name)) { return i; }
+        i++;
+    }
+    return -1;
+}
+
+/// resolve a path (absolute or relative to the working directory); -1 when it does not exist
+fn fs_resolve(path: *u8) -> int {
+    var cur = fs_cwd;
+    var i = 0;
+    if (path[0] == '/') { cur = 0; i = 1; }
+    var comp: u8[32];
+    while (path[i] != 0) {
+        if (path[i] == '/') { i++; continue; }
+        var n = 0;
+        while (path[i] != 0 && path[i] != '/') {
+            if (n >= FS_NAME - 1) { return -1; }
+            comp[n] = path[i]; n++; i++;
+        }
+        comp[n] = 0;
+        if (kstreq(&comp[0], ".")) { continue; }
+        if (kstreq(&comp[0], "..")) { cur = fs_nodes[cur].parent; continue; }
+        if (fs_nodes[cur].kind != K_DIR) { return -1; }
+        let c = fs_child(cur, &comp[0]);
+        if (c < 0) { return -1; }
+        cur = c;
+    }
+    return cur;
+}
+
+/// split "a/b/c" into the directory node of "a/b" and the final name "c" (copied into `name`); -1 on error
+fn fs_split(path: *u8, name: *u8) -> int {
+    var tmp: u8[128];
+    kstrncpy(&tmp[0], path, 128);
+    var n = kstrlen(&tmp[0]);
+    while (n > 1 && tmp[n - 1] == '/') { n--; tmp[n] = 0; }
+    var slash = -1;
+    var i = 0;
+    while (i < n) { if (tmp[i] == '/') { slash = i; } i++; }
+    if (n == 0 || (slash == n - 1)) { return -1; }
+    var dir = fs_cwd;
+    var base = 0;
+    if (slash == 0) { dir = 0; base = 1; }
+    else if (slash > 0) { tmp[slash] = 0; dir = fs_resolve(&tmp[0]); base = slash + 1; }
+    if (dir < 0 || fs_nodes[dir].kind != K_DIR) { return -1; }
+    if (kstrlen(&tmp[base]) >= FS_NAME) { return -1; }
+    kstrncpy(name, &tmp[base], FS_NAME);
+    return dir;
+}
+
+fn fs_alloc_node() -> int {
+    var i = 1;
+    while (i < FS_MAX) { if (fs_nodes[i].kind == K_FREE) { return i; } i++; }
+    return -1;
+}
+
+/// create a file or directory; returns the node, or -1 (exists / no space / bad path)
+fn fs_create(path: *u8, kind: int) -> int {
+    var name: u8[32];
+    let dir = fs_split(path, &name[0]);
+    if (dir < 0) { return -1; }
+    if (kstreq(&name[0], ".") || kstreq(&name[0], "..")) { return -1; }
+    if (fs_child(dir, &name[0]) >= 0) { return -1; }
+    let n = fs_alloc_node();
+    if (n < 0) { return -1; }
+    kstrncpy(&fs_nodes[n].name[0], &name[0], FS_NAME);
+    fs_nodes[n].kind = kind;
+    fs_nodes[n].parent = dir;
+    fs_nodes[n].size = 0;
+    fs_nodes[n].cap = 0;
+    fs_nodes[n].data = 0 as *u8;
+    fs_nodes[n].mtime = ticks;
+    return n;
+}
+
+fn fs_write(n: int, data: *u8, len: int, append: bool) -> bool {
+    if (fs_nodes[n].kind != K_FILE) { return false; }
+    if (!append) { fs_nodes[n].size = 0; }
+    let need = fs_nodes[n].size + len;
+    if (need > fs_nodes[n].cap) {
+        var cap = fs_nodes[n].cap * 2;
+        if (cap < need + 1) { cap = need + 1; }
+        if (cap < 64) { cap = 64; }
+        let nd = kmalloc(cap);
+        if (nd == (0 as *u8)) { return false; }
+        if (fs_nodes[n].size > 0) { kmemcpy(nd, fs_nodes[n].data, fs_nodes[n].size); }
+        kfree(fs_nodes[n].data);
+        fs_nodes[n].data = nd;
+        fs_nodes[n].cap = cap;
+    }
+    kmemcpy(fs_nodes[n].data + fs_nodes[n].size, data, len);
+    fs_nodes[n].size = need;
+    fs_nodes[n].data[need] = 0;
+    fs_nodes[n].mtime = ticks;
+    return true;
+}
+
+fn fs_nonempty_dir(n: int) -> bool {
+    var i = 1;
+    while (i < FS_MAX) { if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == n) { return true; } i++; }
+    return false;
+}
+
+fn fs_remove(n: int) -> bool {
+    if (n <= 0) { return false; }
+    if (fs_nodes[n].kind == K_DIR && fs_nonempty_dir(n)) { return false; }
+    if (fs_nodes[n].kind == K_FILE) { kfree(fs_nodes[n].data); }
+    fs_nodes[n].kind = K_FREE;
+    return true;
+}
+
+/// absolute path of a node into `out` (at least 128 bytes)
+fn fs_path(n: int, out: *u8) {
+    if (n == 0) { out[0] = '/'; out[1] = 0; return; }
+    var parts: int[16];
+    var depth = 0;
+    var cur = n;
+    while (cur != 0 && depth < 16) { parts[depth] = cur; depth++; cur = fs_nodes[cur].parent; }
+    var o = 0;
+    while (depth > 0) {
+        depth--;
+        out[o] = '/'; o++;
+        let nm = &fs_nodes[parts[depth]].name[0];
+        var j = 0;
+        while (nm[j] != 0 && o < 126) { out[o] = nm[j]; o++; j++; }
+    }
+    out[o] = 0;
+}
+
+/// out[0]=nodes used, out[1]=files, out[2]=dirs, out[3]=bytes stored
+fn fs_stats(out: *int) {
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+    var i = 0;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE) {
+            out[0]++;
+            if (fs_nodes[i].kind == K_FILE) { out[1]++; out[3] = out[3] + fs_nodes[i].size; } else { out[2]++; }
+        }
+        i++;
+    }
+}
+
+fn fs_put_file(path: *u8, text: *u8) {
+    let n = fs_create(path, K_FILE);
+    if (n >= 0) { fs_write(n, text, kstrlen(text), false); }
+}
+
+fn fs_seed() {
+    fs_create("/etc", K_DIR);
+    fs_create("/home", K_DIR);
+    fs_create("/docs", K_DIR);
+    fs_create("/tmp", K_DIR);
+    fs_put_file("/etc/hostname", "kcos\n");
+    fs_put_file("/etc/motd", "Welcome to KingCobra OS.\nType 'help' for the list of commands.\n");
+    fs_put_file("/etc/os-release", "NAME=KCOS\nVERSION=0.1\nLANGUAGE=KingCobra\nCOMPILER=kcc --target kcos\n");
+    fs_put_file("/home/hello.txt", "Hello from a file stored on the KCOS kernel heap.\n");
+    fs_put_file("/docs/about.txt", "KCOS is written in KingCobra and compiled by kcc, the KingCobra native compiler.\nOnly the 16/32-bit boot stage is assembly.\n");
+}

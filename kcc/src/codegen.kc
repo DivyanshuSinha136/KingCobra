@@ -1,0 +1,1853 @@
+// codegen.kc -- annotated AST -> x86-64 machine code in a format-neutral object module.
+// Author: Divyanshu Sinha (MIT License)
+//
+// gen_module(ctx, target) returns
+//   { target, abi, fmt, text, rodata, data, bss, syms, relocs, undef, libs }
+// where text/rodata/data are byte streams, `syms` = [{ name, sec, off, size, global, kind }] and
+// `relocs` = [{ sec, off, kind, sym, addend }] with kind one of
+//   call_ext   rel32 call to a function this module does not define
+//   rip_local  rel32 pc-relative reference to a symbol of this module (lea)
+//   rip_got    rel32 pc-relative reference to the GOT slot of a symbol (ELF only)
+//   abs64      64-bit absolute address (data section)
+import std.fbin;
+import "util.kc" as util;
+import "types.kc" as T;
+import "x64.kc" as X;
+
+var C = {};          // program context from the checker
+var M = {};          // module being built
+var A = {};          // assembler of the function being generated
+var win64 = false;
+var cur = 0;         // bytes of frame in use (grows downward from rbp)
+var maxcur = 0;
+var loops = [];
+var dstack = [];      // pending `defer` / `try` records of the enclosing blocks
+var pending = [];     // defer bodies to emit out of line
+var fn_lbl = {};      // goto labels of the current function
+var in_thunk = false;
+var hret_slot = 0;   // frame slot holding the hidden struct-return pointer
+var cur_sig = null;
+
+const RAX = 0; const RCX = 1; const RDX = 2; const RSP = 4; const RBP = 5; const R8 = 8;
+
+// ---------------------------------------------------------------- small helpers
+fn tsize(ty: string) -> int { return T.size_of(ty, C.structs); }
+fn tsigned(ty: string) -> bool { return T.INTS.has(ty) && T.INTS[ty][1]; }
+fn floaty(ty: string) -> bool { return ty == "float" || ty == "f32"; }
+fn is_agg(ty: string) -> bool { return T.is_array(ty) || C.structs.has(ty); }
+fn rv(ty: string) -> string { return T.is_array(ty) ? "*" + T.elem_of(ty) : ty; }
+fn cvof(n) { return n["cv"]; }
+
+fn alloc_bytes(size: int, align: int) -> int {
+    cur = util.align_up(cur + size, align);
+    if (cur > maxcur) { maxcur = cur; }
+    return -cur;
+}
+fn tmp_alloc() -> int { return alloc_bytes(8, 8); }
+
+fn alloc_local(sym) {
+    let size = tsize(sym.ty);
+    var al = 8;
+    if (!sym.agg) { al = size; if (al < 1) { al = 1; } }
+    else if (size >= 16) { al = 16; }
+    sym["off"] = alloc_bytes(size < 1 ? 1 : size, al);
+}
+
+// ---------------------------------------------------------------- loads / stores of typed values
+/// Load a value of type `ty` from [base+disp] into rax / xmm0.
+fn load_at(ty: string, base: int, disp: int) {
+    if (is_agg(ty)) { X.lea(A, RAX, base, disp); return; }
+    if (ty == "float") { X.movsd_load(A, 0, base, disp); return; }
+    if (ty == "f32") { X.movss_load(A, 0, base, disp); X.cvtss2sd(A, 0, 0); return; }
+    if (T.is_ptr(ty)) { X.mov_load64(A, RAX, base, disp); return; }
+    X.load_sized(A, RAX, base, disp, tsize(ty), tsigned(ty));
+}
+
+/// Load an integer/pointer value of type `ty` from [rbp+disp] into register `dst`.
+fn load_reg_local(ty: string, dst: int, disp: int) {
+    if (T.is_ptr(ty)) { X.mov_load64(A, dst, RBP, disp); return; }
+    X.load_sized(A, dst, RBP, disp, tsize(ty), tsigned(ty));
+}
+
+/// Store rax / xmm0 (a value of type `ty`) to [base+disp].
+fn store_at(ty: string, base: int, disp: int) {
+    if (ty == "float") { X.movsd_store(A, base, disp, 0); return; }
+    if (ty == "f32") { X.cvtsd2ss(A, 0, 0); X.movss_store(A, base, disp, 0); return; }
+    X.store_sized(A, base, disp, RAX, T.is_ptr(ty) ? 8 : tsize(ty));
+}
+
+fn float_const(v: float) {
+    X.mov_ri(A, RAX, util.f64_bits(v));
+    X.movq_xr(A, 0, RAX);
+}
+
+fn to_bool_rax() { X.test_rr(A, RAX, RAX); X.setcc(A, X.CC_NE, RAX); X.movzx8(A, RAX, RAX); }
+
+fn float_to_bool() {
+    X.mov_ri(A, RAX, 0);
+    X.movq_xr(A, 1, RAX);
+    X.ucomisd(A, 0, 1);
+    X.setcc(A, X.CC_NE, RAX);
+    X.setcc(A, X.CC_P, RCX);
+    X.alu_rr(A, X.ALU_OR, RAX, RCX);
+    X.movzx8(A, RAX, RAX);
+}
+
+/// rax (an integer of type `from`) -> xmm0 as a double
+fn int_to_float(fromty: string) {
+    if (fromty == "u64") {
+        let big = X.new_label(A);
+        let done = X.new_label(A);
+        X.test_rr(A, RAX, RAX);
+        X.jcc(A, X.CC_L, big);
+        X.cvtsi2sd(A, 0, RAX);
+        X.jmp(A, done);
+        X.bind(A, big);
+        X.mov_rr(A, RCX, RAX);
+        X.shift_i(A, 5, RCX, 1);
+        X.alu_ri(A, X.ALU_AND, RAX, 1);
+        X.alu_rr(A, X.ALU_OR, RCX, RAX);
+        X.cvtsi2sd(A, 0, RCX);
+        X.sse_arith(A, 0x58, 0, 0);
+        X.bind(A, done);
+    } else { X.cvtsi2sd(A, 0, RAX); }
+}
+
+// ---------------------------------------------------------------- expressions
+/// Evaluate `n` and convert to type `ty` (int -> float, anything -> bool).
+fn gen_to(n, ty: string) {
+    let nt = rv(n["ty"]);
+    if (floaty(ty)) {
+        if (floaty(nt)) { gen(n); } else { gen(n); int_to_float(nt); }
+        return;
+    }
+    if (ty == "bool" && nt != "bool") {
+        gen(n);
+        if (floaty(nt)) { float_to_bool(); } else { to_bool_rax(); }
+        return;
+    }
+    gen(n);
+}
+
+fn is_const_int(n) -> bool { return cvof(n) != null && !floaty(rv(n["ty"])); }
+fn is_local_scalar(n) -> bool {
+    return n["t"] == "id" && n["sym"]["kind"] == "local" && !n["sym"]["agg"] && !floaty(n["sym"]["ty"]) && n["sym"]["ty"] != "f32";
+}
+fn is_simple_float(n) -> bool {
+    if (cvof(n) != null && floaty(rv(n["ty"]))) { return true; }
+    return n["t"] == "id" && n["sym"]["kind"] == "local" && n["sym"]["ty"] == "float";
+}
+
+/// lhs -> rax, rhs -> rcx (both integers / pointers)
+fn gen_int_operands(l, r) {
+    if (is_const_int(r)) { gen(l); X.mov_ri(A, RCX, cvof(r)); return; }
+    if (is_local_scalar(r)) { gen(l); load_reg_local(r["sym"]["ty"], RCX, r["sym"]["off"]); return; }
+    let mark = cur;
+    let t = tmp_alloc();
+    gen(l);
+    X.mov_store64(A, RBP, t, RAX);
+    gen(r);
+    X.mov_rr(A, RCX, RAX);
+    X.mov_load64(A, RAX, RBP, t);
+    cur = mark;
+}
+
+/// lhs -> xmm0, rhs -> xmm1 (both converted to double)
+fn gen_float_operands(l, r) {
+    let mark = cur;
+    let t = tmp_alloc();
+    gen_to(l, "float");
+    X.movsd_store(A, RBP, t, 0);
+    gen_to(r, "float");
+    X.movapd(A, 1, 0);
+    X.movsd_load(A, 0, RBP, t);
+    cur = mark;
+}
+
+fn cc_for(op: string, unsigned: bool) -> int {
+    if (op == "==") { return X.CC_E; }
+    if (op == "!=") { return X.CC_NE; }
+    if (op == "<") { return unsigned ? X.CC_B : X.CC_L; }
+    if (op == "<=") { return unsigned ? X.CC_BE : X.CC_LE; }
+    if (op == ">") { return unsigned ? X.CC_A : X.CC_G; }
+    return unsigned ? X.CC_AE : X.CC_GE;
+}
+
+/// Float comparison; result in rax as 0/1.
+fn float_compare(op: string) {
+    // operands are in xmm0 (a) and xmm1 (b)
+    if (op == "==") {
+        X.ucomisd(A, 0, 1); X.setcc(A, X.CC_E, RAX); X.setcc(A, X.CC_NP, RCX); X.alu_rr(A, X.ALU_AND, RAX, RCX);
+    } else if (op == "!=") {
+        X.ucomisd(A, 0, 1); X.setcc(A, X.CC_NE, RAX); X.setcc(A, X.CC_P, RCX); X.alu_rr(A, X.ALU_OR, RAX, RCX);
+    } else if (op == "<") { X.ucomisd(A, 1, 0); X.setcc(A, X.CC_A, RAX); }
+    else if (op == "<=") { X.ucomisd(A, 1, 0); X.setcc(A, X.CC_AE, RAX); }
+    else if (op == ">") { X.ucomisd(A, 0, 1); X.setcc(A, X.CC_A, RAX); }
+    else { X.ucomisd(A, 0, 1); X.setcc(A, X.CC_AE, RAX); }
+    X.movzx8(A, RAX, RAX);
+}
+
+fn gen_bin(n) {
+    let cls = n["cls"];
+    let op = n["op"];
+    if (cls == "logic") {
+        let lf = X.new_label(A);
+        let end = X.new_label(A);
+        cond_jump(n, lf, false);
+        X.mov_ri(A, RAX, 1);
+        X.jmp(A, end);
+        X.bind(A, lf);
+        X.mov_ri(A, RAX, 0);
+        X.bind(A, end);
+        return;
+    }
+    if (cls == "cmp_float") {
+        gen_float_operands(n["l"], n["r"]);
+        float_compare(op);
+        return;
+    }
+    if (cls == "cmp_int" || cls == "cmp_uint") {
+        gen_int_operands(n["l"], n["r"]);
+        X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+        X.setcc(A, cc_for(op, cls == "cmp_uint"), RAX);
+        X.movzx8(A, RAX, RAX);
+        return;
+    }
+    if (cls == "float") {
+        gen_float_operands(n["l"], n["r"]);
+        let code = (op == "+") ? 0x58 : ((op == "-") ? 0x5C : ((op == "*") ? 0x59 : 0x5E));
+        X.sse_arith(A, code, 0, 1);
+        return;
+    }
+    gen_int_operands(n["l"], n["r"]);
+    if (cls == "ptr_add" || cls == "ptr_sub") {
+        if (n["scale"] != 1) { X.imul_ri(A, RCX, RCX, n["scale"]); }
+        X.alu_rr(A, cls == "ptr_add" ? X.ALU_ADD : X.ALU_SUB, RAX, RCX);
+    } else if (cls == "int_ptr_add") {
+        if (n["scale"] != 1) { X.imul_ri(A, RAX, RAX, n["scale"]); }
+        X.alu_rr(A, X.ALU_ADD, RAX, RCX);
+    } else if (cls == "ptr_diff") {
+        X.alu_rr(A, X.ALU_SUB, RAX, RCX);
+        if (n["scale"] > 1) {
+            X.cqo(A);
+            X.mov_ri(A, RCX, n["scale"]);
+            X.idiv_r(A, RCX);
+        }
+    } else if (cls == "shl" || cls == "sar" || cls == "shr") {
+        X.shift_cl(A, cls == "shl" ? 4 : (cls == "shr" ? 5 : 7), RAX);
+    } else {
+        // integer arithmetic ("int" / "uint") and bitwise
+        if (op == "+") { X.alu_rr(A, X.ALU_ADD, RAX, RCX); }
+        else if (op == "-") { X.alu_rr(A, X.ALU_SUB, RAX, RCX); }
+        else if (op == "*") { X.imul_rr(A, RAX, RCX); }
+        else if (op == "&") { X.alu_rr(A, X.ALU_AND, RAX, RCX); }
+        else if (op == "|") { X.alu_rr(A, X.ALU_OR, RAX, RCX); }
+        else if (op == "^") { X.alu_rr(A, X.ALU_XOR, RAX, RCX); }
+        else if (op == "/" || op == "%") {
+            if (cls == "uint") { X.mov_ri(A, RDX, 0); X.div_r(A, RCX); }
+            else { X.cqo(A); X.idiv_r(A, RCX); }
+            if (op == "%") { X.mov_rr(A, RAX, RDX); }
+        }
+    }
+}
+
+/// Jump to `label` when the truth value of `n` equals `when`; fall through otherwise.
+fn cond_jump(n, label: int, when: bool) {
+    let t = n["t"];
+    if (cvof(n) != null && !floaty(rv(n["ty"]))) {
+        if ((cvof(n) != 0) == when) { X.jmp(A, label); }
+        return;
+    }
+    if (t == "un" && n["op"] == "!") { cond_jump(n["e"], label, !when); return; }
+    if (t == "bin") {
+        let cls = n["cls"];
+        if (cls == "logic") {
+            if (n["op"] == "&&") {
+                if (!when) { cond_jump(n["l"], label, false); cond_jump(n["r"], label, false); }
+                else {
+                    let skip = X.new_label(A);
+                    cond_jump(n["l"], skip, false);
+                    cond_jump(n["r"], label, true);
+                    X.bind(A, skip);
+                }
+            } else {
+                if (when) { cond_jump(n["l"], label, true); cond_jump(n["r"], label, true); }
+                else {
+                    let skip = X.new_label(A);
+                    cond_jump(n["l"], skip, true);
+                    cond_jump(n["r"], label, false);
+                    X.bind(A, skip);
+                }
+            }
+            return;
+        }
+        if (cls == "cmp_int" || cls == "cmp_uint") {
+            gen_int_operands(n["l"], n["r"]);
+            X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+            let cc = cc_for(n["op"], cls == "cmp_uint");
+            X.jcc(A, when ? cc : (cc ^ 1), label);
+            return;
+        }
+    }
+    let nt = rv(n["ty"]);
+    gen(n);
+    if (floaty(nt)) { float_to_bool(); }
+    X.test_rr(A, RAX, RAX);
+    X.jcc(A, when ? X.CC_NE : X.CC_E, label);
+}
+
+fn gen_un(n) {
+    let op = n["op"];
+    let e = n["e"];
+    if (op == "&") {
+        let et = e["t"];
+        if (et == "call" || et == "structlit" || et == "arrlit" || et == "arrfill") {
+            // address of a temporary: keep a private copy alive until the enclosing statement ends
+            let size = tsize(e["ty"]);
+            let t = alloc_bytes(r8(size), 16);
+            gen(e);
+            X.lea(A, RCX, RBP, t);
+            emit_copy(size);
+            X.lea(A, RAX, RBP, t);
+            return;
+        }
+        gen_addr(e);
+        return;
+    }
+    if (op == "*") { gen(e); load_at(n["ty"], RAX, 0); return; }
+    if (op == "-") {
+        if (floaty(n["ty"])) {
+            gen_to(e, "float");
+            X.movq_rx(A, RAX, 0);
+            X.mov_ri(A, RCX, -9223372036854775808);
+            X.alu_rr(A, X.ALU_XOR, RAX, RCX);
+            X.movq_xr(A, 0, RAX);
+        } else { gen(e); X.neg_r(A, RAX); }
+        return;
+    }
+    if (op == "!") { gen_to(e, "bool"); X.alu_ri(A, X.ALU_XOR, RAX, 1); return; }
+    if (op == "~") { gen(e); X.not_r(A, RAX); return; }
+}
+
+fn gen_cast(n) {
+    let fromty = n["fromty"];
+    let to = n["ty"];
+    let e = n["e"];
+    gen(e);
+    if (floaty(to)) {
+        if (!floaty(fromty)) { int_to_float(fromty); }
+        return;
+    }
+    if (floaty(fromty)) {
+        if (to == "bool") { float_to_bool(); return; }
+        X.cvttsd2si(A, RAX, 0);
+        if (T.is_int(to) && tsize(to) < 8) { X.extend(A, RAX, tsize(to), tsigned(to)); }
+        return;
+    }
+    if (to == "bool") { if (fromty != "bool") { to_bool_rax(); } return; }
+    if (T.is_int(to) && tsize(to) < 8) { X.extend(A, RAX, tsize(to), tsigned(to)); }
+}
+
+fn gen_cond_expr(n) {
+    let lf = X.new_label(A);
+    let end = X.new_label(A);
+    cond_jump(n["c"], lf, false);
+    gen_to(n["a"], n["ty"]);
+    X.jmp(A, end);
+    X.bind(A, lf);
+    gen_to(n["b"], n["ty"]);
+    X.bind(A, end);
+}
+
+fn sym_ref(g) {
+    return g;
+}
+
+/// rax = address of global `g`
+fn global_addr(g) {
+    if (M.fmt == "elf" && !g["is_static"]) { X.mov_got(A, RAX, g["name"]); }
+    else { X.lea_rip(A, RAX, g["name"], 0); }
+}
+
+/// rax = address of the lvalue `n`
+fn gen_addr(n) {
+    let t = n["t"];
+    if (t == "id") {
+        let s = n["sym"];
+        if (s["kind"] == "local") { X.lea(A, RAX, RBP, s["off"]); }
+        else { global_addr(s); }
+        return;
+    }
+    if (t == "un" && n["op"] == "*") { gen(n["e"]); return; }
+    if (t == "member") {
+        if (n["via_ptr"]) { gen(n["e"]); } else { gen_addr(n["e"]); }
+        if (n["off"] != 0) { X.alu_ri(A, X.ALU_ADD, RAX, n["off"]); }
+        return;
+    }
+    if (t == "index") {
+        let base = n["e"];
+        let idx = n["i"];
+        let esz = n["esize"];
+        if (cvof(idx) != null) {
+            if (n["arr"]) { gen_addr(base); } else { gen(base); }
+            let off = cvof(idx) * esz;
+            if (off != 0) {
+                if (off >= -2147483648 && off <= 2147483647) { X.alu_ri(A, X.ALU_ADD, RAX, off); }
+                else { X.mov_ri(A, RCX, off); X.alu_rr(A, X.ALU_ADD, RAX, RCX); }
+            }
+            return;
+        }
+        let mark = cur;
+        let tb = tmp_alloc();
+        if (n["arr"]) { gen_addr(base); } else { gen(base); }
+        X.mov_store64(A, RBP, tb, RAX);
+        gen(idx);
+        if (esz != 1) { X.imul_ri(A, RAX, RAX, esz); }
+        X.mov_load64(A, RCX, RBP, tb);
+        X.alu_rr(A, X.ALU_ADD, RAX, RCX);
+        cur = mark;
+        return;
+    }
+    if (t == "call" || t == "arrlit" || t == "arrfill" || t == "structlit") { gen(n); return; }
+    throw { message: "internal: not an lvalue: " + t, line: n["line"], col: n["col"], kind: "compile" };
+}
+
+fn str_symbol(bytes) -> string {
+    let key = util.hex_of(bytes);
+    if (M.strs.has(key)) { return M.strs[key]; }
+    let name = ".LC" + str(M.nstr);
+    M.nstr = M.nstr + 1;
+    let off = fbin.size(M.rodata);
+    fbin.seek(M.rodata, 0, "end");
+    fbin.write_bytes(M.rodata, bytes);
+    fbin.write_u8(M.rodata, 0);
+    M.syms.push({ name: name, sec: "rodata", off: off, size: len(bytes) + 1, global: false, kind: "object" });
+    M.strs[key] = name;
+    return name;
+}
+
+fn gen(n) {
+    let t = n["t"];
+    let ty = n["ty"];
+    let cv = cvof(n);
+    if (cv != null) {
+        if (floaty(ty)) { float_const(cv); return; }
+        if (T.is_int(ty)) { X.mov_ri(A, RAX, cv); return; }
+        // ptr-typed constants never occur
+    }
+    if (t == "int") { X.mov_ri(A, RAX, n["v"]); return; }
+    if (t == "null") { X.mov_ri(A, RAX, 0); return; }
+    if (t == "str") { X.lea_rip(A, RAX, str_symbol(n["v"]), 0); return; }
+    if (t == "fnref") { X.lea_rip(A, RAX, n["sig"]["name"], 0); return; }
+    if (t == "id") {
+        let s = n["sym"];
+        if (s["kind"] == "local") { load_at(s["ty"], RBP, s["off"]); }
+        else { global_addr(s); load_at(s["ty"], RAX, 0); }
+        return;
+    }
+    if (t == "bin") { gen_bin(n); return; }
+    if (t == "un") { gen_un(n); return; }
+    if (t == "cast") { gen_cast(n); return; }
+    if (t == "cond") { gen_cond_expr(n); return; }
+    if (t == "call") { gen_call(n); return; }
+    if (t == "index" || t == "member") {
+        gen_addr(n);
+        load_at(ty, RAX, 0);
+        return;
+    }
+    if (t == "incdec") { gen_incdec(n); return; }
+    if (t == "comma") { gen(n["l"]); gen(n["r"]); return; }
+    if (t == "coalesce") {
+        let end = X.new_label(A);
+        gen(n["l"]);
+        X.test_rr(A, RAX, RAX);
+        X.jcc(A, X.CC_NE, end);
+        gen_to(n["r"], ty);
+        X.bind(A, end);
+        return;
+    }
+    if (t == "in") { gen_in(n); return; }
+    if (t == "assignx") { gen_assign(n); return; }
+    if (t == "arrlit" || t == "arrfill" || t == "structlit") {
+        let size = tsize(ty);
+        let off = alloc_bytes(size < 1 ? 1 : size, 16);
+        let td = tmp_alloc();
+        X.lea(A, RAX, RBP, off);
+        X.mov_store64(A, RBP, td, RAX);
+        gen_into(td, ty, n);
+        X.lea(A, RAX, RBP, off);
+        return;
+    }
+    if (t == "match") { gen_match(n); return; }
+    throw { message: "internal: cannot generate code for " + t, line: n["line"], col: n["col"], kind: "compile" };
+}
+
+// ---------------------------------------------------------------- aggregates: copy, zero, initialise
+/// copy `size` bytes: rax = source address, rcx = destination address (clobbers rdx, r8, rax, rcx)
+fn emit_copy(size: int) {
+    var off = 0;
+    if (size > 128) {
+        let top = X.new_label(A);
+        X.mov_ri(A, R8, size / 8);
+        X.bind(A, top);
+        X.mov_load64(A, RDX, RAX, 0);
+        X.mov_store64(A, RCX, 0, RDX);
+        X.alu_ri(A, X.ALU_ADD, RAX, 8);
+        X.alu_ri(A, X.ALU_ADD, RCX, 8);
+        X.alu_ri(A, X.ALU_SUB, R8, 1);
+        X.jcc(A, X.CC_NE, top);
+        let rest = size % 8;
+        var done = 0;
+        if (rest >= 4) { X.load_sized(A, RDX, RAX, done, 4, false); X.store_sized(A, RCX, done, RDX, 4); done = done + 4; }
+        if (rest - done >= 2) { X.load_sized(A, RDX, RAX, done, 2, false); X.store_sized(A, RCX, done, RDX, 2); done = done + 2; }
+        if (rest - done >= 1) { X.load_sized(A, RDX, RAX, done, 1, false); X.store_sized(A, RCX, done, RDX, 1); }
+        return;
+    }
+    while (off + 8 <= size) { X.mov_load64(A, RDX, RAX, off); X.mov_store64(A, RCX, off, RDX); off = off + 8; }
+    if (size - off >= 4) { X.load_sized(A, RDX, RAX, off, 4, false); X.store_sized(A, RCX, off, RDX, 4); off = off + 4; }
+    if (size - off >= 2) { X.load_sized(A, RDX, RAX, off, 2, false); X.store_sized(A, RCX, off, RDX, 2); off = off + 2; }
+    if (size - off >= 1) { X.load_sized(A, RDX, RAX, off, 1, false); X.store_sized(A, RCX, off, RDX, 1); }
+}
+
+/// zero `size` bytes at the address stored in frame slot `td`
+fn zero_dest(td: int, size: int) {
+    X.mov_load64(A, RDX, RBP, td);
+    X.mov_ri(A, RAX, 0);
+    if (size > 128) {
+        let top = X.new_label(A);
+        X.mov_ri(A, R8, size / 8);
+        X.bind(A, top);
+        X.mov_store64(A, RDX, 0, RAX);
+        X.alu_ri(A, X.ALU_ADD, RDX, 8);
+        X.alu_ri(A, X.ALU_SUB, R8, 1);
+        X.jcc(A, X.CC_NE, top);
+        let rest = size % 8;
+        var done = 0;
+        if (rest >= 4) { X.store_sized(A, RDX, done, RAX, 4); done = done + 4; }
+        if (rest - done >= 2) { X.store_sized(A, RDX, done, RAX, 2); done = done + 2; }
+        if (rest - done >= 1) { X.store_sized(A, RDX, done, RAX, 1); }
+        return;
+    }
+    var off = 0;
+    while (off + 8 <= size) { X.mov_store64(A, RDX, off, RAX); off = off + 8; }
+    if (size - off >= 4) { X.store_sized(A, RDX, off, RAX, 4); off = off + 4; }
+    if (size - off >= 2) { X.store_sized(A, RDX, off, RAX, 2); off = off + 2; }
+    if (size - off >= 1) { X.store_sized(A, RDX, off, RAX, 1); }
+}
+
+/// store the address (frame slot `td`) + `off` into a fresh frame slot and return it
+fn derive_slot(td: int, off: int) -> int {
+    let t2 = tmp_alloc();
+    X.mov_load64(A, RAX, RBP, td);
+    if (off != 0) { X.alu_ri(A, X.ALU_ADD, RAX, off); }
+    X.mov_store64(A, RBP, t2, RAX);
+    return t2;
+}
+
+/// Evaluate `e` as a value of type `ty` and store it at the address held in frame slot `td`.
+fn gen_into(td: int, ty: string, e) {
+    let mark = cur;
+    let et = e["t"];
+    if (T.is_array(ty) && et == "arrlit") {
+        let ety = T.elem_of(ty);
+        let esz = tsize(ety);
+        if (e["cnt"] < T.array_len(ty)) { zero_dest(td, tsize(ty)); }
+        var i = 0;
+        for (x in e["elems"]) {
+            let m2 = cur;
+            let t2 = derive_slot(td, i * esz);
+            gen_into(t2, ety, x);
+            cur = m2;
+            i = i + 1;
+        }
+    } else if (T.is_array(ty) && et == "arrfill") {
+        let ety = T.elem_of(ty);
+        let esz = tsize(ety);
+        let cnt = e["cnt"];
+        if (cnt < T.array_len(ty)) { zero_dest(td, tsize(ty)); }
+        let ti = tmp_alloc();
+        let t2 = tmp_alloc();
+        X.mov_ri(A, RAX, 0);
+        X.mov_store64(A, RBP, ti, RAX);
+        let top = X.new_label(A);
+        let end = X.new_label(A);
+        X.bind(A, top);
+        X.mov_load64(A, RAX, RBP, ti);
+        X.alu_ri(A, X.ALU_CMP, RAX, cnt);
+        X.jcc(A, X.CC_GE, end);
+        if (esz != 1) { X.imul_ri(A, RAX, RAX, esz); }
+        X.mov_load64(A, RCX, RBP, td);
+        X.alu_rr(A, X.ALU_ADD, RAX, RCX);
+        X.mov_store64(A, RBP, t2, RAX);
+        gen_into(t2, ety, e["v"]);
+        X.mov_load64(A, RAX, RBP, ti);
+        X.alu_ri(A, X.ALU_ADD, RAX, 1);
+        X.mov_store64(A, RBP, ti, RAX);
+        X.jmp(A, top);
+        X.bind(A, end);
+    } else if (et == "structlit") {
+        if (!e["complete"]) { zero_dest(td, tsize(ty)); }
+        for (f in e["sfields"]) {
+            let m2 = cur;
+            let t2 = derive_slot(td, f.off);
+            gen_into(t2, f.ty, f.e);
+            cur = m2;
+        }
+    } else if (is_agg(ty)) {
+        gen(e);                              // address of the source aggregate
+        X.mov_load64(A, RCX, RBP, td);
+        emit_copy(tsize(ty));
+    } else {
+        gen_to(e, ty);
+        X.mov_load64(A, RCX, RBP, td);
+        store_at(ty, RCX, 0);
+    }
+    cur = mark;
+}
+
+// ---------------------------------------------------------------- ++ / -- as expressions, `in`
+fn gen_incdec(n) {
+    let tty = n["ty"];
+    let e = n["e"];
+    let mark = cur;
+    let ta = tmp_alloc();
+    let tv = tmp_alloc();
+    gen_addr(e);
+    X.mov_store64(A, RBP, ta, RAX);
+    load_at(tty, RAX, 0);
+    let dec = n["op"] == "--";
+    if (floaty(tty)) {
+        X.movsd_store(A, RBP, tv, 0);
+        X.mov_ri(A, RAX, util.f64_bits(1.0));
+        X.movq_xr(A, 1, RAX);
+        X.sse_arith(A, dec ? 0x5C : 0x58, 0, 1);
+    } else {
+        X.mov_store64(A, RBP, tv, RAX);
+        X.alu_ri(A, dec ? X.ALU_SUB : X.ALU_ADD, RAX, n["step"]);
+    }
+    X.mov_load64(A, RCX, RBP, ta);
+    store_at(tty, RCX, 0);
+    if (n["prefix"]) { X.mov_load64(A, RCX, RBP, ta); load_at(tty, RCX, 0); }
+    else if (floaty(tty)) { X.movsd_load(A, 0, RBP, tv); }
+    else { X.mov_load64(A, RAX, RBP, tv); }
+    cur = mark;
+}
+
+fn gen_in(n) {
+    let mark = cur;
+    let tv = tmp_alloc();
+    let tb = tmp_alloc();
+    let ti = tmp_alloc();
+    gen(n["l"]);
+    X.mov_store64(A, RBP, tv, RAX);
+    let top = X.new_label(A);
+    let found = X.new_label(A);
+    let nf = X.new_label(A);
+    let end = X.new_label(A);
+    if (n["mode"] == "arr") {
+        gen_addr(n["r"]);
+        X.mov_store64(A, RBP, tb, RAX);
+        X.mov_ri(A, RAX, 0);
+        X.mov_store64(A, RBP, ti, RAX);
+        X.bind(A, top);
+        X.mov_load64(A, RAX, RBP, ti);
+        X.alu_ri(A, X.ALU_CMP, RAX, n["alen"]);
+        X.jcc(A, X.CC_GE, nf);
+        if (n["esize"] != 1) { X.imul_ri(A, RAX, RAX, n["esize"]); }
+        X.mov_load64(A, RCX, RBP, tb);
+        X.alu_rr(A, X.ALU_ADD, RAX, RCX);
+        load_at(n["ety"], RAX, 0);
+        X.mov_load64(A, RCX, RBP, tv);
+        X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+        X.jcc(A, X.CC_E, found);
+        X.mov_load64(A, RAX, RBP, ti);
+        X.alu_ri(A, X.ALU_ADD, RAX, 1);
+        X.mov_store64(A, RBP, ti, RAX);
+        X.jmp(A, top);
+    } else {
+        gen(n["r"]);
+        X.mov_store64(A, RBP, tb, RAX);
+        X.bind(A, top);
+        X.mov_load64(A, RAX, RBP, tb);
+        X.load_sized(A, RAX, RAX, 0, 1, false);
+        X.test_rr(A, RAX, RAX);
+        X.jcc(A, X.CC_E, nf);
+        X.mov_load64(A, RCX, RBP, tv);
+        X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+        X.jcc(A, X.CC_E, found);
+        X.mov_load64(A, RAX, RBP, tb);
+        X.alu_ri(A, X.ALU_ADD, RAX, 1);
+        X.mov_store64(A, RBP, tb, RAX);
+        X.jmp(A, top);
+    }
+    X.bind(A, found);
+    X.mov_ri(A, RAX, 1);
+    X.jmp(A, end);
+    X.bind(A, nf);
+    X.mov_ri(A, RAX, 0);
+    X.bind(A, end);
+    cur = mark;
+}
+
+// ---------------------------------------------------------------- match
+fn gen_match(n) {
+    let mark = cur;
+    let ts = tmp_alloc();
+    gen(n["e"]);
+    X.mov_store64(A, RBP, ts, RAX);
+    let arms = n["arms"];
+    let labels = [];
+    for (a in arms) { labels.push(X.new_label(A)); }
+    let nomatch = X.new_label(A);
+    let end = X.new_label(A);
+    var i = 0;
+    var wild = false;
+    for (a in arms) {
+        if (wild) { break; }
+        var j = 0;
+        for (p in a["pats"]) {
+            if (p["t"] == "wild") { X.jmp(A, labels[i]); wild = true; break; }
+            X.mov_ri(A, RCX, a["consts"][j]);
+            X.mov_load64(A, RAX, RBP, ts);
+            X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+            X.jcc(A, X.CC_E, labels[i]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (!wild) { X.jmp(A, nomatch); }
+    let ty = n["ty"];
+    i = 0;
+    for (a in arms) {
+        X.bind(A, labels[i]);
+        let b = a["body"];
+        if (a["is_stmt"]) {
+            if (b["t"] == "block") { gen_block(b); }
+            else if (b["t"] == "assign") { gen_assign(b); }
+            else { gen(b); }
+        } else if (n["is_value"]) { gen_to(b, ty); }
+        else { gen(b); }
+        X.jmp(A, end);
+        i = i + 1;
+    }
+    X.bind(A, nomatch);
+    if (n["is_value"]) {
+        X.mov_ri(A, RAX, 0);
+        if (floaty(ty)) { X.movq_xr(A, 0, RAX); }
+    }
+    X.bind(A, end);
+    cur = mark;
+}
+
+// ---------------------------------------------------------------- calls
+const SYSV_INT = [7, 6, 2, 1, 8, 9];
+const WIN_INT = [1, 2, 8, 9];
+
+/// flatten the scalar leaves of an aggregate: [{ off, fl }]
+fn leaves(ty: string, base: int, out) {
+    if (T.is_array(ty)) {
+        let el = T.elem_of(ty);
+        let esz = tsize(el);
+        var i = 0;
+        while (i < T.array_len(ty)) { leaves(el, base + i * esz, out); i = i + 1; }
+    } else if (C.structs.has(ty)) {
+        for (f in C.structs[ty].fields) { leaves(f.ty, base + f.off, out); }
+    } else { out.push({ off: base, fl: floaty(ty) }); }
+}
+
+/// SysV: the class ("i" / "f") of each eightbyte of a small struct, or null when it is passed in memory
+fn eightbytes(ty: string) {
+    let size = tsize(ty);
+    if (size == 0 || size > 16) { return null; }
+    if (C.structs.has(ty) && C.structs[ty]["packed"] == true) { return null; }
+    let ls = [];
+    leaves(ty, 0, ls);
+    let out = [];
+    var b = 0;
+    while (b * 8 < size) {
+        var any_leaf = false;
+        var any_int = false;
+        for (lf in ls) { if (lf.off / 8 == b) { any_leaf = true; if (!lf.fl) { any_int = true; } } }
+        out.push((any_int || !any_leaf) ? "i" : "f");
+        b = b + 1;
+    }
+    return out;
+}
+
+fn r8(size: int) -> int { return util.align_up(size < 1 ? 1 : size, 8); }
+
+/// true when a struct return value travels through a hidden pointer
+fn ret_in_memory(ty: string) -> bool {
+    if (!C.structs.has(ty)) { return false; }
+    let size = tsize(ty);
+    if (win64) { return !(size == 1 || size == 2 || size == 4 || size == 8); }
+    return eightbytes(ty) == null;
+}
+
+/// Where does each argument go? items: [{ k: "i" | "f" | "a", ty }]
+/// placements: reg {reg,float} | stack {off} | aregs {regs:[{reg,float}]} | astack {off,size} | aptr {reg} | astackptr {off}
+fn place(items) {
+    let pl = [];
+    var ni = 0;
+    var nf = 0;
+    var soff = 0;
+    var p = 0;
+    for (it in items) {
+        if (it.k == "a") {
+            let size = tsize(it.ty);
+            if (win64) {
+                if (size == 1 || size == 2 || size == 4 || size == 8) {
+                    if (p < 4) { pl.push({ where: "aregs", regs: [{ reg: WIN_INT[p], float: false }] }); }
+                    else { pl.push({ where: "astack", off: soff, size: 8 }); soff = soff + 8; }
+                } else {
+                    if (p < 4) { pl.push({ where: "aptr", reg: WIN_INT[p] }); }
+                    else { pl.push({ where: "astackptr", off: soff }); soff = soff + 8; }
+                }
+            } else {
+                let cl = eightbytes(it.ty);
+                var done = false;
+                if (cl != null) {
+                    var ci = 0;
+                    var cf = 0;
+                    for (c in cl) { if (c == "i") { ci = ci + 1; } else { cf = cf + 1; } }
+                    if (ni + ci <= 6 && nf + cf <= 8) {
+                        let regs = [];
+                        for (c in cl) {
+                            if (c == "i") { regs.push({ reg: SYSV_INT[ni], float: false }); ni = ni + 1; }
+                            else { regs.push({ reg: nf, float: true }); nf = nf + 1; }
+                        }
+                        pl.push({ where: "aregs", regs: regs });
+                        done = true;
+                    }
+                }
+                if (!done) { pl.push({ where: "astack", off: soff, size: r8(size) }); soff = soff + r8(size); }
+            }
+        } else if (win64) {
+            if (p < 4) { pl.push({ where: "reg", float: it.k == "f", reg: it.k == "f" ? p : WIN_INT[p] }); }
+            else { pl.push({ where: "stack", float: it.k == "f", off: soff }); soff = soff + 8; }
+        } else if (it.k == "f") {
+            if (nf < 8) { pl.push({ where: "reg", float: true, reg: nf }); nf = nf + 1; }
+            else { pl.push({ where: "stack", float: true, off: soff }); soff = soff + 8; }
+        } else {
+            if (ni < 6) { pl.push({ where: "reg", float: false, reg: SYSV_INT[ni] }); ni = ni + 1; }
+            else { pl.push({ where: "stack", float: false, off: soff }); soff = soff + 8; }
+        }
+        p = p + 1;
+    }
+    return { pl: pl, stack: soff, nf: nf };
+}
+
+fn item_for(ty: string) {
+    if (C.structs.has(ty)) { return { k: "a", ty: ty }; }
+    return { k: floaty(ty) ? "f" : "i", ty: ty };
+}
+
+fn gen_call(n) {
+    let kind = n["kind"];
+    if (kind == "builtin") {
+        let bi = n["builtin"];
+        if (util.starts_with(bi, "k:")) { gen_intrinsic(n, bi[2..len(bi)]); return; }
+        if (bi == "sqrt") { gen_to(n["args"][0], "float"); X.sse_arith(A, 0x51, 0, 0); }
+        else if (bi == "fabs") {
+            gen_to(n["args"][0], "float");
+            X.movq_rx(A, RAX, 0); X.shift_i(A, 4, RAX, 1); X.shift_i(A, 5, RAX, 1); X.movq_xr(A, 0, RAX);
+        } else {
+            gen(n["args"][0]);
+            X.mov_rr(A, RCX, RAX); X.shift_i(A, 7, RCX, 63);
+            X.alu_rr(A, X.ALU_XOR, RAX, RCX); X.alu_rr(A, X.ALU_SUB, RAX, RCX);
+        }
+        return;
+    }
+    let indirect = (kind == "indirect");
+    var sig = null;
+    var ptys = [];
+    var variadic = false;
+    if (indirect) { ptys = n["fparams"]; } else { sig = n["sig"]; ptys = sig.params; variadic = sig.variadic; }
+    let args = n["cargs"];
+    let np = len(ptys);
+    let rt = n["ty"];
+    let mark = cur;
+    var tf = 0;
+    if (indirect) {
+        tf = tmp_alloc();
+        gen(n["f"]);
+        X.mov_store64(A, RBP, tf, RAX);
+    }
+    // result buffer + hidden pointer for a struct returned in memory
+    let retagg = C.structs.has(rt);
+    var rtmp = 0;
+    let items = [];
+    let temps = [];
+    let tys = [];
+    if (retagg) {
+        rtmp = alloc_bytes(r8(tsize(rt)) + 8, 16);
+        if (ret_in_memory(rt)) {
+            let th = tmp_alloc();
+            X.lea(A, RAX, RBP, rtmp);
+            X.mov_store64(A, RBP, th, RAX);
+            items.push({ k: "i", ty: "*u8" });
+            temps.push(th);
+            tys.push("*u8");
+        }
+    }
+    let first_arg = len(items);
+    var i = 0;
+    for (a in args) {
+        var pty = "";
+        if (i < np) { pty = ptys[i]; } else { pty = rv(a["ty"]); }
+        if (C.structs.has(pty)) {
+            // copy the struct now: later arguments cannot change it
+            let t = alloc_bytes(r8(tsize(pty)), 16);
+            gen(a);
+            X.lea(A, RCX, RBP, t);
+            emit_copy(tsize(pty));
+            items.push({ k: "a", ty: pty });
+            temps.push(t);
+        } else {
+            let t = tmp_alloc();
+            gen_to(a, pty);
+            if (floaty(pty)) { X.movsd_store(A, RBP, t, 0); } else { X.mov_store64(A, RBP, t, RAX); }
+            items.push({ k: floaty(pty) ? "f" : "i", ty: pty });
+            temps.push(t);
+        }
+        tys.push(pty);
+        i = i + 1;
+    }
+    let pr = place(items);
+    let pl = pr.pl;
+    let shadow = win64 ? 32 : 0;
+    let total = util.align_up(shadow + pr.stack, 16);
+    if (total > 0) { X.alu_ri(A, X.ALU_SUB, RSP, total); }
+    i = 0;
+    for (c in pl) {
+        let t = temps[i];
+        if (c.where == "stack") {
+            X.mov_load64(A, RAX, RBP, t);
+            X.mov_store64(A, RSP, shadow + c.off, RAX);
+        } else if (c.where == "astack") {
+            X.lea(A, RAX, RBP, t);
+            X.lea(A, RCX, RSP, shadow + c.off);
+            emit_copy(c.size);
+        } else if (c.where == "astackptr") {
+            X.lea(A, RAX, RBP, t);
+            X.mov_store64(A, RSP, shadow + c.off, RAX);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (c in pl) {
+        let t = temps[i];
+        if (c.where == "reg") {
+            if (c.float) {
+                X.movsd_load(A, c.reg, RBP, t);
+                if (win64 && variadic && i >= np + first_arg) { X.movq_rx(A, WIN_INT[c.reg], c.reg); }
+            } else { X.mov_load64(A, c.reg, RBP, t); }
+        } else if (c.where == "aregs") {
+            var j = 0;
+            for (r in c.regs) {
+                if (r.float) { X.movsd_load(A, r.reg, RBP, t + 8 * j); } else { X.mov_load64(A, r.reg, RBP, t + 8 * j); }
+                j = j + 1;
+            }
+        } else if (c.where == "aptr") { X.lea(A, c.reg, RBP, t); }
+        i = i + 1;
+    }
+    if (indirect) {
+        X.mov_load64(A, 11, RBP, tf);
+        X.call_r(A, 11);
+    } else {
+        if (!win64 && sig.is_ext) { X.mov_ri(A, RAX, pr.nf); }
+        if (sig.is_ext) { X.call_ext(A, sig.name); } else { X.call_local(A, sig.name); }
+    }
+    if (total > 0) { X.alu_ri(A, X.ALU_ADD, RSP, total); }
+    cur = mark;
+    if (retagg) {
+        if (!ret_in_memory(rt)) {
+            if (win64) { X.mov_store64(A, RBP, rtmp, RAX); }
+            else {
+                var ni = 0;
+                var nf = 0;
+                var j = 0;
+                for (c in eightbytes(rt)) {
+                    if (c == "i") { X.mov_store64(A, RBP, rtmp + 8 * j, ni == 0 ? RAX : RDX); ni = ni + 1; }
+                    else { X.movsd_store(A, RBP, rtmp + 8 * j, nf); nf = nf + 1; }
+                    j = j + 1;
+                }
+            }
+        }
+        X.lea(A, RAX, RBP, rtmp);
+        return;
+    }
+    if (T.is_int(rt) && tsize(rt) < 8) { X.extend(A, RAX, tsize(rt), tsigned(rt)); }
+}
+
+// ---------------------------------------------------------------- exceptions and defer
+// Handler records live in the frame (40 bytes): [0] previous record  [8] kind (0 catch, 1 defer)  [16] rsp  [24] rbp
+// [32] target address. The chain head and the thrown value are two static words in .bss. `throw` calls
+// __kcc_throw, which unlinks records one by one: a defer record runs its out-of-line thunk, a catch record
+// resumes at the catch label with the frame restored.
+fn eh_head(reg: int) { X.lea_rip(A, reg, "__kcc_eh", 0); }
+
+fn emit_register(rec: int, kind: int, label: int) {
+    eh_head(RCX);
+    X.mov_load64(A, RAX, RCX, 0);
+    X.mov_store64(A, RBP, rec, RAX);
+    X.mov_ri(A, RAX, kind);
+    X.mov_store64(A, RBP, rec + 8, RAX);
+    X.mov_store64(A, RBP, rec + 16, RSP);
+    X.mov_store64(A, RBP, rec + 24, RBP);
+    X.lea_label(A, RAX, label);
+    X.mov_store64(A, RBP, rec + 32, RAX);
+    X.lea(A, RAX, RBP, rec);
+    X.mov_store64(A, RCX, 0, RAX);
+}
+
+fn emit_entry(e) {
+    eh_head(RCX);
+    X.mov_load64(A, RAX, RBP, e["rec"]);
+    X.mov_store64(A, RCX, 0, RAX);
+    if (e["kind"] == "defer") { X.call_label(A, e["label"]); }
+}
+
+/// run (without removing) every pending entry above `depth`, innermost first
+fn emit_unwind(depth: int) {
+    var i = len(dstack) - 1;
+    while (i >= depth) { emit_entry(dstack[i]); i = i - 1; }
+}
+
+fn gen_try(s) {
+    let mark = cur;
+    let rec = alloc_bytes(40, 8);
+    let lcatch = X.new_label(A);
+    let lend = X.new_label(A);
+    emit_register(rec, 0, lcatch);
+    dstack.push({ kind: "try", rec: rec });
+    gen_block(s["body"]);
+    dstack.pop();
+    emit_entry({ kind: "try", rec: rec });
+    X.jmp(A, lend);
+    X.bind(A, lcatch);
+    if (s["vname"] != "") {
+        let sym = s["vsym"];
+        alloc_local(sym);
+        X.lea_rip(A, RCX, "__kcc_exc", 0);
+        X.mov_load64(A, RAX, RCX, 0);
+        X.mov_store64(A, RBP, sym.off, RAX);
+    }
+    gen_block(s["handler"]);
+    X.bind(A, lend);
+    cur = mark;
+}
+
+fn gen_defer(s) {
+    let rec = alloc_bytes(40, 8);
+    let label = X.new_label(A);
+    emit_register(rec, 1, label);
+    dstack.push({ kind: "defer", rec: rec, label: label });
+    pending.push({ label: label, body: s["body"] });
+}
+
+/// the shared throw routine: value in rax
+fn gen_throw_routine() {
+    let saveA = A;
+    A = X.new_asm();
+    eh_head(RCX);
+    X.lea_rip(A, RDX, "__kcc_exc", 0);
+    X.mov_store64(A, RDX, 0, RAX);
+    let top = X.new_label(A);
+    let isdefer = X.new_label(A);
+    let uncaught = X.new_label(A);
+    X.bind(A, top);
+    eh_head(RCX);
+    X.mov_load64(A, RAX, RCX, 0);
+    X.test_rr(A, RAX, RAX);
+    X.jcc(A, X.CC_E, uncaught);
+    X.mov_load64(A, RDX, RAX, 0);
+    X.mov_store64(A, RCX, 0, RDX);
+    X.mov_load64(A, RSP, RAX, 16);
+    X.mov_load64(A, RBP, RAX, 24);
+    X.mov_load64(A, RDX, RAX, 8);
+    X.test_rr(A, RDX, RDX);
+    X.jcc(A, X.CC_NE, isdefer);
+    X.jmp_mem(A, RAX, 32);
+    X.bind(A, isdefer);
+    X.call_mem(A, RAX, 32);
+    X.jmp(A, top);
+    X.bind(A, uncaught);
+    if (M.target == "linux") {
+        let msg = [117, 110, 99, 97, 117, 103, 104, 116, 32, 101, 120, 99, 101, 112, 116, 105, 111, 110, 10];   // "uncaught exception\n"
+        X.lea_rip(A, 6, str_symbol(msg), 0);
+        X.mov_ri(A, 7, 2);
+        X.mov_ri(A, RDX, len(msg));
+        X.mov_ri(A, RAX, 1);
+        X.syscall(A);
+        X.mov_ri(A, 7, 70);
+        X.mov_ri(A, RAX, 231);
+        X.syscall(A);
+    }
+    X.ud2(A);
+    X.finish(A);
+    place_function("__kcc_throw", null, A, true);
+    A = saveA;
+}
+
+
+// ---------------------------------------------------------------- freestanding intrinsics
+/// Inline machine code for the bare-metal intrinsics (port I/O, cli/sti/hlt, lidt/lgdt/ltr, control registers, cpuid, ISR stubs).
+fn gen_intrinsic(n, name: string) {
+    let args = n["args"];
+    let mark = cur;
+    if (name == "inb" || name == "inw" || name == "inl") {
+        gen(args[0]); X.mov_rr(A, RDX, RAX); X.mov_ri(A, RAX, 0);
+        if (name == "inb") { X.b(A, 0xEC); } else if (name == "inw") { X.b(A, 0x66); X.b(A, 0xED); } else { X.b(A, 0xED); }
+    } else if (name == "outb" || name == "outw" || name == "outl") {
+        let t = tmp_alloc();
+        gen(args[0]); X.mov_store64(A, RBP, t, RAX);
+        gen(args[1]); X.mov_load64(A, RDX, RBP, t);
+        if (name == "outb") { X.b(A, 0xEE); } else if (name == "outw") { X.b(A, 0x66); X.b(A, 0xEF); } else { X.b(A, 0xEF); }
+    } else if (name == "cli") { X.b(A, 0xFA); }
+    else if (name == "sti") { X.b(A, 0xFB); }
+    else if (name == "hlt") { X.b(A, 0xF4); }
+    else if (name == "pause") { X.b(A, 0xF3); X.b(A, 0x90); }
+    else if (name == "int3") { X.b(A, 0xCC); }
+    else if (name == "lidt") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x01); X.b(A, 0x18); }      // lidt [rax]
+    else if (name == "lgdt") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x01); X.b(A, 0x10); }      // lgdt [rax]
+    else if (name == "invlpg") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x01); X.b(A, 0x38); }    // invlpg [rax]
+    else if (name == "ltr") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x00); X.b(A, 0xD8); }       // ltr ax
+    else if (name == "rdtsc") {
+        X.b(A, 0x0F); X.b(A, 0x31); X.shift_i(A, 4, RDX, 32); X.alu_rr(A, X.ALU_OR, RAX, RDX);
+    }
+    else if (name == "read_cr0") { X.b(A, 0x0F); X.b(A, 0x20); X.b(A, 0xC0); }
+    else if (name == "read_cr2") { X.b(A, 0x0F); X.b(A, 0x20); X.b(A, 0xD0); }
+    else if (name == "read_cr3") { X.b(A, 0x0F); X.b(A, 0x20); X.b(A, 0xD8); }
+    else if (name == "write_cr3") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x22); X.b(A, 0xD8); }
+    else if (name == "read_cr4") { X.b(A, 0x0F); X.b(A, 0x20); X.b(A, 0xE0); }
+    else if (name == "write_cr4") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x22); X.b(A, 0xE0); }
+    else if (name == "write_cr0") { gen(args[0]); X.b(A, 0x0F); X.b(A, 0x22); X.b(A, 0xC0); }
+    else if (name == "read_rflags") { X.b(A, 0x9C); X.b(A, 0x58); }                          // pushfq; pop rax
+    else if (name == "read_rsp") { X.mov_rr(A, RAX, RSP); }
+    else if (name == "ud2") { X.b(A, 0x0F); X.b(A, 0x0B); }
+    else if (name == "mfence") { X.b(A, 0x0F); X.b(A, 0xAE); X.b(A, 0xF0); }
+    else if (name == "lfence") { X.b(A, 0x0F); X.b(A, 0xAE); X.b(A, 0xE8); }
+    else if (name == "sfence") { X.b(A, 0x0F); X.b(A, 0xAE); X.b(A, 0xF8); }
+    else if (name == "wbinvd") { X.b(A, 0x0F); X.b(A, 0x09); }
+    else if (name == "popcnt") { gen(args[0]); X.b(A, 0xF3); X.b(A, 0x48); X.b(A, 0x0F); X.b(A, 0xB8); X.b(A, 0xC0); }
+    else if (name == "bsf" || name == "bsr") {
+        // index of the lowest / highest set bit, -1 for 0
+        gen(args[0]); X.mov_ri(A, RCX, -1);
+        X.b(A, 0x48); X.b(A, 0x0F); X.b(A, name == "bsf" ? 0xBC : 0xBD); X.b(A, 0xC0);       // bsf/bsr rax, rax
+        X.b(A, 0x48); X.b(A, 0x0F); X.b(A, 0x44); X.b(A, 0xC1);                               // cmovz rax, rcx
+    }
+    else if (name == "rdmsr") {
+        gen(args[0]); X.mov_rr(A, RCX, RAX);
+        X.b(A, 0x0F); X.b(A, 0x32); X.shift_i(A, 4, RDX, 32); X.alu_rr(A, X.ALU_OR, RAX, RDX);
+    }
+    else if (name == "wrmsr") {
+        let t = tmp_alloc();
+        gen(args[0]); X.mov_store64(A, RBP, t, RAX);
+        gen(args[1]); X.mov_rr(A, RDX, RAX); X.shift_i(A, 5, RDX, 32);
+        X.mov_load64(A, RCX, RBP, t);
+        X.b(A, 0x0F); X.b(A, 0x30);
+    }
+    else if (name == "atomic_xchg" || name == "atomic_add") {
+        // atomic_xchg(p: *int, v) / atomic_add(p: *int, v): store, return the OLD value
+        let t = tmp_alloc();
+        gen(args[0]); X.mov_store64(A, RBP, t, RAX);
+        gen(args[1]); X.mov_load64(A, RCX, RBP, t);
+        if (name == "atomic_xchg") { X.b(A, 0x48); X.b(A, 0x87); X.b(A, 0x01); }                         // xchg [rcx], rax
+        else { X.b(A, 0xF0); X.b(A, 0x48); X.b(A, 0x0F); X.b(A, 0xC1); X.b(A, 0x01); }                  // lock xadd [rcx], rax
+    }
+    else if (name == "atomic_cas") {
+        // atomic_cas(p: *int, expected, new) -> old value (== expected on success)
+        let t1 = tmp_alloc();
+        let t2 = tmp_alloc();
+        gen(args[0]); X.mov_store64(A, RBP, t1, RAX);
+        gen(args[1]); X.mov_store64(A, RBP, t2, RAX);
+        gen(args[2]); X.mov_rr(A, RDX, RAX);
+        X.mov_load64(A, RAX, RBP, t2); X.mov_load64(A, RCX, RBP, t1);
+        X.b(A, 0xF0); X.b(A, 0x48); X.b(A, 0x0F); X.b(A, 0xB1); X.b(A, 0x11);                          // lock cmpxchg [rcx], rdx
+    }
+    else if (name == "insw_rep" || name == "outsw_rep") {
+        // insw_rep(port, buf, count) / outsw_rep(port, buf, count): `rep insw` / `rep outsw` (16-bit words)
+        let t1 = tmp_alloc();
+        let t2 = tmp_alloc();
+        gen(args[0]); X.mov_store64(A, RBP, t1, RAX);
+        gen(args[1]); X.mov_store64(A, RBP, t2, RAX);
+        gen(args[2]); X.mov_rr(A, RCX, RAX);
+        X.mov_load64(A, RDX, RBP, t1);
+        if (name == "insw_rep") { X.mov_load64(A, 7, RBP, t2); X.b(A, 0xF3); X.b(A, 0x66); X.b(A, 0x6D); }
+        else { X.mov_load64(A, 6, RBP, t2); X.b(A, 0xF3); X.b(A, 0x66); X.b(A, 0x6F); }
+    }
+    else if (name == "fnaddr") { X.lea_rip(A, RAX, n["fn"], 0); }
+    else if (name == "callp") {
+        // callp(address, a1 .. a6): call a function through its address (see fnaddr), SysV register arguments, result in rax
+        var temps = [];
+        for (a in args) { let t = tmp_alloc(); temps.push(t); gen(a); X.mov_store64(A, RBP, t, RAX); }
+        var k = 1;
+        while (k < len(args)) { X.mov_load64(A, SYSV_INT[k - 1], RBP, temps[k]); k = k + 1; }
+        X.mov_load64(A, 11, RBP, temps[0]);
+        X.b(A, 0x41); X.b(A, 0xFF); X.b(A, 0xD3);                                                       // call r11
+    }
+    else if (name == "cpuid") {
+        // cpuid(leaf, out: *u32): out[0..3] = eax, ebx, ecx, edx
+        let t = tmp_alloc();
+        gen(args[0]); X.mov_store64(A, RBP, t, RAX);
+        gen(args[1]); X.mov_rr(A, 6, RAX);                       // rsi = out
+        X.mov_load64(A, RAX, RBP, t); X.mov_ri(A, RCX, 0);
+        X.b(A, 0x53); X.b(A, 0x0F); X.b(A, 0xA2);                // push rbx; cpuid
+        X.store_sized(A, 6, 0, RAX, 4); X.store_sized(A, 6, 4, 3, 4);
+        X.store_sized(A, 6, 8, RCX, 4); X.store_sized(A, 6, 12, RDX, 4);
+        X.b(A, 0x5B);                                            // pop rbx
+    }
+    else if (name == "isr_stub") {
+        // address of the interrupt entry stub for a vector (emitted by the kcos linker, 16 bytes apart)
+        gen(args[0]); X.shift_i(A, 4, RAX, 4);
+        X.lea_rip(A, RCX, "__kc_isr_base", 0); X.alu_rr(A, X.ALU_ADD, RAX, RCX);
+    }
+    else { util.fail("internal: unknown intrinsic " + name, n["line"], n["col"]); }
+    cur = mark;
+}
+
+// ---------------------------------------------------------------- statements
+fn zero_fill(off: int, size: int) {
+    let words = util.align_up(size, 8) / 8;
+    X.mov_ri(A, RAX, 0);
+    if (words <= 4) {
+        var w = 0;
+        while (w < words) { X.mov_store64(A, RBP, off + 8 * w, RAX); w = w + 1; }
+        return;
+    }
+    let top = X.new_label(A);
+    X.lea(A, RDX, RBP, off);
+    X.mov_ri(A, RCX, words);
+    X.bind(A, top);
+    X.mov_store64(A, RDX, 0, RAX);
+    X.alu_ri(A, X.ALU_ADD, RDX, 8);
+    X.alu_ri(A, X.ALU_SUB, RCX, 1);
+    X.jcc(A, X.CC_NE, top);
+}
+
+fn gen_block(b) {
+    let mark = cur;
+    let base = len(dstack);
+    for (s in b["body"]) { gen_stmt(s); }
+    while (len(dstack) > base) { emit_entry(dstack.pop()); }
+    cur = mark;
+}
+
+fn gen_assign(s) {
+    let target = s["target"];
+    let tty = target["ty"];
+    let op = s["op"];
+    if (op == "=") {
+        if (s["agg"] == true) {
+            let mark = cur;
+            let size = tsize(tty);
+            let v = s["value"];
+            let vt = v["t"];
+            let ts = tmp_alloc();
+            if (vt == "arrlit" || vt == "arrfill" || vt == "structlit") {
+                let off = alloc_bytes(size < 1 ? 1 : size, 16);
+                let td = tmp_alloc();
+                X.lea(A, RAX, RBP, off);
+                X.mov_store64(A, RBP, td, RAX);
+                gen_into(td, tty, v);
+                X.lea(A, RAX, RBP, off);
+            } else { gen(v); }
+            X.mov_store64(A, RBP, ts, RAX);
+            gen_addr(target);
+            X.mov_rr(A, RCX, RAX);
+            X.mov_load64(A, RAX, RBP, ts);
+            emit_copy(size);
+            cur = mark;
+            return;
+        }
+        if (target["t"] == "id" && target["sym"]["kind"] == "local") {
+            gen_to(s["value"], tty);
+            store_at(tty, RBP, target["sym"]["off"]);
+            if (T.is_int(tty) && tsize(tty) < 8) { X.extend(A, RAX, tsize(tty), tsigned(tty)); }
+            return;
+        }
+        let mark = cur;
+        let ta = tmp_alloc();
+        gen_to(s["value"], tty);
+        if (floaty(tty)) { X.movsd_store(A, RBP, ta, 0); } else { X.mov_store64(A, RBP, ta, RAX); }
+        // evaluate the address after the value (rcx keeps it)
+        gen_addr(target);
+        X.mov_rr(A, RCX, RAX);
+        if (floaty(tty)) { X.movsd_load(A, 0, RBP, ta); } else { X.mov_load64(A, RAX, RBP, ta); }
+        store_at(tty, RCX, 0);
+        if (T.is_int(tty) && tsize(tty) < 8) { X.extend(A, RAX, tsize(tty), tsigned(tty)); }
+        cur = mark;
+        return;
+    }
+    // compound assignment: target op= value
+    let bop = op[0..len(op) - 1];
+    let mark = cur;
+    let ta = tmp_alloc();
+    let tv = tmp_alloc();
+    gen_addr(target);
+    X.mov_store64(A, RBP, ta, RAX);
+    load_at(tty, RAX, 0);
+    let cls = s["cls"];
+    if (cls == "float") {
+        X.movsd_store(A, RBP, tv, 0);
+        gen_to(s["value"], "float");
+        X.movapd(A, 1, 0);
+        X.movsd_load(A, 0, RBP, tv);
+        let code = (bop == "+") ? 0x58 : ((bop == "-") ? 0x5C : ((bop == "*") ? 0x59 : 0x5E));
+        X.sse_arith(A, code, 0, 1);
+    } else {
+        X.mov_store64(A, RBP, tv, RAX);
+        gen(s["value"]);
+        X.mov_rr(A, RCX, RAX);
+        X.mov_load64(A, RAX, RBP, tv);
+        if (cls == "ptr") {
+            if (s["scale"] != 1) { X.imul_ri(A, RCX, RCX, s["scale"]); }
+            X.alu_rr(A, bop == "+" ? X.ALU_ADD : X.ALU_SUB, RAX, RCX);
+        } else if (bop == "+") { X.alu_rr(A, X.ALU_ADD, RAX, RCX); }
+        else if (bop == "-") { X.alu_rr(A, X.ALU_SUB, RAX, RCX); }
+        else if (bop == "*") { X.imul_rr(A, RAX, RCX); }
+        else if (bop == "&") { X.alu_rr(A, X.ALU_AND, RAX, RCX); }
+        else if (bop == "|") { X.alu_rr(A, X.ALU_OR, RAX, RCX); }
+        else if (bop == "^") { X.alu_rr(A, X.ALU_XOR, RAX, RCX); }
+        else if (bop == "<<") { X.shift_cl(A, 4, RAX); }
+        else if (bop == ">>") { X.shift_cl(A, cls == "ushr" ? 5 : 7, RAX); }
+        else if (bop == "/" || bop == "%") {
+            if (cls == "uint") { X.mov_ri(A, RDX, 0); X.div_r(A, RCX); } else { X.cqo(A); X.idiv_r(A, RCX); }
+            if (bop == "%") { X.mov_rr(A, RAX, RDX); }
+        }
+    }
+    X.mov_load64(A, RCX, RBP, ta);
+    store_at(tty, RCX, 0);
+    if (T.is_int(tty) && tsize(tty) < 8) { X.extend(A, RAX, tsize(tty), tsigned(tty)); }
+    cur = mark;
+}
+
+fn find_target(label: string, want_cont: bool, at) {
+    var i = len(loops) - 1;
+    while (i >= 0) {
+        let l = loops[i];
+        if (label != "") { if (l.label == label) { return l; } }
+        else if (!want_cont || l.cont >= 0) { return l; }
+        i = i - 1;
+    }
+    throw { message: "internal: no jump target", line: at["line"], col: at["col"], kind: "compile" };
+}
+
+fn no_jump_in_defer(s) {
+    if (in_thunk) { throw { message: "'" + s["t"] + "' cannot leave a defer block", line: s["line"], col: s["col"], kind: "compile" }; }
+}
+
+fn label_of(name: string) -> int {
+    if (!fn_lbl.has(name)) { fn_lbl[name] = X.new_label(A); }
+    return fn_lbl[name];
+}
+
+fn gen_stmt(s) {
+    let t = s["t"];
+    if (t == "block") { gen_block(s); return; }
+    if (t == "multi") { for (x in s["body"]) { gen_stmt(x); } return; }
+    if (t == "decl") {
+        if (s["skip"] == true) { return; }
+        let sym = s["sym"];
+        alloc_local(sym);
+        if (s["init"] != null) {
+            if (sym.agg) {
+                let m2 = cur;
+                let td = tmp_alloc();
+                X.lea(A, RAX, RBP, sym.off);
+                X.mov_store64(A, RBP, td, RAX);
+                gen_into(td, sym.ty, s["init"]);
+                cur = m2;
+            } else {
+                gen_to(s["init"], sym.ty);
+                store_at(sym.ty, RBP, sym.off);
+            }
+        } else if (sym.agg) { zero_fill(sym.off, tsize(sym.ty)); }
+        else {
+            X.mov_ri(A, RAX, 0);
+            if (floaty(sym.ty)) { X.movq_xr(A, 0, RAX); }
+            store_at(sym.ty, RBP, sym.off);
+        }
+        return;
+    }
+    if (t == "assign") { gen_assign(s); return; }
+    if (t == "expr") { let mark = cur; gen(s["e"]); cur = mark; return; }
+    if (t == "if") {
+        let lelse = X.new_label(A);
+        cond_jump(s["c"], lelse, false);
+        gen_block(s["a"]);
+        if (s["b"] != null) {
+            let lend = X.new_label(A);
+            X.jmp(A, lend);
+            X.bind(A, lelse);
+            gen_stmt(s["b"]);
+            X.bind(A, lend);
+        } else { X.bind(A, lelse); }
+        return;
+    }
+    if (t == "while") {
+        let top = X.new_label(A);
+        let end = X.new_label(A);
+        X.bind(A, top);
+        cond_jump(s["c"], end, false);
+        loops.push({ brk: end, cont: top, label: s["label"], dd: len(dstack) });
+        gen_block(s["body"]);
+        loops.pop();
+        X.jmp(A, top);
+        X.bind(A, end);
+        return;
+    }
+    if (t == "dowhile") {
+        let top = X.new_label(A);
+        let cont = X.new_label(A);
+        let end = X.new_label(A);
+        X.bind(A, top);
+        loops.push({ brk: end, cont: cont, label: s["label"], dd: len(dstack) });
+        gen_block(s["body"]);
+        loops.pop();
+        X.bind(A, cont);
+        cond_jump(s["c"], top, true);
+        X.bind(A, end);
+        return;
+    }
+    if (t == "for") {
+        let mark = cur;
+        if (s["init"] != null) { gen_stmt(s["init"]); }
+        let top = X.new_label(A);
+        let cont = X.new_label(A);
+        let end = X.new_label(A);
+        X.bind(A, top);
+        if (s["cond"] != null) { cond_jump(s["cond"], end, false); }
+        loops.push({ brk: end, cont: cont, label: s["label"], dd: len(dstack) });
+        gen_block(s["body"]);
+        loops.pop();
+        X.bind(A, cont);
+        if (s["step"] != null) { gen_stmt(s["step"]); }
+        X.jmp(A, top);
+        X.bind(A, end);
+        cur = mark;
+        return;
+    }
+    if (t == "forrange") {
+        let mark = cur;
+        let sym = s["sym"];
+        alloc_local(sym);
+        let hi = tmp_alloc();
+        gen(s["lo"]);
+        X.mov_store64(A, RBP, sym.off, RAX);
+        gen(s["hi"]);
+        X.mov_store64(A, RBP, hi, RAX);
+        let top = X.new_label(A);
+        let cont = X.new_label(A);
+        let end = X.new_label(A);
+        X.bind(A, top);
+        X.mov_load64(A, RAX, RBP, sym.off);
+        X.mov_load64(A, RCX, RBP, hi);
+        X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+        X.jcc(A, sym.ty == "u64" ? X.CC_AE : X.CC_GE, end);
+        loops.push({ brk: end, cont: cont, label: s["label"], dd: len(dstack) });
+        gen_block(s["body"]);
+        loops.pop();
+        X.bind(A, cont);
+        X.mov_load64(A, RAX, RBP, sym.off);
+        X.alu_ri(A, X.ALU_ADD, RAX, 1);
+        X.mov_store64(A, RBP, sym.off, RAX);
+        X.jmp(A, top);
+        X.bind(A, end);
+        cur = mark;
+        return;
+    }
+    if (t == "forin") {
+        let mark = cur;
+        let sym = s["sym"];
+        let hid = s["hid"];
+        let hbase = s["hbase"];
+        alloc_local(hbase); alloc_local(hid); alloc_local(sym);
+        if (s["isym"] != null) { alloc_local(s["isym"]); }
+        gen_addr(s["e"]);
+        X.mov_store64(A, RBP, hbase.off, RAX);
+        X.mov_ri(A, RAX, 0);
+        X.mov_store64(A, RBP, hid.off, RAX);
+        let top = X.new_label(A);
+        let cont = X.new_label(A);
+        let end = X.new_label(A);
+        X.bind(A, top);
+        X.mov_load64(A, RAX, RBP, hid.off);
+        X.alu_ri(A, X.ALU_CMP, RAX, s["alen"]);
+        X.jcc(A, X.CC_GE, end);
+        let esz = tsize(s["ety"]);
+        if (esz != 1) { X.imul_ri(A, RAX, RAX, esz); }
+        X.mov_load64(A, RCX, RBP, hbase.off);
+        X.alu_rr(A, X.ALU_ADD, RAX, RCX);
+        if (C.structs.has(s["ety"])) { X.lea(A, RCX, RBP, sym.off); emit_copy(esz); }
+        else {
+            load_at(s["ety"], RAX, 0);
+            store_at(sym.ty, RBP, sym.off);
+        }
+        if (s["isym"] != null) {
+            X.mov_load64(A, RAX, RBP, hid.off);
+            X.mov_store64(A, RBP, s["isym"].off, RAX);
+        }
+        loops.push({ brk: end, cont: cont, label: s["label"], dd: len(dstack) });
+        gen_block(s["body"]);
+        loops.pop();
+        X.bind(A, cont);
+        X.mov_load64(A, RAX, RBP, hid.off);
+        X.alu_ri(A, X.ALU_ADD, RAX, 1);
+        X.mov_store64(A, RBP, hid.off, RAX);
+        X.jmp(A, top);
+        X.bind(A, end);
+        cur = mark;
+        return;
+    }
+    if (t == "switch") { gen_switch(s); return; }
+    if (t == "label") { X.bind(A, label_of(s["name"])); gen_stmt(s["stmt"]); return; }
+    if (t == "goto") { no_jump_in_defer(s); X.jmp(A, label_of(s["name"])); return; }
+    if (t == "return") {
+        no_jump_in_defer(s);
+        if (len(dstack) == 0) {
+            if (s["e"] != null) { gen_return_value(s["e"]); }
+            X.leave(A);
+            X.ret(A);
+            return;
+        }
+        let mark = cur;
+        let tr = tmp_alloc();
+        if (s["e"] != null) {
+            gen_return_value(s["e"]);
+            if (floaty(cur_sig.ret)) { X.movsd_store(A, RBP, tr, 0); } else { X.mov_store64(A, RBP, tr, RAX); }
+        }
+        emit_unwind(0);
+        if (s["e"] != null) {
+            if (floaty(cur_sig.ret)) { X.movsd_load(A, 0, RBP, tr); } else { X.mov_load64(A, RAX, RBP, tr); }
+        }
+        cur = mark;
+        X.leave(A);
+        X.ret(A);
+        return;
+    }
+    if (t == "break" || t == "continue") {
+        no_jump_in_defer(s);
+        let l = find_target(s["label"], t == "continue", s);
+        emit_unwind(l.dd);
+        X.jmp(A, t == "break" ? l.brk : l.cont);
+        return;
+    }
+    if (t == "defer") { gen_defer(s); return; }
+    if (t == "try") { gen_try(s); return; }
+    if (t == "throw") {
+        let mark = cur;
+        gen(s["e"]);
+        X.call_local(A, "__kcc_throw");
+        cur = mark;
+        return;
+    }
+    throw { message: "internal: cannot generate code for statement " + t, line: s["line"], col: s["col"], kind: "compile" };
+}
+
+fn gen_return_value(e) {
+    let rt = cur_sig.ret;
+    if (!C.structs.has(rt)) { gen_to(e, rt); return; }
+    // struct result: rax = address of the value, then into registers or the caller's buffer
+    let size = tsize(rt);
+    if (e["t"] == "structlit" || e["t"] == "arrlit") { gen(e); } else { gen(e); }
+    if (ret_in_memory(rt)) {
+        X.mov_load64(A, RCX, RBP, hret_slot);
+        emit_copy(size);
+        X.mov_load64(A, RAX, RBP, hret_slot);
+        return;
+    }
+    X.mov_rr(A, RCX, RAX);
+    if (win64) { X.load_sized(A, RAX, RCX, 0, size, false); return; }
+    var ni = 0;
+    var nf = 0;
+    var j = 0;
+    let cl = eightbytes(rt);
+    // load the second integer register first (rax holds nothing we still need: the source is in rcx)
+    for (c in cl) {
+        if (c == "f") { X.movsd_load(A, nf, RCX, 8 * j); nf = nf + 1; }
+        j = j + 1;
+    }
+    j = 0;
+    for (c in cl) {
+        if (c == "i") { X.mov_load64(A, ni == 0 ? RAX : RDX, RCX, 8 * j); ni = ni + 1; }
+        j = j + 1;
+    }
+}
+
+fn gen_switch(s) {
+    let mark = cur;
+    let ts = tmp_alloc();
+    gen(s["e"]);
+    X.mov_store64(A, RBP, ts, RAX);
+    let end = X.new_label(A);
+    let labels = [];
+    var deflabel = -1;
+    var i = 0;
+    for (c in s["cases"]) {
+        let l = X.new_label(A);
+        labels.push(l);
+        if (c.vals == null) { deflabel = l; }
+        else {
+            for (v in c.vals) {
+                if (cvof(v) != null && !floaty(rv(v["ty"]))) {
+                    X.mov_ri(A, RCX, cvof(v));
+                    X.mov_load64(A, RAX, RBP, ts);
+                } else {
+                    gen(v);
+                    X.mov_rr(A, RCX, RAX);
+                    X.mov_load64(A, RAX, RBP, ts);
+                }
+                X.alu_rr(A, X.ALU_CMP, RAX, RCX);
+                X.jcc(A, X.CC_E, l);
+            }
+        }
+        i = i + 1;
+    }
+    X.jmp(A, deflabel >= 0 ? deflabel : end);
+    loops.push({ brk: end, cont: -1, label: "", dd: len(dstack) });
+    let base = len(dstack);
+    i = 0;
+    for (c in s["cases"]) {
+        X.bind(A, labels[i]);
+        for (x in c.body) { gen_stmt(x); }
+        i = i + 1;
+    }
+    while (len(dstack) > base) { emit_entry(dstack.pop()); }
+    loops.pop();
+    X.bind(A, end);
+    cur = mark;
+}
+
+// ---------------------------------------------------------------- functions
+/// append a finished function to .text and record its symbol, relocations and call fixups
+fn place_function(name: string, pro, asm, is_static: bool) {
+    util.pad_to(M.text, 16, 0xCC);
+    fbin.seek(M.text, 0, "end");
+    let start = fbin.tell(M.text);
+    var plen = 0;
+    if (pro != null) { plen = fbin.size(pro.s); util.append_stream(M.text, pro.s); }
+    util.append_stream(M.text, asm.s);
+    for (r in asm.relocs) {
+        M.relocs.push({ sec: "text", off: start + plen + r.off, kind: r.kind, sym: r.sym, addend: r.addend });
+        if (r.kind == "call_ext" && !M.undef.contains(r.sym)) { M.undef.push(r.sym); }
+    }
+    for (c in asm.calls) { M.calls.push({ off: start + plen + c.off, name: c.name }); }
+    M.syms.push({ name: name, sec: "text", off: start, size: fbin.size(M.text) - start, global: !is_static, kind: "func" });
+}
+
+fn gen_function(sig) {
+    let f = sig.node;
+    cur_sig = sig;
+    A = X.new_asm();
+    cur = 0;
+    maxcur = 0;
+    loops = [];
+    dstack = [];
+    pending = [];
+    fn_lbl = {};
+    in_thunk = false;
+    // parameters: place them like a caller would, then spill register parameters into frame slots
+    let items = [];
+    let hidden = C.structs.has(sig.ret) && ret_in_memory(sig.ret);
+    if (hidden) { items.push({ k: "i", ty: "*u8" }); }
+    for (p in f["psyms"]) { items.push(item_for(p.ty)); }
+    let pr = place(items);
+    let shadow = win64 ? 32 : 0;
+    var i = 0;
+    if (hidden) {
+        hret_slot = alloc_bytes(8, 8);
+        X.mov_store64(A, RBP, hret_slot, pr.pl[0].reg);
+        i = 1;
+    }
+    let later = [];
+    for (p in f["psyms"]) {
+        let c = pr.pl[i];
+        if (c.where == "stack") { p["off"] = 16 + shadow + c.off; }
+        else if (c.where == "astack") { p["off"] = 16 + shadow + c.off; }
+        else if (c.where == "reg") {
+            alloc_local(p);
+            if (c.float) { X.movsd_store(A, RBP, p.off, c.reg); }
+            else { X.store_sized(A, RBP, p.off, c.reg, T.is_ptr(p.ty) ? 8 : tsize(p.ty)); }
+        } else if (c.where == "aregs") {
+            p["off"] = alloc_bytes(8 * len(c.regs), 16);
+            var j = 0;
+            for (r in c.regs) {
+                if (r.float) { X.movsd_store(A, RBP, p.off + 8 * j, r.reg); } else { X.mov_store64(A, RBP, p.off + 8 * j, r.reg); }
+                j = j + 1;
+            }
+        } else if (c.where == "aptr") {
+            let ps = alloc_bytes(8, 8);
+            X.mov_store64(A, RBP, ps, c.reg);
+            later.push({ p: p, slot: ps });
+        } else if (c.where == "astackptr") {
+            later.push({ p: p, slot: 16 + shadow + c.off });
+        }
+        i = i + 1;
+    }
+    for (l in later) {
+        alloc_local(l.p);
+        X.mov_load64(A, RAX, RBP, l.slot);
+        X.lea(A, RCX, RBP, l.p.off);
+        emit_copy(tsize(l.p.ty));
+    }
+    for (s in f["body"]["body"]) { gen_stmt(s); }
+    while (len(dstack) > 0) { emit_entry(dstack.pop()); }
+    // falling off the end returns 0 (or nothing)
+    if (sig.ret != "void") {
+        X.mov_ri(A, RAX, 0);
+        if (floaty(sig.ret)) { X.movq_xr(A, 0, RAX); }
+    }
+    X.leave(A);
+    X.ret(A);
+    // out-of-line bodies of `defer` statements: entered with `call`, rbp = this frame's rbp
+    in_thunk = true;
+    var pi = 0;
+    while (pi < len(pending)) {
+        let pd = pending[pi];
+        X.bind(A, pd.label);
+        cur = maxcur;
+        dstack = [];
+        loops = [];
+        X.alu_ri(A, X.ALU_SUB, RSP, 8);
+        gen_block(pd.body);
+        X.alu_ri(A, X.ALU_ADD, RSP, 8);
+        X.ret(A);
+        pi = pi + 1;
+    }
+    in_thunk = false;
+    X.finish(A);
+    // prologue now that the frame size is known
+    let frame = util.align_up(maxcur, 16);
+    if (frame > 1048576) { util.fail("function '" + sig.name + "' needs a " + str(frame) + "-byte stack frame (limit 1 MiB)", f["line"], f["col"]); }
+    let pro = X.new_asm();
+    X.b(pro, 0x55);                      // push rbp
+    X.mov_rr(pro, RBP, RSP);
+    var left = frame;
+    while (left > 4096) {                // touch each page so guard pages are hit in order
+        X.alu_ri(pro, X.ALU_SUB, RSP, 4096);
+        X.op_rm(pro, 0, 1, [0x85], RAX, RSP, 0);     // test [rsp], rax
+        left = left - 4096;
+    }
+    if (left > 0) { X.alu_ri(pro, X.ALU_SUB, RSP, left); }
+    place_function(sig.name, pro, A, sig.is_static);
+}
+
+// ---------------------------------------------------------------- globals
+fn emit_global(g) {
+    let size = tsize(g.ty);
+    var al = T.align_of(g.ty, C.structs);
+    if (g.agg && size >= 16) { al = 16; }
+    if (M.fmt == "flat" && size >= 4096 && size % 4096 == 0) { al = 4096; }       // page tables, stacks: page aligned
+    if (al < 1) { al = 1; }
+    let glob = !g.is_static;
+    if (g.init_kind == "zero") {
+        M.bss = util.align_up(M.bss, al);
+        M.syms.push({ name: g.name, sec: "bss", off: M.bss, size: size, global: glob, kind: "object" });
+        M.bss = M.bss + (size < 1 ? 1 : size);
+        return;
+    }
+    // initialised data. Pointer initialisers need a relocation, so they must live in .data
+    var has_reloc = g.init_kind == "str" || g.init_kind == "fn";
+    if (g.init_kind == "agg") { for (it in g.init_items) { if (it.kind == "str" || it.kind == "fn") { has_reloc = true; } } }
+    let to_data = g.mutable || has_reloc;
+    let s = to_data ? M.data : M.rodata;
+    let secname = to_data ? "data" : "rodata";
+    util.pad_to(s, al, 0);
+    fbin.seek(s, 0, "end");
+    let off = fbin.tell(s);
+    if (g.init_kind == "agg") {
+        var strsyms = [];
+        for (it in g.init_items) { if (it.kind == "str") { strsyms.push(str_symbol(it.v)); } else { strsyms.push(""); } }
+        fbin.seek(s, 0, "end");
+        let off2 = fbin.tell(s);
+        fbin.fill(s, 0, size < 1 ? 1 : size);
+        var idx = 0;
+        for (it in g.init_items) {
+            fbin.seek(s, off2 + it.off);
+            if (it.kind == "str") { M.relocs.push({ sec: secname, off: off2 + it.off, kind: "abs64", sym: strsyms[idx], addend: 0 }); }
+            else if (it.kind == "fn") { M.relocs.push({ sec: secname, off: off2 + it.off, kind: "abs64", sym: it.v, addend: 0 }); }
+            else if (it.kind == "float") { if (it.ty == "f32") { fbin.write_f32(s, it.v); } else { fbin.write_f64(s, it.v); } }
+            else {
+                let isz = T.is_ptr(it.ty) ? 8 : tsize(it.ty);
+                if (isz == 8) { fbin.write_u64(s, it.v); }
+                else if (isz == 4) { fbin.write_u32(s, it.v & 0xFFFFFFFF); }
+                else if (isz == 2) { fbin.write_u16(s, it.v & 0xFFFF); }
+                else { fbin.write_u8(s, it.v & 0xFF); }
+            }
+            idx = idx + 1;
+        }
+        fbin.seek(s, 0, "end");
+        M.syms.push({ name: g.name, sec: secname, off: off2, size: size, global: glob, kind: "object" });
+        return;
+    }
+    if (g.init_kind == "str") {
+        let sym = str_symbol(g.init_bytes);
+        fbin.write_u64(s, 0);
+        M.relocs.push({ sec: secname, off: off, kind: "abs64", sym: sym, addend: 0 });
+    } else if (g.init_kind == "fn") {
+        fbin.write_u64(s, 0);
+        M.relocs.push({ sec: secname, off: off, kind: "abs64", sym: g.init_fn, addend: 0 });
+    } else if (g.init_kind == "float") {
+        if (g.ty == "f32") { fbin.write_f32(s, g.init_val); } else { fbin.write_f64(s, g.init_val); }
+    } else {
+        let v = g.init_val;
+        if (size == 8) { fbin.write_u64(s, v); }
+        else if (size == 4) { fbin.write_u32(s, v & 0xFFFFFFFF); }
+        else if (size == 2) { fbin.write_u16(s, v & 0xFFFF); }
+        else { fbin.write_u8(s, v & 0xFF); }
+    }
+    M.syms.push({ name: g.name, sec: secname, off: off, size: size, global: glob, kind: "object" });
+}
+
+/// Translate a library name written for one OS to the equivalent default for the target OS.
+fn map_lib(lib: string, target: string) -> string {
+    let generic = lib == "" || lib.contains("libc.so") || lib.contains("libm.so") || lib.contains("libSystem") ||
+                  lib.contains("msvcrt") || lib.contains("libc.dylib") || lib.contains("libm.dylib");
+    if (!generic) { return lib; }
+    if (target == "windows") { return "msvcrt.dll"; }
+    if (target == "macos") { return "/usr/lib/libSystem.B.dylib"; }
+    if (lib.contains("libm.so")) { return "libm.so.6"; }
+    return "libc.so.6";
+}
+
+/// Build the object module for a checked program. target: "linux" | "windows" | "macos"
+fn gen_module(ctx, target: string, force_abi: string = "") {
+    C = ctx;
+    win64 = (target == "windows") || force_abi == "win64";
+    M = { target: target, abi: win64 ? "win64" : "sysv",
+          fmt: target == "windows" ? "coff" : (target == "macos" ? "macho" : (target == "kcos" ? "flat" : "elf")),
+          text: fbin.buffer(), rodata: fbin.buffer(), data: fbin.buffer(), bss: 0,
+          syms: [], relocs: [], calls: [], undef: [], libs: ctx.libs, strs: {}, nstr: 0 };
+    // map library names onto this target and remember which library provides each import
+    M["import_lib"] = {};
+    let libs2 = [];
+    for (name in ctx.funcs.keys()) {
+        let sg = ctx.funcs[name];
+        if (sg.is_ext) {
+            let l = map_lib(sg.lib, target);
+            M.import_lib[name] = l;
+            if (!libs2.contains(l)) { libs2.push(l); }
+        }
+    }
+    M.libs = libs2;
+    for (g in ctx.global_list) { emit_global(g); }
+    if (ctx.uses_eh) {
+        // exception state: chain head + thrown value
+        M.bss = util.align_up(M.bss, 8);
+        M.syms.push({ name: "__kcc_eh", sec: "bss", off: M.bss, size: 8, global: false, kind: "object" });
+        M.bss = M.bss + 8;
+        M.syms.push({ name: "__kcc_exc", sec: "bss", off: M.bss, size: 8, global: false, kind: "object" });
+        M.bss = M.bss + 8;
+        gen_throw_routine();
+    }
+    for (sig in ctx.fn_list) { gen_function(sig); }
+    // resolve calls between functions of this module
+    let where = {};
+    for (s in M.syms) { if (s.kind == "func") { where[s.name] = s.off; } }
+    for (c in M.calls) {
+        util.patch_i32(M.text, c.off, where[c.name] - (c.off + 4));
+    }
+    return M;
+}

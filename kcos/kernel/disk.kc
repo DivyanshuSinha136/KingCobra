@@ -1,0 +1,207 @@
+// disk.kc -- ATA PIO driver (primary bus, master drive, LBA28) and the persistent KCFS store.  Author: Divyanshu Sinha (MIT License)
+const ATA_DATA = 0x1F0;
+const ATA_STATUS = 0x1F7;
+const STORE_LBA = 1024;              // KCFS header sector; the data follows at STORE_LBA + 1 (256 KiB reserved)
+const STORE_MAX = 0x3E000;
+
+var disk_present = false;
+var disk_sectors = 0;
+var disk_model: u8[44];
+var fs_persisted = false;
+
+fn ata_delay() { var i = 0; while (i < 4) { inb(0x3F6); i++; } }
+
+fn ata_wait_idle() -> bool {
+    var spin = 0;
+    while (spin < 2000000) { if ((inb(ATA_STATUS) & 0x80) == 0) { return true; } spin++; }
+    return false;
+}
+
+/// wait for DRQ; false on error, fault or timeout
+fn ata_wait_drq() -> bool {
+    ata_delay();
+    var spin = 0;
+    while (spin < 2000000) {
+        let s = inb(ATA_STATUS);
+        if ((s & 0x80) == 0) {
+            if ((s & 0x21) != 0) { return false; }
+            if ((s & 0x08) != 0) { return true; }
+        }
+        spin++;
+    }
+    return false;
+}
+
+fn disk_init() {
+    var id: u16[256];
+    disk_present = false;
+    if (inb(ATA_STATUS) == 0xFF) { return; }                  // floating bus: no controller
+    outb(0x1F6, 0xA0);
+    outb(0x1F2, 0); outb(0x1F3, 0); outb(0x1F4, 0); outb(0x1F5, 0);
+    outb(ATA_STATUS, 0xEC);                                    // IDENTIFY
+    if (inb(ATA_STATUS) == 0) { return; }
+    if (!ata_wait_idle()) { return; }
+    if (inb(0x1F4) != 0 || inb(0x1F5) != 0) { return; }       // ATAPI / SATA signature: not handled
+    if (!ata_wait_drq()) { return; }
+    insw_rep(ATA_DATA, &id[0], 256);
+    disk_sectors = (id[60] as int) | ((id[61] as int) << 16);
+    var i = 0;
+    while (i < 20) {
+        let w = id[27 + i] as int;
+        disk_model[i * 2] = (w >> 8) as u8;
+        disk_model[i * 2 + 1] = (w & 255) as u8;
+        i++;
+    }
+    disk_model[40] = 0;
+    var e = 39;
+    while (e > 0 && (disk_model[e] == ' ' || disk_model[e] == 0)) { disk_model[e] = 0; e--; }
+    disk_present = disk_sectors > 0;
+}
+
+fn ata_setup(lba: int, cmd: int) {
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, lba & 0xFF);
+    outb(0x1F4, (lba >> 8) & 0xFF);
+    outb(0x1F5, (lba >> 16) & 0xFF);
+    outb(ATA_STATUS, cmd);
+}
+
+fn ata_read(lba: int, count: int, buf: *u8) -> bool {
+    if (!disk_present) { return false; }
+    var i = 0;
+    while (i < count) {
+        if (!ata_wait_idle()) { return false; }
+        ata_setup(lba + i, 0x20);
+        if (!ata_wait_drq()) { return false; }
+        insw_rep(ATA_DATA, buf + i * 512, 256);
+        i++;
+    }
+    return true;
+}
+
+fn ata_write(lba: int, count: int, buf: *u8) -> bool {
+    if (!disk_present) { return false; }
+    var i = 0;
+    while (i < count) {
+        if (!ata_wait_idle()) { return false; }
+        ata_setup(lba + i, 0x30);
+        if (!ata_wait_drq()) { return false; }
+        outsw_rep(ATA_DATA, buf + i * 512, 256);
+        outb(ATA_STATUS, 0xE7);                                // cache flush
+        if (!ata_wait_idle()) { return false; }
+        i++;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- persistent KCFS
+// header sector: "KCFS0001" | u64 stream bytes | u64 node count | u64 checksum.  Stream: per node a 48-byte record
+// { u32 index, u32 kind, u32 parent, u32 size, name[28] } followed by the file's bytes.
+fn store_total() -> int {
+    var total = 0;
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE) { total = total + 48; if (fs_nodes[i].kind == K_FILE) { total = total + fs_nodes[i].size; } }
+        i++;
+    }
+    return total;
+}
+
+fn store_sum(buf: *u8, n: int) -> int {
+    var s = 0;
+    var i = 0;
+    while (i < n) { s = s + buf[i]; i++; }
+    return s;
+}
+
+/// 0 ok, 1 no disk, 2 too big, 3 I/O error, 4 out of memory
+fn fs_save() -> int {
+    if (!disk_present) { return 1; }
+    let total = store_total();
+    if (total > STORE_MAX) { return 2; }
+    let nsec = (total + 511) >> 9;
+    let buf = kzalloc(nsec * 512 + 512);
+    if (buf == (0 as *u8)) { return 4; }
+    var p = 0;
+    var count = 0;
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE) {
+            let rec = buf + p;
+            *(rec as *u32) = i as u32;
+            *((rec + 4) as *u32) = fs_nodes[i].kind as u32;
+            *((rec + 8) as *u32) = fs_nodes[i].parent as u32;
+            let sz = fs_nodes[i].kind == K_FILE ? fs_nodes[i].size : 0;
+            *((rec + 12) as *u32) = sz as u32;
+            kmemcpy(rec + 16, &fs_nodes[i].name[0], FS_NAME);
+            p = p + 48;
+            if (sz > 0) { kmemcpy(buf + p, fs_nodes[i].data, sz); p = p + sz; }
+            count++;
+        }
+        i++;
+    }
+    var hdr: u8[512];
+    kmemset(&hdr[0], 0, 512);
+    kmemcpy(&hdr[0], "KCFS0001", 8);
+    wr64((&hdr[0] as int) + 8, total);
+    wr64((&hdr[0] as int) + 16, count);
+    wr64((&hdr[0] as int) + 24, store_sum(buf, total));
+    var ok = true;
+    if (nsec > 0) { ok = ata_write(STORE_LBA + 1, nsec, buf); }
+    if (ok) { ok = ata_write(STORE_LBA, 1, &hdr[0]); }
+    kfree(buf);
+    if (ok) { fs_persisted = true; return 0; }
+    return 3;
+}
+
+/// restore the filesystem from disk; false (and the filesystem untouched) when there is no valid store
+fn fs_load() -> bool {
+    if (!disk_present) { return false; }
+    var hdr: u8[512];
+    if (!ata_read(STORE_LBA, 1, &hdr[0])) { return false; }
+    if (!kstarts(&hdr[0], "KCFS0001")) { return false; }
+    let total = rd64((&hdr[0] as int) + 8);
+    let count = rd64((&hdr[0] as int) + 16);
+    let sum = rd64((&hdr[0] as int) + 24);
+    if (total < 0 || total > STORE_MAX || count < 0 || count >= FS_MAX) { return false; }
+    let nsec = (total + 511) >> 9;
+    let buf = kzalloc(nsec * 512 + 512);
+    if (buf == (0 as *u8)) { return false; }
+    if (nsec > 0 && !ata_read(STORE_LBA + 1, nsec, buf)) { kfree(buf); return false; }
+    if (store_sum(buf, total) != sum) { kfree(buf); return false; }
+    fs_init();
+    var p = 0;
+    var n = 0;
+    while (n < count && p + 48 <= total) {
+        let rec = buf + p;
+        let idx = *(rec as *u32) as int;
+        let kind = *((rec + 4) as *u32) as int;
+        let parent = *((rec + 8) as *u32) as int;
+        let sz = *((rec + 12) as *u32) as int;
+        p = p + 48;
+        if (idx > 0 && idx < FS_MAX) {
+            kstrncpy(&fs_nodes[idx].name[0], rec + 16, FS_NAME);
+            fs_nodes[idx].kind = kind;
+            fs_nodes[idx].parent = parent;
+            fs_nodes[idx].size = 0;
+            fs_nodes[idx].cap = 0;
+            fs_nodes[idx].data = 0 as *u8;
+            fs_nodes[idx].mtime = 0;
+            if (kind == K_FILE && sz > 0) { fs_write(idx, buf + p, sz, false); }
+        }
+        p = p + sz;
+        n++;
+    }
+    kfree(buf);
+    fs_persisted = true;
+    return true;
+}
+
+fn fs_forget() -> bool {
+    if (!disk_present) { return false; }
+    var z: u8[512];
+    kmemset(&z[0], 0, 512);
+    fs_persisted = false;
+    return ata_write(STORE_LBA, 1, &z[0]);
+}

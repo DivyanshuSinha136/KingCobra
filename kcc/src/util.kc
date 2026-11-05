@@ -1,0 +1,128 @@
+// util.kc -- small helpers shared by every kcc stage.
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import std.system;
+
+/// Each importing file gets its own copy of a module, so the switch travels in the environment (KCC_TRACE).
+fn set_trace(on: bool) { if (on) { system.setenv("KCC_TRACE", "1"); } }
+/// Progress marker (only with --verbose / KCC_TRACE=1): shows how far a writer got if the process dies.
+fn trace(msg: string) { let t = system.getenv("KCC_TRACE");
+    if (t != null && t != "") { println("kcc:   [" + msg + "]"); } }
+
+/// Raise a compile error. The driver catches it and prints  file:line:col: error: msg
+fn fail(msg: string, line: int, col: int) {
+    throw { message: msg, line: line, col: col, kind: "compile" };
+}
+
+fn align_up(n: int, a: int) -> int {
+    return (n + a - 1) & ~(a - 1);
+}
+
+/// IEEE-754 bit pattern of a double, as a signed 64-bit int.
+fn f64_bits(x: float) -> int {
+    let s = fbin.buffer();
+    fbin.write_f64(s, x);
+    fbin.seek(s, 0);
+    return fbin.read_i64(s);
+}
+
+fn f32_bits(x: float) -> int {
+    let s = fbin.buffer();
+    fbin.write_f32(s, x);
+    fbin.seek(s, 0);
+    return fbin.read_u32(s);
+}
+
+/// Append every byte of a stream (or array of bytes) at the end of `dst`.
+fn append_stream(dst, src) {
+    let n = fbin.size(src);
+    fbin.seek(dst, 0, "end");
+    fbin.write_bytes(dst, fbin.to_bytes(src, 0, n));
+}
+
+/// Overwrite 4 bytes at `pos` (little endian) and restore the write position.
+fn patch_u32(s, pos: int, v: int) {
+    let save = fbin.tell(s);
+    fbin.seek(s, pos);
+    fbin.write_u32(s, v & 0xFFFFFFFF);
+    fbin.seek(s, save);
+}
+
+fn patch_i32(s, pos: int, v: int) {
+    let save = fbin.tell(s);
+    fbin.seek(s, pos);
+    fbin.write_i32(s, v);
+    fbin.seek(s, save);
+}
+
+fn patch_u64(s, pos: int, v: int) {
+    let save = fbin.tell(s);
+    fbin.seek(s, pos);
+    fbin.write_u64(s, v);
+    fbin.seek(s, save);
+}
+
+fn pad_to(s, align: int, fill: int) {
+    let n = fbin.size(s);
+    let target = align_up(n, align);
+    fbin.seek(s, 0, "end");
+    if (target > n) { fbin.fill(s, fill, target - n); }
+}
+
+/// ULEB128 bytes of a non-negative int as an array (optionally padded to `width` bytes).
+fn uleb(v: int, width: int = 0) -> int[] {
+    let out = [];
+    var x = v;
+    var more = true;
+    while (more) {
+        var b = x & 0x7F;
+        x = x >>> 7;
+        if (x != 0) { b = b | 0x80; } else { more = false; }
+        out.push(b);
+    }
+    while (len(out) < width) {
+        out[len(out) - 1] = out[len(out) - 1] | 0x80;
+        out.push(0);
+    }
+    if (width > 0) { out[len(out) - 1] = out[len(out) - 1] & 0x7F; }
+    return out;
+}
+
+fn str_bytes(s: string) -> int[] {
+    return fbin.to_bytes(fbin.from_string(s));
+}
+
+fn write_cstr(s, text: string) {
+    fbin.write_string(s, text);
+    fbin.write_u8(s, 0);
+}
+
+fn hex_of(arr) -> string {
+    var out = "";
+    for (b in arr) {
+        let h = "0123456789abcdef";
+        out = out + h[(b >> 4) & 15] + h[b & 15];
+    }
+    return out;
+}
+
+fn starts_with(s: string, p: string) -> bool {
+    return len(s) >= len(p) && s[0..len(p)] == p;
+}
+
+fn ends_with(s: string, p: string) -> bool {
+    return len(s) >= len(p) && s[len(s) - len(p)..len(s)] == p;
+}
+
+/// Byte-wise string comparison: -1, 0 or 1.
+fn str_cmp(a: string, b: string) -> int {
+    let x = str_bytes(a);
+    let y = str_bytes(b);
+    var i = 0;
+    while (i < len(x) && i < len(y)) {
+        if (x[i] != y[i]) { return x[i] < y[i] ? -1 : 1; }
+        i = i + 1;
+    }
+    if (len(x) == len(y)) { return 0; }
+    return len(x) < len(y) ? -1 : 1;
+}

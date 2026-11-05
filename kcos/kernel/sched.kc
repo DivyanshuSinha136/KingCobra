@@ -1,0 +1,96 @@
+// sched.kc -- preemptive round-robin kernel threads.  Author: Divyanshu Sinha (MIT License)
+//
+// Uses three kcc features: `fnaddr(fn)` (function address), `callp(addr, args..)` (indirect call) and the linker-provided
+// `kc_switch` (save callee-saved registers, swap stacks, return into the other thread).
+extern fn kc_switch(old_sp: *int, new_sp: int);
+
+const MAX_TASKS = 8;
+const T_FREE = 0;
+const T_READY = 1;
+const T_DEAD = 2;
+const TASK_STACK = 16384;
+
+struct Task {
+    sp: int,
+    state: int,
+    stack: *u8,
+    entry: int,
+    arg: int
+}
+
+var tasks: Task[8];
+var cur_task = 0;
+var sched_on = false;
+var switches = 0;
+
+fn sched_init() {
+    var i = 0;
+    while (i < MAX_TASKS) { tasks[i].state = T_FREE; tasks[i].stack = 0 as *u8; i++; }
+    tasks[0].state = T_READY;               // task 0 is the boot thread (the shell)
+    cur_task = 0;
+    sched_on = true;
+}
+
+/// pick the next ready task and switch to it; interrupts must be off
+fn schedule() {
+    var n = 1;
+    while (n <= MAX_TASKS) {
+        let cand = (cur_task + n) % MAX_TASKS;
+        if (tasks[cand].state == T_READY) {
+            if (cand == cur_task) { return; }
+            let old = cur_task;
+            cur_task = cand;
+            switches++;
+            kc_switch(&tasks[old].sp, tasks[cand].sp);
+            return;
+        }
+        n++;
+    }
+}
+
+fn task_yield() {
+    let f = read_rflags();
+    cli();
+    schedule();
+    if ((f & 0x200) != 0) { sti(); }
+}
+
+/// first code a new thread runs (reached through the `ret` in kc_switch, still inside an interrupt gate: IF is 0)
+fn task_trampoline() {
+    sti();
+    let t = cur_task;
+    callp(tasks[t].entry, tasks[t].arg);
+    cli();
+    tasks[t].state = T_DEAD;
+    schedule();
+    while (true) { hlt(); }
+}
+
+/// start a thread running `entry(arg)`; entry is fnaddr(some_function). Returns the task id or -1.
+fn spawn(entry: int, arg: int) -> int {
+    let f = read_rflags();
+    cli();
+    var slot = -1;
+    var i = 1;
+    while (i < MAX_TASKS) {
+        if (tasks[i].state == T_DEAD) { kfree(tasks[i].stack); tasks[i].stack = 0 as *u8; tasks[i].state = T_FREE; }
+        if (slot < 0 && tasks[i].state == T_FREE) { slot = i; }
+        i++;
+    }
+    if (slot < 0) { if ((f & 0x200) != 0) { sti(); } return -1; }
+    let stack = kmalloc(TASK_STACK);
+    if (stack == (0 as *u8)) { if ((f & 0x200) != 0) { sti(); } return -1; }
+    let top = ((stack as int) + TASK_STACK) & ~15;
+    let sp = top - 64;
+    var k = 0;
+    while (k < 6) { wr64(sp + k * 8, 0); k++; }               // r15 r14 r13 r12 rbx rbp
+    wr64(sp + 48, fnaddr(task_trampoline));                   // "return address" kc_switch jumps to
+    wr64(sp + 56, 0);
+    tasks[slot].sp = sp;
+    tasks[slot].stack = stack;
+    tasks[slot].entry = entry;
+    tasks[slot].arg = arg;
+    tasks[slot].state = T_READY;
+    if ((f & 0x200) != 0) { sti(); }
+    return slot;
+}

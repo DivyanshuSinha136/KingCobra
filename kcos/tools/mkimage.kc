@@ -1,0 +1,51 @@
+// mkimage.kc -- assemble a bootable KCOS disk image:  boot.bin (stage 1 + stage 2)  +  kernel.bin (flat binary)
+// Author: Divyanshu Sinha (MIT License)
+//
+//   kingcobra kcos/tools/mkimage.kc kcos/boot/boot.bin build/kernel.bin -o build/kcos.img [--min-size 1048576]
+//
+// The kernel's sector count is patched into the MBR (u16 at offset 0x1FC); the image is padded to a whole number of sectors.
+import std.fbin;
+import std.io;
+import std.system;
+
+const SECTOR = 512;
+const BOOT_BYTES = 2560;                 // stage 1 (512) + stage 2 (4 * 512)
+const MAX_KERNEL = 0x60000;              // KERNEL_BASE 0x10000 .. stack guard 0x70000
+
+fn die(msg: string) { println("mkimage: " + msg); system.exit(1); }
+
+fn main() {
+    let args = system.args();
+    var files = [];
+    var out = "";
+    var min_size = 1048576;
+    var i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        if (a == "-o" && i + 1 < len(args)) { out = args[i + 1]; i = i + 2; continue; }
+        if (a == "--min-size" && i + 1 < len(args)) { min_size = int(args[i + 1]); i = i + 2; continue; }
+        files.push(a);
+        i = i + 1;
+    }
+    if (len(files) != 2 || out == "") { println("usage: mkimage boot.bin kernel.bin -o kcos.img [--min-size BYTES]"); system.exit(2); }
+    if (!io.exists(files[0])) { die("cannot open " + files[0]); }
+    if (!io.exists(files[1])) { die("cannot open " + files[1]); }
+    let boot = fbin.load(files[0]);
+    let kern = fbin.load(files[1]);
+    if (fbin.size(boot) != BOOT_BYTES) { die("boot.bin must be " + str(BOOT_BYTES) + " bytes, it is " + str(fbin.size(boot))); }
+    let ksize = fbin.size(kern);
+    if (ksize > MAX_KERNEL) { die("kernel is " + str(ksize) + " bytes; the boot layout allows at most " + str(MAX_KERNEL) + " (0x10000..0x70000)"); }
+    let sectors = (ksize + SECTOR - 1) >> 9;
+    let img = fbin.buffer();
+    fbin.write_bytes(img, fbin.to_bytes(boot, 0, BOOT_BYTES));
+    fbin.seek(img, 0x1FC);
+    fbin.write_u16(img, sectors);
+    fbin.seek(img, 0, "end");
+    fbin.write_bytes(img, fbin.to_bytes(kern, 0, ksize));
+    let pad = sectors * SECTOR - ksize;
+    if (pad > 0) { fbin.fill(img, 0, pad); }
+    let total = fbin.size(img);
+    if (total < min_size) { fbin.fill(img, 0, min_size - total); }
+    fbin.save(img, out);
+    println("mkimage: wrote " + out + " (" + str(fbin.size(img)) + " bytes; kernel " + str(ksize) + " bytes = " + str(sectors) + " sectors at LBA 5)");
+}

@@ -1,0 +1,465 @@
+// macho.kc -- Mach-O x86-64 writers: relocatable object (.o) and native dylib linker (.dylib).
+// Author: Divyanshu Sinha (MIT License)
+//
+// The dylib path needs no external linker: it lays out __TEXT/__DATA/__LINKEDIT, emits rebase and bind
+// opcodes, an export trie and the symbol tables itself. Imports are reached through `jmp [GOT slot]` stubs.
+import std.fbin;
+import "util.kc" as util;
+
+const MH_MAGIC_64 = 0xFEEDFACF;
+const CPU_X86_64 = 0x01000007;
+
+fn msym(name: string) -> string {
+    if (name[0] == ".") { return "L_" + name[1..len(name)]; }     // assembler-local temporary
+    return "_" + name;
+}
+
+fn name16(s, name: string) {
+    fbin.write_string(s, name);
+    fbin.fill(s, 0, 16 - len(name));
+}
+
+fn section_hdr(s, sect: string, seg: string, addr: int, size: int, off: int, align_log2: int, reloff: int, nreloc: int, flags: int) {
+    name16(s, sect); name16(s, seg);
+    fbin.write_u64(s, addr); fbin.write_u64(s, size);
+    fbin.write_u32(s, off); fbin.write_u32(s, align_log2);
+    fbin.write_u32(s, reloff); fbin.write_u32(s, nreloc);
+    fbin.write_u32(s, flags);
+    fbin.write_u32(s, 0); fbin.write_u32(s, 0); fbin.write_u32(s, 0);
+}
+
+fn reloc_word(symnum: int, pcrel: int, length: int, ext: int, type: int) -> int {
+    return (symnum & 0xFFFFFF) | (pcrel << 24) | (length << 25) | (ext << 27) | (type << 28);
+}
+
+// ---------------------------------------------------------------- relocatable object
+fn build_obj(mod) {
+    let text_len = fbin.size(mod.text);
+    let ro_len = fbin.size(mod.rodata);
+    let data_len = fbin.size(mod.data);
+    // symbol order: local defined, external defined, undefined
+    let order = [];
+    for (s in mod.syms) { if (!s.global) { order.push({ name: s.name, sym: s, kind: "local" }); } }
+    let nlocal = len(order);
+    for (s in mod.syms) { if (s.global) { order.push({ name: s.name, sym: s, kind: "def" }); } }
+    let ndef = len(order) - nlocal;
+    for (u in mod.undef) { order.push({ name: u, sym: null, kind: "undef" }); }
+    let nundef = len(order) - nlocal - ndef;
+    let symidx = {};
+    var i = 0;
+    for (o in order) { symidx[o.name] = i; i = i + 1; }
+
+    var secnum = { text: 1, rodata: 2, data: 3, bss: 4 };
+    let text_addr = 0;
+    let ro_addr = util.align_up(text_addr + text_len, 16);
+    let data_addr = util.align_up(ro_addr + ro_len, 16);
+    let bss_addr = util.align_up(data_addr + data_len, 16);
+    var secaddr = { text: text_addr, rodata: ro_addr, data: data_addr, bss: bss_addr };
+    let total = bss_addr + mod.bss;
+
+    // patch implicit addends and collect relocation entries per section
+    let text = fbin.from_bytes(fbin.to_bytes(mod.text, 0, text_len));
+    let data = fbin.from_bytes(fbin.to_bytes(mod.data, 0, data_len));
+    let rtext = fbin.buffer(); let rdata = fbin.buffer();
+    var nrt = 0; var nrd = 0;
+    for (r in mod.relocs) {
+        let tgt = (r.sec == "text") ? text : data;
+        let save = fbin.tell(tgt);
+        fbin.seek(tgt, r.off);
+        var w = 0;
+        if (r.kind == "abs64") { fbin.write_u64(tgt, r.addend); w = reloc_word(symidx[r.sym], 0, 3, 1, 0); }
+        else {
+            fbin.write_i32(tgt, r.addend + 4);
+            w = reloc_word(symidx[r.sym], 1, 2, 1, r.kind == "call_ext" ? 2 : 1);
+        }
+        fbin.seek(tgt, save);
+        let rb = (r.sec == "text") ? rtext : rdata;
+        fbin.write_i32(rb, r.off);
+        fbin.write_u32(rb, w);
+        if (r.sec == "text") { nrt = nrt + 1; } else { nrd = nrd + 1; }
+    }
+
+    let nsyms = len(order);
+    let hdr = 32 + (72 + 4 * 80) + 24 + 80;
+    let off_text = util.align_up(hdr, 16);
+    let off_ro = off_text + ro_addr;
+    let off_data = off_text + data_addr;
+    let off_end = off_data + data_len;
+    let off_rtext = util.align_up(off_end, 8);
+    let off_rdata = off_rtext + 8 * nrt;
+    let off_sym = off_rdata + 8 * nrd;
+    let off_str = off_sym + 16 * nsyms;
+
+    let strtab = fbin.buffer();
+    fbin.write_u8(strtab, 0);
+    let symbuf = fbin.buffer();
+    for (o in order) {
+        fbin.seek(strtab, 0, "end");
+        let strx = fbin.tell(strtab);
+        util.write_cstr(strtab, msym(o.name));
+        fbin.write_u32(symbuf, strx);
+        if (o.kind == "undef") {
+            fbin.write_u8(symbuf, 1); fbin.write_u8(symbuf, 0); fbin.write_u16(symbuf, 0); fbin.write_u64(symbuf, 0);
+        } else {
+            fbin.write_u8(symbuf, o.kind == "def" ? 0x0F : 0x0E);
+            fbin.write_u8(symbuf, secnum[o.sym.sec]);
+            fbin.write_u16(symbuf, 0);
+            fbin.write_u64(symbuf, secaddr[o.sym.sec] + o.sym.off);
+        }
+    }
+    let str_len = fbin.size(strtab);
+    let out = fbin.buffer();
+    fbin.write_u32(out, MH_MAGIC_64);
+    fbin.write_u32(out, CPU_X86_64);
+    fbin.write_u32(out, 3);
+    fbin.write_u32(out, 1);                       // MH_OBJECT
+    fbin.write_u32(out, 3);                       // ncmds
+    fbin.write_u32(out, (72 + 4 * 80) + 24 + 80);
+    fbin.write_u32(out, 0);
+    fbin.write_u32(out, 0);
+    // LC_SEGMENT_64
+    fbin.write_u32(out, 0x19); fbin.write_u32(out, 72 + 4 * 80);
+    name16(out, "");
+    fbin.write_u64(out, 0); fbin.write_u64(out, total);
+    fbin.write_u64(out, off_text); fbin.write_u64(out, off_end - off_text);
+    fbin.write_u32(out, 7); fbin.write_u32(out, 7);
+    fbin.write_u32(out, 4); fbin.write_u32(out, 0);
+    section_hdr(out, "__text", "__TEXT", text_addr, text_len, off_text, 4, nrt > 0 ? off_rtext : 0, nrt, 0x80000400);
+    section_hdr(out, "__const", "__TEXT", ro_addr, ro_len, off_ro, 4, 0, 0, 0);
+    section_hdr(out, "__data", "__DATA", data_addr, data_len, off_data, 4, nrd > 0 ? off_rdata : 0, nrd, 0);
+    section_hdr(out, "__bss", "__DATA", bss_addr, mod.bss, 0, 4, 0, 0, 1);
+    // LC_SYMTAB
+    fbin.write_u32(out, 2); fbin.write_u32(out, 24);
+    fbin.write_u32(out, off_sym); fbin.write_u32(out, nsyms); fbin.write_u32(out, off_str); fbin.write_u32(out, str_len);
+    // LC_DYSYMTAB
+    fbin.write_u32(out, 0xB); fbin.write_u32(out, 80);
+    fbin.write_u32(out, 0); fbin.write_u32(out, nlocal);
+    fbin.write_u32(out, nlocal); fbin.write_u32(out, ndef);
+    fbin.write_u32(out, nlocal + ndef); fbin.write_u32(out, nundef);
+    for (k in 0..12) { fbin.write_u32(out, 0); }
+    fbin.fill(out, 0, off_text - fbin.size(out));
+    fbin.write_bytes(out, fbin.to_bytes(text, 0, text_len));
+    fbin.fill(out, 0, ro_addr - text_len);
+    fbin.write_bytes(out, fbin.to_bytes(mod.rodata, 0, ro_len));
+    fbin.fill(out, 0, data_addr - (ro_addr + ro_len));
+    fbin.write_bytes(out, fbin.to_bytes(data, 0, data_len));
+    fbin.fill(out, 0, off_rtext - off_end);
+    fbin.write_bytes(out, fbin.to_bytes(rtext, 0, fbin.size(rtext)));
+    fbin.write_bytes(out, fbin.to_bytes(rdata, 0, fbin.size(rdata)));
+    fbin.write_bytes(out, fbin.to_bytes(symbuf, 0, fbin.size(symbuf)));
+    fbin.write_bytes(out, fbin.to_bytes(strtab, 0, str_len));
+    return out;
+}
+
+// ---------------------------------------------------------------- export trie
+fn common_prefix_len(a: string, b: string) -> int {
+    var i = 0;
+    while (i < len(a) && i < len(b) && a[i] == b[i]) { i = i + 1; }
+    return i;
+}
+
+fn trie_build(items) {
+    let node = { term: -1, kids: [], off: 0 };
+    let groups = {};
+    let order = [];
+    for (it in items) {
+        if (it.rest == "") { node.term = it.addr; continue; }
+        let c = it.rest[0..1];
+        if (!groups.has(c)) { groups[c] = []; order.push(c); }
+        groups[c].push(it);
+    }
+    for (c in order) {
+        let g = groups[c];
+        var p = len(g[0].rest);
+        for (it in g) { p = min(p, common_prefix_len(g[0].rest, it.rest)); }
+        let label = g[0].rest[0..p];
+        let sub = [];
+        for (it in g) { sub.push({ rest: it.rest[p..len(it.rest)], addr: it.addr }); }
+        node.kids.push({ label: label, node: trie_build(sub) });
+    }
+    return node;
+}
+
+fn trie_node_size(n) -> int {
+    var sz = (n.term >= 0) ? 5 : 1;
+    sz = sz + len(util.uleb(len(n.kids)));
+    for (k in n.kids) { sz = sz + len(k.label) + 1 + 3; }
+    return sz;
+}
+
+/// assign pre-order offsets; returns the cursor after this subtree
+fn trie_layout(n, cursor: int) -> int {
+    n.off = cursor;
+    var c = cursor + trie_node_size(n);
+    for (k in n.kids) { c = trie_layout(k.node, c); }
+    return c;
+}
+
+fn trie_write(out, n) {
+    if (n.term >= 0) {
+        fbin.write_u8(out, 4);
+        fbin.write_u8(out, 0);
+        fbin.write_bytes(out, util.uleb(n.term, 3));
+    } else { fbin.write_u8(out, 0); }
+    fbin.write_bytes(out, util.uleb(len(n.kids)));
+    for (k in n.kids) {
+        util.write_cstr(out, k.label);
+        fbin.write_bytes(out, util.uleb(k.node.off, 3));
+    }
+    for (k in n.kids) { trie_write(out, k.node); }
+}
+
+// ---------------------------------------------------------------- dylib
+fn dylib_cmd(s, cmd: int, path: string, ts: int) {
+    let size = util.align_up(24 + len(path) + 1, 8);
+    fbin.write_u32(s, cmd); fbin.write_u32(s, size);
+    fbin.write_u32(s, 24); fbin.write_u32(s, ts);
+    fbin.write_u32(s, 0x10000); fbin.write_u32(s, 0x10000);
+    util.write_cstr(s, path);
+    fbin.fill(s, 0, size - (24 + len(path) + 1));
+}
+
+fn build_dylib(mod, installname: string) { return build_image(mod, installname, false); }
+
+/// Build a dylib (`exe == false`) or an executable (`exe == true`: MH_EXECUTE, __PAGEZERO, LC_LOAD_DYLINKER and
+/// LC_MAIN -- dyld calls `main(argc, argv, envp, apple)` itself and exit()s with its result, so no start-up stub).
+/// Addresses below are laid out as file offsets; `B` is the extra virtual base an executable's __TEXT sits at.
+fn build_image(mod, installname: string, exe: bool) {
+    let PAGE = 4096;
+    let B = exe ? 0x100000000 : 0;
+    let seg_ix = exe ? 2 : 1;                    // __DATA's index in the segment list (opcodes refer to it)
+    let text_len = fbin.size(mod.text);
+    let ro_len = fbin.size(mod.rodata);
+    let data_len = fbin.size(mod.data);
+    let imports = mod.undef;
+    let libs = [];
+    for (l in mod.libs) { libs.push(l); }
+    if (len(libs) == 0 || exe && !libs.contains("/usr/lib/libSystem.B.dylib")) { libs.push("/usr/lib/libSystem.B.dylib"); }
+    let exps = [];
+    var main_off = -1;
+    if (exe) {
+        for (s in mod.syms) { if (s.name == "main" && s.kind == "func") { main_off = s.off; } }
+        if (main_off < 0) { util.fail("an executable needs a `fn main` (define `fn main() -> int { ... }`)", 0, 0); }
+    } else {
+        for (s in mod.syms) { if (s.global) { exps.push(s); } }
+    }
+    let DYLINKER = "/usr/lib/dyld";
+    let dlsize = util.align_up(12 + len(DYLINKER) + 1, 8);
+
+    // load command sizes
+    var idsize = util.align_up(24 + len(installname) + 1, 8);
+    var libsize = 0;
+    for (l in libs) { libsize = libsize + util.align_up(24 + len(l) + 1, 8); }
+    let seg_text = 72 + 2 * 80;
+    let seg_data = 72 + 3 * 80;
+    let seg_link = 72;
+    var sizeofcmds = seg_text + seg_data + seg_link + 48 + 24 + 80 + idsize + libsize + 24 + 24;
+    var ncmds = 9 + len(libs);
+    if (exe) {      // + __PAGEZERO, LC_LOAD_DYLINKER, LC_MAIN;  - LC_ID_DYLIB
+        sizeofcmds = sizeofcmds + 72 + dlsize + 24 - idsize;
+        ncmds = ncmds + 2;
+    }
+    let hdr = 32 + sizeofcmds;
+
+    // ---- addresses (vmaddr == fileoff for TEXT and DATA, image base 0)
+    let text_addr = util.align_up(hdr, 16);
+    let stubs_addr = util.align_up(text_addr + text_len, 16);
+    let text_sect_end = stubs_addr + 8 * len(imports);
+    let ro_addr = util.align_up(text_sect_end, 16);
+    let text_seg_end = ro_addr + ro_len;
+    let text_vmsize = util.align_up(text_seg_end, PAGE);
+    let data_seg = text_vmsize;
+    let got_addr = data_seg;
+    let data_addr = util.align_up(got_addr + 8 * len(imports), 16);
+    let bss_addr = util.align_up(data_addr + data_len, 16);
+    let data_file_end = data_addr + data_len;
+    let data_vm_end = bss_addr + mod.bss;
+    let data_filesize = util.align_up(data_file_end - data_seg, PAGE);
+    let data_vmsize = util.align_up(data_vm_end - data_seg, PAGE);
+    let link_off = data_seg + data_filesize;
+
+    var base = { text: text_addr, rodata: ro_addr, data: data_addr, bss: bss_addr };
+    let symaddr = {};
+    for (s in mod.syms) { symaddr[s.name] = base[s.sec] + s.off; }
+    let text = fbin.from_bytes(fbin.to_bytes(mod.text, 0, text_len));
+    let data = fbin.from_bytes(fbin.to_bytes(mod.data, 0, data_len));
+    let stub_of = {};
+    let got_of = {};
+    var i = 0;
+    for (u in imports) { stub_of[u] = stubs_addr + 8 * i; got_of[u] = got_addr + 8 * i; i = i + 1; }
+    let rebase_sites = [];
+    for (r in mod.relocs) {
+        if (r.kind == "abs64") {
+            util.patch_u64(data, r.off, B + symaddr[r.sym] + r.addend);
+            rebase_sites.push(data_addr + r.off - data_seg);
+            continue;
+        }
+        let place = text_addr + r.off;
+        let s = (r.kind == "call_ext") ? stub_of[r.sym] : symaddr[r.sym];
+        util.patch_i32(text, r.off, s + r.addend - place);
+    }
+    let stubs = fbin.buffer();
+    for (u in imports) {
+        let at = stub_of[u];
+        fbin.write_u8(stubs, 0xFF); fbin.write_u8(stubs, 0x25);
+        fbin.write_i32(stubs, got_of[u] - (at + 6));
+        fbin.write_u8(stubs, 0xCC); fbin.write_u8(stubs, 0xCC);
+    }
+
+    // ---- LINKEDIT payloads
+    let rebase = fbin.buffer();
+    if (len(rebase_sites) > 0) {
+        fbin.write_u8(rebase, 0x11);                                   // type = pointer
+        for (site in rebase_sites) {
+            fbin.write_u8(rebase, 0x20 | seg_ix);                      // __DATA segment + offset
+            fbin.write_bytes(rebase, util.uleb(site));
+            fbin.write_u8(rebase, 0x51);                               // rebase once
+        }
+    }
+    fbin.write_u8(rebase, 0);
+    util.pad_to(rebase, 8, 0);
+    let bind = fbin.buffer();
+    for (u in imports) {
+        var ord = 1;
+        let want = mod.import_lib.has(u) ? mod.import_lib[u] : libs[0];
+        var j = 0;
+        for (l in libs) { if (l == want) { ord = j + 1; } j = j + 1; }
+        if (ord < 16) { fbin.write_u8(bind, 0x10 | ord); }
+        else { fbin.write_u8(bind, 0x20); fbin.write_bytes(bind, util.uleb(ord)); }
+        fbin.write_u8(bind, 0x40);
+        util.write_cstr(bind, "_" + u);
+        fbin.write_u8(bind, 0x51);                                     // type pointer
+        fbin.write_u8(bind, 0x70 | seg_ix);                            // __DATA segment + offset
+        fbin.write_bytes(bind, util.uleb(got_of[u] - data_seg));
+        fbin.write_u8(bind, 0x90);                                     // do bind
+    }
+    fbin.write_u8(bind, 0);
+    util.pad_to(bind, 8, 0);
+    // export trie (prefix-compressed, node offsets are 3-byte padded ULEBs so layout needs one pass)
+    let items = [];
+    for (s in exps) { items.push({ rest: "_" + s.name, addr: symaddr[s.name] }); }
+    let root = trie_build(items);
+    trie_layout(root, 0);
+    let trie = fbin.buffer();
+    trie_write(trie, root);
+    util.pad_to(trie, 8, 0);
+    // symbol table: defined exports, then imports
+    let strtab = fbin.buffer();
+    fbin.write_u8(strtab, 0x20); fbin.write_u8(strtab, 0);
+    let symbuf = fbin.buffer();
+    var nsyms = 0;
+    let secord = { text: 1, rodata: 2, data: 4, bss: 5 };
+    for (s in exps) {
+        fbin.seek(strtab, 0, "end");
+        let sx = fbin.tell(strtab);
+        util.write_cstr(strtab, "_" + s.name);
+        fbin.write_u32(symbuf, sx); fbin.write_u8(symbuf, 0x0F); fbin.write_u8(symbuf, secord[s.sec]);
+        fbin.write_u16(symbuf, 0); fbin.write_u64(symbuf, symaddr[s.name]);
+        nsyms = nsyms + 1;
+    }
+    for (u in imports) {
+        fbin.seek(strtab, 0, "end");
+        let sx = fbin.tell(strtab);
+        util.write_cstr(strtab, "_" + u);
+        var ord = 1;
+        let want = mod.import_lib.has(u) ? mod.import_lib[u] : libs[0];
+        var j = 0;
+        for (l in libs) { if (l == want) { ord = j + 1; } j = j + 1; }
+        fbin.write_u32(symbuf, sx); fbin.write_u8(symbuf, 0x01); fbin.write_u8(symbuf, 0);
+        fbin.write_u16(symbuf, ord << 8); fbin.write_u64(symbuf, 0);
+        nsyms = nsyms + 1;
+    }
+    util.pad_to(strtab, 8, 0);
+    let rebase_off = link_off;
+    let bind_off = rebase_off + fbin.size(rebase);
+    let export_off = bind_off + fbin.size(bind);
+    let sym_off = util.align_up(export_off + fbin.size(trie), 8);
+    let str_off = sym_off + 16 * nsyms;
+    let link_end = str_off + fbin.size(strtab);
+    let link_size = link_end - link_off;
+
+    // ---- write the file
+    let out = fbin.buffer();
+    fbin.write_u32(out, MH_MAGIC_64); fbin.write_u32(out, CPU_X86_64); fbin.write_u32(out, 3);
+    fbin.write_u32(out, exe ? 2 : 6);             // MH_EXECUTE / MH_DYLIB
+    fbin.write_u32(out, ncmds); fbin.write_u32(out, sizeofcmds);
+    fbin.write_u32(out, exe ? 0x200085 : 0x100084);   // DYLDLINK | TWOLEVEL | (PIE | NOUNDEFS) / NO_REEXPORTED_DYLIBS
+    fbin.write_u32(out, 0);
+    if (exe) {                                    // __PAGEZERO: the unmapped first 4 GiB
+        fbin.write_u32(out, 0x19); fbin.write_u32(out, 72);
+        name16(out, "__PAGEZERO");
+        fbin.write_u64(out, 0); fbin.write_u64(out, B);
+        fbin.write_u64(out, 0); fbin.write_u64(out, 0);
+        fbin.write_u32(out, 0); fbin.write_u32(out, 0); fbin.write_u32(out, 0); fbin.write_u32(out, 0);
+    }
+    // __TEXT
+    fbin.write_u32(out, 0x19); fbin.write_u32(out, seg_text);
+    name16(out, "__TEXT");
+    fbin.write_u64(out, B); fbin.write_u64(out, text_vmsize);
+    fbin.write_u64(out, 0); fbin.write_u64(out, text_vmsize);
+    fbin.write_u32(out, 5); fbin.write_u32(out, 5); fbin.write_u32(out, 2); fbin.write_u32(out, 0);
+    section_hdr(out, "__text", "__TEXT", B + text_addr, text_sect_end - text_addr, text_addr, 4, 0, 0, 0x80000400);
+    section_hdr(out, "__const", "__TEXT", B + ro_addr, ro_len, ro_addr, 4, 0, 0, 0);
+    // __DATA
+    fbin.write_u32(out, 0x19); fbin.write_u32(out, seg_data);
+    name16(out, "__DATA");
+    fbin.write_u64(out, B + data_seg); fbin.write_u64(out, data_vmsize);
+    fbin.write_u64(out, data_seg); fbin.write_u64(out, data_filesize);
+    fbin.write_u32(out, 3); fbin.write_u32(out, 3); fbin.write_u32(out, 3); fbin.write_u32(out, 0);
+    section_hdr(out, "__got", "__DATA", B + got_addr, 8 * len(imports), got_addr, 3, 0, 0, 0);
+    section_hdr(out, "__data", "__DATA", B + data_addr, data_len, data_addr, 4, 0, 0, 0);
+    section_hdr(out, "__bss", "__DATA", B + bss_addr, mod.bss, 0, 4, 0, 0, 1);
+    // __LINKEDIT
+    fbin.write_u32(out, 0x19); fbin.write_u32(out, seg_link);
+    name16(out, "__LINKEDIT");
+    fbin.write_u64(out, B + data_seg + data_vmsize); fbin.write_u64(out, util.align_up(link_size, PAGE));
+    fbin.write_u64(out, link_off); fbin.write_u64(out, link_size);
+    fbin.write_u32(out, 1); fbin.write_u32(out, 1); fbin.write_u32(out, 0); fbin.write_u32(out, 0);
+    // LC_DYLD_INFO_ONLY
+    fbin.write_u32(out, 0x80000022); fbin.write_u32(out, 48);
+    fbin.write_u32(out, rebase_off); fbin.write_u32(out, fbin.size(rebase));
+    fbin.write_u32(out, bind_off); fbin.write_u32(out, fbin.size(bind));
+    fbin.write_u32(out, 0); fbin.write_u32(out, 0);
+    fbin.write_u32(out, 0); fbin.write_u32(out, 0);
+    fbin.write_u32(out, export_off); fbin.write_u32(out, fbin.size(trie));
+    // LC_SYMTAB
+    fbin.write_u32(out, 2); fbin.write_u32(out, 24);
+    fbin.write_u32(out, sym_off); fbin.write_u32(out, nsyms); fbin.write_u32(out, str_off); fbin.write_u32(out, fbin.size(strtab));
+    // LC_DYSYMTAB
+    fbin.write_u32(out, 0xB); fbin.write_u32(out, 80);
+    fbin.write_u32(out, 0); fbin.write_u32(out, 0);
+    fbin.write_u32(out, 0); fbin.write_u32(out, len(exps));
+    fbin.write_u32(out, len(exps)); fbin.write_u32(out, len(imports));
+    for (z in 0..12) { fbin.write_u32(out, 0); }
+    if (exe) {
+        fbin.write_u32(out, 0xE); fbin.write_u32(out, dlsize); fbin.write_u32(out, 12);      // LC_LOAD_DYLINKER
+        util.write_cstr(out, DYLINKER);
+        fbin.fill(out, 0, dlsize - (12 + len(DYLINKER) + 1));
+        fbin.write_u32(out, 0x80000028); fbin.write_u32(out, 24);                              // LC_MAIN
+        fbin.write_u64(out, main_off + text_addr); fbin.write_u64(out, 0);                     // entryoff (from __TEXT), default stack
+    } else { dylib_cmd(out, 0xD, installname, 1); }
+    for (l in libs) { dylib_cmd(out, 0xC, l, 2); }
+    // LC_BUILD_VERSION: macOS, min 10.15
+    fbin.write_u32(out, 0x32); fbin.write_u32(out, 24);
+    fbin.write_u32(out, 1); fbin.write_u32(out, 0x000A0F00); fbin.write_u32(out, 0x000A0F00); fbin.write_u32(out, 0);
+    // LC_UUID derived from the code
+    fbin.write_u32(out, 0x1B); fbin.write_u32(out, 24);
+    fbin.write_bytes(out, fbin.to_bytes(fbin.from_hex(fbin.sha256(text)[0..32]), 0, 16));
+    fbin.fill(out, 0, text_addr - fbin.size(out));
+    fbin.write_bytes(out, fbin.to_bytes(text, 0, text_len));
+    fbin.fill(out, 0, stubs_addr - (text_addr + text_len));
+    fbin.write_bytes(out, fbin.to_bytes(stubs, 0, fbin.size(stubs)));
+    fbin.fill(out, 0, ro_addr - (stubs_addr + 8 * len(imports)));
+    fbin.write_bytes(out, fbin.to_bytes(mod.rodata, 0, ro_len));
+    fbin.fill(out, 0, data_seg - fbin.size(out));
+    fbin.fill(out, 0, data_addr - data_seg);             // got slots (bound by dyld)
+    fbin.write_bytes(out, fbin.to_bytes(data, 0, data_len));
+    fbin.fill(out, 0, link_off - fbin.size(out));
+    fbin.write_bytes(out, fbin.to_bytes(rebase, 0, fbin.size(rebase)));
+    fbin.write_bytes(out, fbin.to_bytes(bind, 0, fbin.size(bind)));
+    fbin.write_bytes(out, fbin.to_bytes(trie, 0, fbin.size(trie)));
+    fbin.fill(out, 0, sym_off - fbin.size(out));
+    fbin.write_bytes(out, fbin.to_bytes(symbuf, 0, fbin.size(symbuf)));
+    fbin.write_bytes(out, fbin.to_bytes(strtab, 0, fbin.size(strtab)));
+    return out;
+}

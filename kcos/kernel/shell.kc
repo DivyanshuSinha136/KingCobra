@@ -1,0 +1,495 @@
+// shell.kc -- the KCOS command shell: line editor with history, and the built-in commands.  Author: Divyanshu Sinha (MIT License)
+const LINE_MAX = 128;
+const HIST_N = 16;
+
+var sh_line: u8[128];
+var sh_argv: int[16];             // addresses of the argument strings
+var sh_argc = 0;
+var sh_raw: u8[128];               // untouched copy of the line
+var sh_rest: *u8;                  // text after the command word (for echo / calc), points into sh_raw
+var sh_hist: u8[2048];             // HIST_N lines of 128 bytes
+var sh_hist_count = 0;
+var sh_running = true;
+var calc_p: *u8;
+var calc_err = false;
+var zero_for_crash = 0;
+
+fn av(i: int) -> *u8 { return sh_argv[i] as *u8; }
+
+fn prompt() {
+    var path: u8[128];
+    fs_path(fs_cwd, &path[0]);
+    con_setcolor(10, 0); con_puts("kcos");
+    con_setcolor(7, 0);  con_puts(":");
+    con_setcolor(11, 0); con_puts(&path[0]);
+    con_setcolor(7, 0);  con_puts("$ ");
+}
+
+fn hist_slot(i: int) -> *u8 { return &sh_hist[(i % HIST_N) * LINE_MAX]; }
+
+/// read one line with editing (backspace, Ctrl+U, Ctrl+C, Ctrl+L, Up/Down history)
+fn readline() {
+    var n = 0;
+    var hpos = sh_hist_count;
+    sh_line[0] = 0;
+    while (true) {
+        let c = getc();
+        if (c == 10) { con_putc('\n'); sh_line[n] = 0; return; }
+        if (c == 8) { if (n > 0) { n--; con_puts("\x08 \x08"); } }
+        else if (c == 3) { con_puts("^C\n"); n = 0; sh_line[0] = 0; return; }
+        else if (c == 12) { con_clear(); prompt(); var k = 0; while (k < n) { con_putc(sh_line[k]); k++; } }
+        else if (c == 21) { while (n > 0) { n--; con_puts("\x08 \x08"); } }
+        else if (c == KEY_UP || c == KEY_DOWN) {
+            var want = hpos;
+            if (c == KEY_UP && hpos > 0 && hpos > sh_hist_count - HIST_N) { want = hpos - 1; }
+            if (c == KEY_DOWN && hpos < sh_hist_count) { want = hpos + 1; }
+            if (want != hpos) {
+                hpos = want;
+                while (n > 0) { n--; con_puts("\x08 \x08"); }
+                if (hpos < sh_hist_count) {
+                    kstrncpy(&sh_line[0], hist_slot(hpos), LINE_MAX);
+                    n = kstrlen(&sh_line[0]);
+                    var k = 0;
+                    while (k < n) { con_putc(sh_line[k]); k++; }
+                }
+            }
+        }
+        else if (c >= 32 && c < 127 && n < LINE_MAX - 1) { sh_line[n] = c as u8; n++; con_putc(c); }
+    }
+}
+
+fn tokenize() {
+    sh_argc = 0;
+    kstrncpy(&sh_raw[0], &sh_line[0], LINE_MAX);
+    var r = 0;
+    while (kisspace(sh_raw[r])) { r++; }
+    while (sh_raw[r] != 0 && !kisspace(sh_raw[r])) { r++; }
+    while (kisspace(sh_raw[r])) { r++; }
+    sh_rest = &sh_raw[r];
+    var i = 0;
+    while (sh_line[i] != 0) {
+        while (kisspace(sh_line[i])) { i++; }
+        if (sh_line[i] == 0) { break; }
+        if (sh_argc >= 15) { break; }
+        sh_argv[sh_argc] = (&sh_line[i]) as int;
+        sh_argc++;
+        while (sh_line[i] != 0 && !kisspace(sh_line[i])) { i++; }
+        if (sh_line[i] != 0) { sh_line[i] = 0; i++; }
+    }
+    sh_argv[sh_argc] = 0;
+}
+
+// ---------------------------------------------------------------- calc: + - * / % ( ) and unary minus, decimal or 0x numbers
+fn calc_ws() { while (*calc_p == ' ') { calc_p++; } }
+fn calc_atom() -> int {
+    calc_ws();
+    if (*calc_p == '(') {
+        calc_p++;
+        let v = calc_expr();
+        calc_ws();
+        if (*calc_p == ')') { calc_p++; } else { calc_err = true; }
+        return v;
+    }
+    if (*calc_p == '-') { calc_p++; return -calc_atom(); }
+    if (!kisdigit(*calc_p)) { calc_err = true; return 0; }
+    let v = katoi(calc_p);
+    if (calc_p[0] == '0' && (calc_p[1] == 'x' || calc_p[1] == 'X')) { calc_p = calc_p + 2; while (khexval(*calc_p) >= 0) { calc_p++; } }
+    else { while (kisdigit(*calc_p)) { calc_p++; } }
+    return v;
+}
+fn calc_term() -> int {
+    var v = calc_atom();
+    while (true) {
+        calc_ws();
+        let op = *calc_p;
+        if (op != '*' && op != '/' && op != '%') { return v; }
+        calc_p++;
+        let r = calc_atom();
+        if (op == '*') { v = v * r; }
+        else { if (r == 0) { calc_err = true; return 0; } if (op == '/') { v = v / r; } else { v = v % r; } }
+    }
+    return v;
+}
+fn calc_expr() -> int {
+    var v = calc_term();
+    while (true) {
+        calc_ws();
+        let op = *calc_p;
+        if (op != '+' && op != '-') { return v; }
+        calc_p++;
+        let r = calc_term();
+        if (op == '+') { v = v + r; } else { v = v - r; }
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------- commands
+fn cmd_help() {
+    con_puts("KCOS commands\n");
+    con_puts("  files   ls [path]  cd [path]  pwd  cat <file>  mkdir <dir>  touch <file>  rm <path>\n");
+    con_puts("          echo <text> [> file | >> file]   stat <path>   fsinfo\n");
+    con_puts("          sync (save the filesystem to disk)   fsreset (forget the saved copy)   disk   tasks   threads\n");
+    con_puts("  system  mem  memmap  heap  cpuinfo  uptime  date  ver  clear  history\n");
+    con_puts("  tools   calc <expr>  hexdump <addr> [len]  sleep <ms>  beep [hz] [ms]  color <fg> <bg>  cobra\n");
+    con_puts("  power   reboot  halt  poweroff  crash (trigger a divide-by-zero panic)\n");
+    con_puts("Keys: Up/Down history, Ctrl+C cancel, Ctrl+L clear, Ctrl+U kill line.\n");
+}
+
+fn cmd_ls() {
+    var dir = fs_cwd;
+    if (sh_argc > 1) { dir = fs_resolve(av(1)); }
+    if (dir < 0) { con_puts("ls: no such path\n"); return; }
+    if (fs_nodes[dir].kind == K_FILE) { con_puts(&fs_nodes[dir].name[0]); con_putc('\n'); return; }
+    var i = 1;
+    var count = 0;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == dir) {
+            if (fs_nodes[i].kind == K_DIR) { con_setcolor(11, 0); con_puts(&fs_nodes[i].name[0]); con_puts("/"); con_setcolor(7, 0); con_puts("\n"); }
+            else { con_puts(&fs_nodes[i].name[0]); con_puts("  "); con_setcolor(8, 0); con_putdec(fs_nodes[i].size); con_puts(" B"); con_setcolor(7, 0); con_puts("\n"); }
+            count++;
+        }
+        i++;
+    }
+    if (count == 0) { con_puts("(empty)\n"); }
+}
+
+fn cmd_cd() {
+    if (sh_argc < 2) { fs_cwd = 0; return; }
+    let n = fs_resolve(av(1));
+    if (n < 0) { con_puts("cd: no such directory\n"); return; }
+    if (fs_nodes[n].kind != K_DIR) { con_puts("cd: not a directory\n"); return; }
+    fs_cwd = n;
+}
+
+fn cmd_cat() {
+    if (sh_argc < 2) { con_puts("usage: cat <file>\n"); return; }
+    let n = fs_resolve(av(1));
+    if (n < 0) { con_puts("cat: no such file\n"); return; }
+    if (fs_nodes[n].kind != K_FILE) { con_puts("cat: is a directory\n"); return; }
+    var i = 0;
+    while (i < fs_nodes[n].size) { con_putc(fs_nodes[n].data[i]); i++; }
+    if (fs_nodes[n].size > 0 && fs_nodes[n].data[fs_nodes[n].size - 1] != '\n') { con_putc('\n'); }
+}
+
+fn cmd_echo() {
+    // find a trailing "> file" or ">> file"
+    var text: u8[128];
+    kstrncpy(&text[0], sh_rest, LINE_MAX);
+    var redirect = 0;                       // 0 none, 1 truncate, 2 append
+    var i = 0;
+    var cut = -1;
+    while (text[i] != 0) {
+        if (text[i] == '>') { cut = i; redirect = 1; if (text[i + 1] == '>') { redirect = 2; } break; }
+        i++;
+    }
+    if (redirect == 0) { con_puts(&text[0]); con_putc('\n'); return; }
+    var j = cut + redirect;
+    while (text[j] == ' ') { j++; }
+    var end = cut;
+    while (end > 0 && text[end - 1] == ' ') { end--; }
+    text[end] = 0;
+    if (text[j] == 0) { con_puts("echo: missing file name\n"); return; }
+    var n = fs_resolve(&text[j]);
+    if (n < 0) { n = fs_create(&text[j], K_FILE); }
+    if (n < 0) { con_puts("echo: cannot create file\n"); return; }
+    text[end] = '\n';
+    text[end + 1] = 0;
+    if (!fs_write(n, &text[0], end + 1, redirect == 2)) { con_puts("echo: write failed\n"); }
+}
+
+fn cmd_stat() {
+    if (sh_argc < 2) { con_puts("usage: stat <path>\n"); return; }
+    let n = fs_resolve(av(1));
+    if (n < 0) { con_puts("stat: no such path\n"); return; }
+    var path: u8[128];
+    fs_path(n, &path[0]);
+    con_puts("path: "); con_puts(&path[0]); con_puts("\ntype: "); con_puts(fs_nodes[n].kind == K_DIR ? "directory" : "file");
+    con_puts("\nsize: "); con_putdec(fs_nodes[n].size); con_puts(" bytes\nnode: "); con_putdec(n);
+    con_puts("\nmodified: tick "); con_putdec(fs_nodes[n].mtime); con_putc('\n');
+}
+
+fn cmd_fsinfo() {
+    var st: int[4];
+    fs_stats(&st[0]);
+    con_puts("KCFS (in-memory)\n  nodes: "); con_putdec(st[0]); con_puts(" / "); con_putdec(FS_MAX);
+    con_puts("\n  files: "); con_putdec(st[1]); con_puts("   directories: "); con_putdec(st[2]);
+    con_puts("\n  data:  "); con_putdec(st[3]); con_puts(" bytes\n");
+}
+
+fn cmd_mem() {
+    var h: int[4];
+    heap_stats(&h[0]);
+    con_puts("RAM (E820 usable): "); con_putdec(ram_usable >> 20); con_puts(" MiB\n");
+    con_puts("Frames: "); con_putdec(pm_frames); con_puts(" tracked, "); con_putdec(pm_free); con_puts(" free ("); con_putdec((pm_free * 4) >> 10); con_puts(" MiB free)\n");
+    con_puts("Heap:   "); con_putdec(heap_size >> 10); con_puts(" KiB at "); con_puthex(heap_start);
+    con_puts(", used "); con_putdec(h[0]); con_puts(" B in "); con_putdec(h[2]); con_puts(" blocks, free "); con_putdec(h[1] >> 10); con_puts(" KiB\n");
+}
+
+fn cmd_memmap() {
+    var i = 0;
+    let n = e820_count();
+    con_puts("BIOS E820 memory map ("); con_putdec(n); con_puts(" entries)\n");
+    while (i < n) {
+        con_puts("  "); con_puthex_w(e820_base(i), 10); con_puts(" - "); con_puthex_w(e820_base(i) + e820_len(i) - 1, 10); con_puts("  ");
+        let t = e820_type(i);
+        con_puts(t == 1 ? "usable" : (t == 2 ? "reserved" : (t == 3 ? "ACPI reclaimable" : (t == 4 ? "ACPI NVS" : "bad/other"))));
+        con_putc('\n');
+        i++;
+    }
+}
+
+fn cmd_heap() {
+    // allocate, use and free a few blocks to show the allocator working
+    let a = kmalloc(100); let b = kmalloc(5000); let c = kmalloc(32);
+    var h: int[4];
+    heap_stats(&h[0]);
+    con_puts("alloc 100/5000/32 -> "); con_puthex(a as int); con_puts(" "); con_puthex(b as int); con_puts(" "); con_puthex(c as int);
+    con_puts("\nin use: "); con_putdec(h[0]); con_puts(" B in "); con_putdec(h[2]); con_puts(" blocks\n");
+    kfree(b); kfree(a); kfree(c);
+    heap_stats(&h[0]);
+    con_puts("after free: "); con_putdec(h[0]); con_puts(" B in use, free blocks: "); con_putdec(h[3]); con_puts(" (coalesced)\n");
+}
+
+fn cmd_cpuinfo() {
+    var r: u32[4];
+    var vendor: u8[16];
+    var brand: u8[52];
+    cpuid(0, &r[0]);
+    *((&vendor[0]) as *u32) = r[1];
+    *((&vendor[4]) as *u32) = r[3];
+    *((&vendor[8]) as *u32) = r[2];
+    vendor[12] = 0;
+    con_puts("vendor:   "); con_puts(&vendor[0]); con_putc('\n');
+    cpuid(0x80000000, &r[0]);
+    if ((r[0] as int) >= 0x80000004) {
+        var k = 0;
+        while (k < 3) {
+            cpuid(0x80000002 + k, &r[0]);
+            *((&brand[k * 16]) as *u32) = r[0];
+            *((&brand[k * 16 + 4]) as *u32) = r[1];
+            *((&brand[k * 16 + 8]) as *u32) = r[2];
+            *((&brand[k * 16 + 12]) as *u32) = r[3];
+            k++;
+        }
+        brand[48] = 0;
+        var s = 0;
+        while (brand[s] == ' ') { s++; }
+        con_puts("model:    "); con_puts(&brand[s]); con_putc('\n');
+    }
+    cpuid(1, &r[0]);
+    let edx = r[3] as int;
+    let ecx = r[2] as int;
+    con_puts("features:");
+    if ((edx & (1 << 25)) != 0) { con_puts(" sse"); }
+    if ((edx & (1 << 26)) != 0) { con_puts(" sse2"); }
+    if ((ecx & 1) != 0) { con_puts(" sse3"); }
+    if ((ecx & (1 << 19)) != 0) { con_puts(" sse4.1"); }
+    if ((ecx & (1 << 28)) != 0) { con_puts(" avx"); }
+    if ((edx & (1 << 9)) != 0) { con_puts(" apic"); }
+    if ((edx & (1 << 4)) != 0) { con_puts(" tsc"); }
+    if ((ecx & (1 << 31)) != 0) { con_puts(" hypervisor"); }
+    con_putc('\n');
+    con_puts("TSC:      "); con_putdec(rdtsc() >> 20); con_puts(" M cycles since reset\n");
+}
+
+fn cmd_uptime() {
+    let s = ticks / PIT_HZ;
+    con_puts("up "); con_putdec(s / 3600); con_puts("h "); con_putdec((s / 60) % 60); con_puts("m "); con_putdec(s % 60); con_puts("s  ("); con_putdec(ticks); con_puts(" ticks @ "); con_putdec(PIT_HZ); con_puts(" Hz)\n");
+}
+
+fn cmd_date() {
+    var t: int[6];
+    rtc_read(&t[0]);
+    con_putudec_pad(t[0], 4); con_putc('-'); con_putudec_pad(t[1], 2); con_putc('-'); con_putudec_pad(t[2], 2); con_putc(' ');
+    con_putudec_pad(t[3], 2); con_putc(':'); con_putudec_pad(t[4], 2); con_putc(':'); con_putudec_pad(t[5], 2); con_puts(" (UTC, CMOS clock)\n");
+}
+
+fn cmd_hexdump() {
+    if (sh_argc < 2) { con_puts("usage: hexdump <addr> [len]\n"); return; }
+    let addr = katoi(av(1));
+    var len = 64;
+    if (sh_argc > 2) { len = katoi(av(2)); }
+    if (len > 512) { len = 512; }
+    var off = 0;
+    while (off < len) {
+        con_puthex_w(addr + off, 8); con_puts("  ");
+        var k = 0;
+        while (k < 16) {
+            if (off + k < len) { con_puthex_w(((addr + off + k) as *u8)[0] as int, 2); } else { con_puts("  "); }
+            con_putc(' ');
+            k++;
+        }
+        con_puts(" |");
+        k = 0;
+        while (k < 16 && off + k < len) {
+            let ch = ((addr + off + k) as *u8)[0] as int;
+            con_putc(ch >= 32 && ch < 127 ? ch : '.');
+            k++;
+        }
+        con_puts("|\n");
+        off = off + 16;
+    }
+}
+
+fn cmd_color() {
+    if (sh_argc < 3) { con_puts("usage: color <fg 0-15> <bg 0-15>\n"); return; }
+    con_setcolor(katoi(av(1)), katoi(av(2)));
+}
+
+fn cmd_cobra() {
+    con_setcolor(10, 0);
+    con_puts("        ____\n");
+    con_puts("       / ___\\_\n");
+    con_puts("      | /  o o\\       _\n");
+    con_puts("      | \\   v  \\_   / \\\n");
+    con_puts("       \\_\\___    \\_/   \\\n");
+    con_puts("          \\____        /\n");
+    con_puts("   ~ ~ ~ ~ ~  \\_______/  ~ ~ ~\n");
+    con_setcolor(14, 0);
+    con_puts("        K i n g C o b r a   O S\n");
+    con_setcolor(7, 0);
+}
+
+fn cmd_reboot() {
+    con_puts("rebooting...\n");
+    cli();
+    var spin = 0;
+    while (spin < 100000 && (inb(0x64) & 2) != 0) { spin++; }
+    outb(0x64, 0xFE);                         // keyboard controller reset line
+    int3();                                    // fallback: with a broken IDT this triple-faults
+    while (true) { hlt(); }
+}
+
+fn cmd_poweroff() {
+    con_puts("powering off...\n");
+    outw(0x604, 0x2000);                       // QEMU (ACPI PM1a)
+    outw(0xB004, 0x2000);                      // Bochs / old QEMU
+    outw(0x4004, 0x3400);                      // VirtualBox
+    con_puts("It is now safe to turn off your computer.\n");
+    cli();
+    while (true) { hlt(); }
+}
+
+var th_counter = 0;
+var th_done = 0;
+
+fn th_worker(id: int) {
+    var i = 0;
+    while (i < 300000) {
+        atomic_add(&th_counter, 1);
+        i++;
+        if (i % 100000 == 0) { task_yield(); }
+    }
+    atomic_add(&th_done, 1);
+}
+
+fn cmd_threads() {
+    th_counter = 0; th_done = 0;
+    let sw0 = switches;
+    let t0 = ticks;
+    var k = 0;
+    while (k < 3) { if (spawn(fnaddr(th_worker), k) < 0) { con_puts("threads: could not start a thread\n"); } k++; }
+    while (th_done < 3) { hlt(); }
+    con_puts("3 threads x 300000 atomic increments = "); con_putdec(th_counter);
+    con_puts(th_counter == 900000 ? "  (correct)" : "  (WRONG)");
+    con_puts("\ncontext switches: "); con_putdec(switches - sw0); con_puts(" in "); con_putdec((ticks - t0) * 10); con_puts(" ms\n");
+}
+
+fn cmd_tasks() {
+    var i = 0;
+    con_puts("id  state  stack\n");
+    while (i < MAX_TASKS) {
+        if (tasks[i].state != T_FREE) {
+            con_putdec_w(i, 2); con_puts("  "); con_puts(tasks[i].state == T_READY ? "ready " : "dead  "); con_puts(i == cur_task ? " <- running " : " ");
+            if (i == 0) { con_puts("(boot/shell)"); } else { con_puthex(tasks[i].stack as int); }
+            con_putc('\n');
+        }
+        i++;
+    }
+    con_puts("context switches so far: "); con_putdec(switches); con_putc('\n');
+}
+
+fn cmd_disk() {
+    if (!disk_present) { con_puts("no ATA disk\n"); return; }
+    con_puts("ATA primary master: "); con_puts(&disk_model[0]); con_puts("\n  "); con_putdec(disk_sectors); con_puts(" sectors ("); con_putdec(disk_sectors >> 11); con_puts(" MiB)\n");
+    con_puts("  KCFS store at LBA "); con_putdec(STORE_LBA); con_puts(fs_persisted ? ": in use\n" : ": not saved yet\n");
+}
+
+fn cmd_sync() {
+    let r = fs_save();
+    if (r == 0) { con_puts("filesystem saved to disk\n"); }
+    else if (r == 1) { con_puts("sync: no ATA disk\n"); }
+    else if (r == 2) { con_puts("sync: filesystem too big for the 256 KiB store\n"); }
+    else if (r == 4) { con_puts("sync: out of memory\n"); }
+    else { con_puts("sync: disk I/O error\n"); }
+}
+
+fn run_command() {
+    tokenize();
+    if (sh_argc == 0) { return; }
+    let cmd = av(0);
+    if (kstreq(cmd, "help") || kstreq(cmd, "?")) { cmd_help(); }
+    else if (kstreq(cmd, "ls") || kstreq(cmd, "dir")) { cmd_ls(); }
+    else if (kstreq(cmd, "cd")) { cmd_cd(); }
+    else if (kstreq(cmd, "pwd")) { var p: u8[128]; fs_path(fs_cwd, &p[0]); con_puts(&p[0]); con_putc('\n'); }
+    else if (kstreq(cmd, "cat") || kstreq(cmd, "type")) { cmd_cat(); }
+    else if (kstreq(cmd, "echo")) { cmd_echo(); }
+    else if (kstreq(cmd, "mkdir")) { if (sh_argc < 2) { con_puts("usage: mkdir <dir>\n"); } else if (fs_create(av(1), K_DIR) < 0) { con_puts("mkdir: cannot create directory\n"); } }
+    else if (kstreq(cmd, "touch")) { if (sh_argc < 2) { con_puts("usage: touch <file>\n"); } else if (fs_resolve(av(1)) < 0 && fs_create(av(1), K_FILE) < 0) { con_puts("touch: cannot create file\n"); } }
+    else if (kstreq(cmd, "rm") || kstreq(cmd, "rmdir")) {
+        if (sh_argc < 2) { con_puts("usage: rm <path>\n"); }
+        else { let n = fs_resolve(av(1)); if (n < 0) { con_puts("rm: no such path\n"); } else if (!fs_remove(n)) { con_puts("rm: cannot remove (root or non-empty directory)\n"); } }
+    }
+    else if (kstreq(cmd, "stat")) { cmd_stat(); }
+    else if (kstreq(cmd, "fsinfo") || kstreq(cmd, "df")) { cmd_fsinfo(); }
+    else if (kstreq(cmd, "mem") || kstreq(cmd, "free")) { cmd_mem(); }
+    else if (kstreq(cmd, "memmap")) { cmd_memmap(); }
+    else if (kstreq(cmd, "threads")) { cmd_threads(); }
+    else if (kstreq(cmd, "tasks")) { cmd_tasks(); }
+    else if (kstreq(cmd, "disk")) { cmd_disk(); }
+    else if (kstreq(cmd, "sync")) { cmd_sync(); }
+    else if (kstreq(cmd, "fsreset")) { con_puts(fs_forget() ? "saved copy erased; the next boot starts with a fresh filesystem\n" : "fsreset: no disk\n"); }
+    else if (kstreq(cmd, "heap")) { cmd_heap(); }
+    else if (kstreq(cmd, "cpuinfo")) { cmd_cpuinfo(); }
+    else if (kstreq(cmd, "uptime")) { cmd_uptime(); }
+    else if (kstreq(cmd, "date")) { cmd_date(); }
+    else if (kstreq(cmd, "ver") || kstreq(cmd, "uname")) { con_puts("KCOS 0.1 (x86-64) -- kernel written in KingCobra, built with kcc --target kcos\n"); }
+    else if (kstreq(cmd, "clear") || kstreq(cmd, "cls")) { con_clear(); }
+    else if (kstreq(cmd, "history")) { var i = (sh_hist_count > HIST_N) ? sh_hist_count - HIST_N : 0; while (i < sh_hist_count) { con_putdec_w(i + 1, 4); con_puts("  "); con_puts(hist_slot(i)); con_putc('\n'); i++; } }
+    else if (kstreq(cmd, "calc")) {
+        calc_p = sh_rest; calc_err = false;
+        let v = calc_expr();
+        calc_ws();
+        if (calc_err || *calc_p != 0 || sh_rest[0] == 0) { con_puts("calc: syntax error (or division by zero)\n"); }
+        else { con_putdec(v); con_puts("  ("); con_puthex(v); con_puts(")\n"); }
+    }
+    else if (kstreq(cmd, "hexdump") || kstreq(cmd, "peek")) { cmd_hexdump(); }
+    else if (kstreq(cmd, "sleep")) { if (sh_argc < 2) { con_puts("usage: sleep <ms>\n"); } else { pit_sleep_ms(katoi(av(1))); } }
+    else if (kstreq(cmd, "beep")) {
+        var f = 880; var ms = 200;
+        if (sh_argc > 1) { f = katoi(av(1)); }
+        if (sh_argc > 2) { ms = katoi(av(2)); }
+        speaker_on(f); pit_sleep_ms(ms); speaker_off();
+    }
+    else if (kstreq(cmd, "color")) { cmd_color(); }
+    else if (kstreq(cmd, "cobra")) { cmd_cobra(); }
+    else if (kstreq(cmd, "reboot")) { cmd_reboot(); }
+    else if (kstreq(cmd, "halt")) { con_puts("system halted.\n"); cli(); while (true) { hlt(); } }
+    else if (kstreq(cmd, "poweroff") || kstreq(cmd, "shutdown")) { cmd_poweroff(); }
+    else if (kstreq(cmd, "crash")) { con_putdec(1 / zero_for_crash); }
+    else { con_puts(cmd); con_puts(": command not found (try 'help')\n"); }
+}
+
+fn shell_run() {
+    let motd = fs_resolve("/etc/motd");
+    if (motd >= 0) { var i = 0; while (i < fs_nodes[motd].size) { con_putc(fs_nodes[motd].data[i]); i++; } }
+    while (sh_running) {
+        prompt();
+        readline();
+        if (sh_line[0] != 0) {
+            kstrncpy(hist_slot(sh_hist_count), &sh_line[0], LINE_MAX);
+            sh_hist_count++;
+            run_command();
+        }
+    }
+}

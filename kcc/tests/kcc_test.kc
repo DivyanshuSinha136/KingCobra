@@ -1,0 +1,215 @@
+// kcc_test.kc -- tests for the KingCobra native compiler (run: kingcobra test kcc/tests/kcc_test.kc)
+import std.fbin;
+import std.io;
+import std.system;
+import "../src/parser.kc" as parser;
+import "../src/check.kc" as check;
+import "../src/codegen.kc" as cg;
+import "../src/elf_obj.kc" as elf_obj;
+import "../src/elf_so.kc" as elf_so;
+import "../src/coff_obj.kc" as coff_obj;
+import "../src/pe_dll.kc" as pe_dll;
+import "../src/macho.kc" as macho;
+import "../src/flat.kc" as flat;
+
+
+fn build(src: string, target: string) {
+    let ctx = check.check_program(parser.parse_program(src));
+    return cg.gen_module(ctx, target);
+}
+
+fn error_of(src: string) -> string {
+    try { build(src, "linux"); } catch (e) { return e.line > 0 ? str(e.line) + ":" + str(e.col) + " " + e.message : e.message; }
+    return "";
+}
+
+fn test_elf_object_header() {
+    let m = build("fn f() -> int { return 1; }", "linux");
+    let o = elf_obj.build(m);
+    assert_eq(fbin.to_hex(o, 0, 4), "7f454c46");
+    assert_eq(fbin.to_bytes(o, 16, 2), [1, 0]);          // ET_REL
+}
+
+fn test_shared_object_types() {
+    let m = build("fn f() -> int { return 1; }", "linux");
+    assert_eq(fbin.to_bytes(elf_so.build(m, "x.so", false), 16, 2), [3, 0]);   // ET_DYN
+    assert_eq(fbin.to_hex(pe_dll.build(build("fn f() -> int { return 1; }", "windows"), "x.dll", false, 3), 0, 2), "4d5a");
+    assert_eq(fbin.to_hex(macho.build_dylib(build("fn f() -> int { return 1; }", "macos"), "x.dylib"), 0, 4), "cffaedfe");
+    assert_eq(fbin.to_hex(coff_obj.build(build("fn f() -> int { return 1; }", "windows")), 0, 2), "6486");
+}
+
+fn test_compile_and_call_shared_object() {
+    let src = "fn t_add(a: int, b: int) -> int { return a + b; }\n" +
+              "fn t_fact(n: int) -> int { if (n <= 1) { return 1; } return n * t_fact(n - 1); }\n" +
+              "fn t_mean(a: float, b: float) -> float { return (a + b) / 2.0; }\n";
+    let m = build(src, "linux");
+    let dir = system.make_temp_dir("kcc");
+    let lib = system.path_join(dir, "kcc_test_lib.so");
+    fbin.save(elf_so.build(m, "kcc_test_lib.so", false), lib);
+    // load the freshly compiled library from a child KingCobra process through `extern`
+    let driver = "extern fn t_add(a: int, b: int) -> int from \"" + lib + "\";\n" +
+                 "extern fn t_fact(n: int) -> int from \"" + lib + "\";\n" +
+                 "extern fn t_mean(a: float, b: float) -> float from \"" + lib + "\";\n" +
+                 "fn main() { print(t_add(40, 2), t_fact(10), t_mean(3.0, 4.0)); }\n";
+    let script = system.path_join(dir, "driver.kc");
+    io.write_file(script, driver);
+    let r = system.run_argv([system.exe_path(), script]);
+    assert_eq(r.stdout.trim(), "42 3628800 3.5");
+    system.rmdir(dir, true);
+}
+
+/// little-endian unsigned read of 2, 4 or 8 bytes at `off`
+fn rd(s, off: int, n: int) -> int {
+    fbin.seek(s, off);
+    if (n == 2) { return fbin.read_u16(s); }
+    if (n == 4) { return fbin.read_u32(s); }
+    return fbin.read_u64(s);
+}
+
+fn test_executable_headers() {
+    let src = "fn main(argc: int, argv: **u8) -> int { return argc; }";
+    let elf = elf_so.build(build(src, "linux"), "prog", true);
+    assert_eq(fbin.to_hex(elf, 0, 4), "7f454c46");
+    assert(rd(elf, 24, 8) > 0);                                              // e_entry is set
+    let pe = pe_dll.build(build(src, "windows"), "prog.exe", true, 3);
+    assert_eq(fbin.to_hex(pe, 0, 2), "4d5a");
+    let off = rd(pe, 0x3C, 4);
+    assert_eq(rd(pe, off + 22, 2) & 0x2000, 0);                              // not a DLL
+    assert(rd(pe, off + 24 + 16, 4) > 0);                                    // AddressOfEntryPoint
+    assert_eq(rd(macho.build_image(build(src, "macos"), "prog", true), 12, 4), 2);   // MH_EXECUTE
+}
+
+fn test_executable_needs_main() {
+    let m = build("fn f() -> int { return 1; }", "linux");
+    var msg = "";
+    try { elf_so.build(m, "prog", true); } catch (e) { msg = e.message; }
+    assert(msg.contains("needs a `fn main`"));
+}
+
+fn test_compile_and_run_executable() {
+    if (system.os() != "linux") { return; }
+    let src = "extern fn puts(*u8) -> int from \"libc.so.6\";\n" +
+              "fn main(argc: int, argv: **u8) -> int { puts(\"hi\"); return 40 + argc; }\n";
+    let dir = system.make_temp_dir("kcc");
+    let exe = system.path_join(dir, "prog");
+    fbin.save(elf_so.build(build(src, "linux"), "prog", true), exe);
+    system.chmod(exe, 493);
+    let r = system.run_argv([exe, "x"]);
+    assert_eq(r.stdout.trim(), "hi");
+    assert_eq(r.code, 42);
+    system.rmdir(dir, true);
+}
+
+fn test_constant_folding() {
+    let ctx = check.check_program(parser.parse_program("const A = 3 * 4 + 1; const B = A << 2; let C: float = 1.5 * 2;"));
+    assert_eq(ctx.globals["A"].cval, 13);
+    assert_eq(ctx.globals["B"].cval, 52);
+    assert_eq(ctx.globals["C"].cval, 3.0);
+}
+
+fn test_struct_layout() {
+    let ctx = check.check_program(parser.parse_program("struct S { a: u8, b: int, c: u8, d: i16 }"));
+    assert_eq(ctx.structs["S"].size, 24);
+    assert_eq(ctx.structs["S"].fields[1].off, 8);
+    let ctx2 = check.check_program(parser.parse_program("packed struct P { a: u8, b: int }"));
+    assert_eq(ctx2.structs["P"].size, 9);
+}
+
+fn test_error_messages() {
+    assert_eq(error_of("fn f() -> int { return 1.5; }"), "1:24 cannot return a value of type float as int (use 'as int' to convert)");
+    assert_eq(error_of("fn f() { let x = 1; x = 2; }"), "1:21 cannot assign to 'x': it was declared with let (use var for a mutable binding)");
+    assert_eq(error_of("fn f() { g(); }"), "1:10 undefined function 'g'");
+    assert_eq(error_of("fn f() { break; }"), "1:10 'break' outside of a loop or switch");
+    assert_eq(error_of("fn f(a: int) -> int { return a +; }"), "1:33 unexpected ';' in expression");
+    assert_eq(error_of("fn f() -> int[2] { return 0; }"), "1:1 functions cannot return arrays by value; return a pointer");
+    assert_eq(error_of("fn f() { let s = \"abc\"; }") == "", true);
+    assert_eq(error_of("fn f(x: f32) {}"), "1:1 'f32' parameters are not supported; use float (f64)");
+    assert_eq(error_of("import std.json;"), "1:8 std.* modules are implemented by the KingCobra runtime and cannot be used in native code; declare the C functions you need with 'extern fn'");
+}
+
+fn test_unsupported_features_are_clear() {
+    assert(error_of("fn f() { let a = {x: 1}; }").contains("object literals"));
+    assert(error_of("fn f(x) {}").contains("needs a type annotation"));
+    assert(error_of("fn f() { let s = f\"a{1}\"; }").contains("f-strings"));
+    assert(error_of("fn f(p: *u8) { let q = p[1..2]; }").contains("slices"));
+    assert(error_of("fn f(...r) {}").contains("variadic"));
+    assert(error_of("fn f() { let n = 1; let g = fn(a: int) -> int { return a + n; }; }").contains("cannot capture"));
+}
+
+fn test_new_grammar_checks() {
+    // things that now compile
+    for (src in [
+        "fn f(a: int) -> int { switch (a) { case 1: return 2; default: break; } return 0; }",
+        "enum E { A, B = 4 } fn f(e: int) -> int { return match (e) { E.A => 1, E.B | 7 => 2, _ => 3 }; }",
+        "fn f() -> int { let [a, b] = [1, 2]; return a + b; }",
+        "fn f<T>(x: T) -> T { return x; } fn g() -> int { return f(3); }",
+        "struct S { a: int } impl S { fn get(self) -> int { return self.a; } } fn g(s: S) -> int { return s.get(); }",
+        "fn f() -> int { var i = 0; do { i++; } while (i < 3); L: while (true) { break L; } return i; }",
+        "fn f() { try { throw 1; } catch (e) { } defer f2(); } fn f2() {}",
+        "fn f(p: *u8) -> *u8 { return p ?? p; }"
+    ]) { assert_eq(error_of(src), ""); }
+    // things that are rejected, with a useful message
+    assert(error_of("fn f(a: int) { switch (a) { case 1: break; case 1: break; } }").contains("duplicate case"));
+    assert(error_of("fn f() { goto nowhere; }").contains("no label"));
+    assert(error_of("fn f() { while (true) { break nolabel; } }").contains("labeled"));
+    assert(error_of("enum E { A } fn f(e: int) { match (e) { E.B => 1, _ => 2 }; }").contains("no member"));
+    assert(error_of("fn f(a: int) { match (a) { 1 => 1, 1 => 2 }; }").contains("already covered"));
+    assert(error_of("fn f<T>(a: T, b: T) {} fn g() { f(1, \"x\"); }").contains("conflicting"));
+    assert(error_of("import std.json;").contains("native code"));
+    assert(error_of("fn f(...a) {}").contains("variadic"));
+    assert(error_of("fn f(a: *u8) { let s = a[1..2]; }").contains("slices"));
+}
+
+fn test_deterministic_output() {
+    let src = "fn f(a: int) -> int { var s = 0; for (i in 0..a) { s += i; } return s; }";
+    let a = fbin.sha256(elf_so.build(build(src, "linux"), "x.so", false));
+    let b = fbin.sha256(elf_so.build(build(src, "linux"), "x.so", false));
+    assert_eq(a, b);
+}
+
+// ---- kcos target: freestanding flat binary + intrinsics
+fn test_kcos_flat_image() {
+    let src = "var port: int; fn kc_interrupt(frame: *u64) { outb(0x20, 0x20); } fn kmain() { port = inb(0x60); cli(); while (true) { hlt(); } }";
+    let m = build(src, "kcos");
+    assert_eq(m.fmt, "flat");
+    let info = flat.build(m, 0x10000, 0x80000, "kmain");
+    assert_eq(info.base, 0x10000);
+    assert_eq(info.addr["__kc_isr_base"], 0x10020);
+    let img = info.stream;
+    assert_eq(fbin.to_hex(img, 0, 2), "fafc");                       // cli; cld
+    assert_eq(fbin.to_hex(img, 0x20, 2), "6a00");                    // vector 0: fake error code
+    assert_eq(fbin.to_hex(img, 0x20 + 8 * 16, 1), "68");             // vector 8 (#DF): the CPU pushes the error code itself
+    assert_eq(fbin.size(img), info.end - info.base);
+}
+
+fn test_kcos_needs_entry_points() {
+    var msg = "";
+    try { flat.build(build("fn kmain() { }", "kcos"), 0x10000, 0x80000, "kmain"); } catch (e) { msg = e.message; }
+    assert(msg.contains("kc_interrupt"));
+}
+
+fn test_intrinsic_argument_checks() {
+    assert(error_of("fn f() { outb(1); }").contains("takes exactly 2"));
+    assert(error_of("fn f() { cli(1); }").contains("takes exactly 0"));
+}
+
+fn test_advanced_intrinsics_encode() {
+    let src = "var l: int; fn add(a: int, b: int) -> int { return a + b; } fn kc_interrupt(frame: *u64) { } fn kmain() { let r = callp(fnaddr(add), 1, 2); let o = atomic_cas(&l, 0, 1); atomic_add(&l, r + o); }";
+    let m = build(src, "kcos");
+    let info = flat.build(m, 0x10000, 0x80000, "kmain");
+    let hex = fbin.to_hex(info.stream, info.text - info.base, fbin.size(m.text));
+    assert(hex.contains("41ffd3"));                  // call r11   (callp)
+    assert(hex.contains("f0480fb111"));              // lock cmpxchg [rcx], rdx   (atomic_cas)
+    assert(hex.contains("f0480fc101"));              // lock xadd [rcx], rax      (atomic_add)
+    assert_eq(info.addr["kc_switch"], info.addr["__kc_isr_base"] + 4096 + 128);
+}
+
+fn test_fnaddr_needs_a_function() {
+    assert(error_of("fn f() { let x = 1; let a = fnaddr(x); }").contains("fnaddr takes the name of a function"));
+}
+
+fn test_flat_page_alignment_and_entry() {
+    let m = build("var pt: u64[512]; var small: int; fn kc_interrupt(frame: *u64) { } fn boot_main() { pt[0] = 1 as u64; }", "kcos");
+    let info = flat.build(m, 0x10000, 0x80000, "boot_main");
+    assert_eq(info.addr["pt"] % 4096, 0);
+}

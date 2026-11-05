@@ -1,0 +1,224 @@
+// x64.kc -- a small x86-64 assembler: just the instructions the kcc code generator needs.
+// Author: Divyanshu Sinha (MIT License)
+//
+// An assembler context `a` is { s: stream, labels, fix, relocs, calls }. Code is position independent
+// within a function; references to other symbols are recorded as relocations / call fixups.
+import std.fbin;
+import "util.kc" as util;
+
+const RAX = 0; const RCX = 1; const RDX = 2; const RBX = 3; const RSP = 4; const RBP = 5; const RSI = 6; const RDI = 7;
+const R8 = 8; const R9 = 9; const R10 = 10; const R11 = 11;
+
+// condition codes
+const CC_B = 2; const CC_AE = 3; const CC_E = 4; const CC_NE = 5; const CC_BE = 6; const CC_A = 7;
+const CC_P = 10; const CC_NP = 11; const CC_L = 12; const CC_GE = 13; const CC_LE = 14; const CC_G = 15;
+
+// ALU opcodes (r/m64, r64 forms) and /digit values for the immediate forms
+const ALU_ADD = 0; const ALU_OR = 1; const ALU_AND = 4; const ALU_SUB = 5; const ALU_XOR = 6; const ALU_CMP = 7;
+
+fn new_asm() {
+    return { s: fbin.buffer(), labels: [], fix: [], relocs: [], calls: [] };
+}
+
+fn pos(a) -> int { return fbin.tell(a.s); }
+fn b(a, v: int) { fbin.write_u8(a.s, v & 0xFF); }
+fn d32(a, v: int) { fbin.write_u32(a.s, v & 0xFFFFFFFF); }
+fn d64(a, v: int) { fbin.write_u64(a.s, v); }
+
+// ---------------------------------------------------------------- encoding helpers
+fn rex(a, w: int, reg: int, rm: int, force: bool) {
+    let r = 0x40 | (w << 3) | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1);
+    if (r != 0x40 || force) { b(a, r); }
+}
+
+fn emit_ops(a, ops) { for (o in ops) { b(a, o); } }
+
+/// op reg, [base + disp]  (also the store forms: the opcode decides the direction)
+fn op_rm(a, prefix: int, w: int, ops, reg: int, base: int, disp: int, force: bool = false) {
+    if (prefix != 0) { b(a, prefix); }
+    rex(a, w, reg, base, force);
+    emit_ops(a, ops);
+    let rm = base & 7;
+    let rg = (reg & 7) << 3;
+    if (disp == 0 && rm != 5) {
+        b(a, rg | rm);
+        if (rm == 4) { b(a, 0x24); }
+    } else if (disp >= -128 && disp <= 127) {
+        b(a, 0x40 | rg | rm);
+        if (rm == 4) { b(a, 0x24); }
+        b(a, disp);
+    } else {
+        b(a, 0x80 | rg | rm);
+        if (rm == 4) { b(a, 0x24); }
+        d32(a, disp);
+    }
+}
+
+/// op reg, rm   (register direct)
+fn op_rr(a, prefix: int, w: int, ops, reg: int, rm: int, force: bool = false) {
+    if (prefix != 0) { b(a, prefix); }
+    rex(a, w, reg, rm, force);
+    emit_ops(a, ops);
+    b(a, 0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+/// op [rip + disp32]: leaves the disp32 for the caller to relocate; returns its offset.
+fn op_rip(a, prefix: int, w: int, ops, reg: int) -> int {
+    if (prefix != 0) { b(a, prefix); }
+    rex(a, w, reg, 0, false);
+    emit_ops(a, ops);
+    b(a, ((reg & 7) << 3) | 5);
+    let at = pos(a);
+    d32(a, 0);
+    return at;
+}
+
+// ---------------------------------------------------------------- integer moves
+fn mov_rr(a, dst: int, src: int) { if (dst != src) { op_rr(a, 0, 1, [0x89], src, dst); } }
+
+fn mov_ri(a, r: int, v: int) {
+    if (v >= 0 && v <= 0xFFFFFFFF) {
+        if (r >= 8) { b(a, 0x41); }
+        b(a, 0xB8 + (r & 7));
+        d32(a, v);
+    } else if (v >= -2147483648 && v < 0) {
+        rex(a, 1, 0, r, false);
+        b(a, 0xC7); b(a, 0xC0 | (r & 7));
+        d32(a, v);
+    } else {
+        rex(a, 1, 0, r, false);
+        b(a, 0xB8 + (r & 7));
+        d64(a, v);
+    }
+}
+
+fn mov_load64(a, dst: int, base: int, disp: int) { op_rm(a, 0, 1, [0x8B], dst, base, disp); }
+fn mov_store64(a, base: int, disp: int, src: int) { op_rm(a, 0, 1, [0x89], src, base, disp); }
+fn lea(a, dst: int, base: int, disp: int) { op_rm(a, 0, 1, [0x8D], dst, base, disp); }
+
+/// Typed load into `dst`, zero/sign extended to 64 bits. size in 1,2,4,8.
+fn load_sized(a, dst: int, base: int, disp: int, size: int, signed: bool) {
+    if (size == 8) { mov_load64(a, dst, base, disp); }
+    else if (size == 4) {
+        if (signed) { op_rm(a, 0, 1, [0x63], dst, base, disp); }          // movsxd
+        else { op_rm(a, 0, 0, [0x8B], dst, base, disp); }                 // mov r32 (zero extends)
+    } else if (size == 2) {
+        op_rm(a, 0, signed ? 1 : 0, signed ? [0x0F, 0xBF] : [0x0F, 0xB7], dst, base, disp);
+    } else {
+        op_rm(a, 0, signed ? 1 : 0, signed ? [0x0F, 0xBE] : [0x0F, 0xB6], dst, base, disp);
+    }
+}
+
+/// Typed store of the low `size` bytes of `src`.
+fn store_sized(a, base: int, disp: int, src: int, size: int) {
+    if (size == 8) { mov_store64(a, base, disp, src); }
+    else if (size == 4) { op_rm(a, 0, 0, [0x89], src, base, disp); }
+    else if (size == 2) { op_rm(a, 0x66, 0, [0x89], src, base, disp); }
+    else { op_rm(a, 0, 0, [0x88], src, base, disp, src >= 4); }
+}
+
+/// Sign/zero-extend the low `size` bytes of `r` in place.
+fn extend(a, r: int, size: int, signed: bool) {
+    if (size == 8) { return; }
+    if (size == 4) {
+        if (signed) { op_rr(a, 0, 1, [0x63], r, r); } else { op_rr(a, 0, 0, [0x89], r, r); }
+    } else if (size == 2) {
+        op_rr(a, 0, signed ? 1 : 0, signed ? [0x0F, 0xBF] : [0x0F, 0xB7], r, r);
+    } else {
+        op_rr(a, 0, signed ? 1 : 0, signed ? [0x0F, 0xBE] : [0x0F, 0xB6], r, r, r >= 4);
+    }
+}
+
+// ---------------------------------------------------------------- integer arithmetic
+fn alu_rr(a, op: int, dst: int, src: int) { op_rr(a, 0, 1, [(op << 3) | 1], src, dst); }
+
+fn alu_ri(a, op: int, r: int, imm: int) {
+    if (imm >= -128 && imm <= 127) {
+        rex(a, 1, 0, r, false); b(a, 0x83); b(a, 0xC0 | (op << 3) | (r & 7)); b(a, imm);
+    } else {
+        rex(a, 1, 0, r, false); b(a, 0x81); b(a, 0xC0 | (op << 3) | (r & 7)); d32(a, imm);
+    }
+}
+
+fn imul_rr(a, dst: int, src: int) { op_rr(a, 0, 1, [0x0F, 0xAF], dst, src); }
+fn imul_ri(a, dst: int, src: int, imm: int) {
+    if (imm >= -128 && imm <= 127) { op_rr(a, 0, 1, [0x6B], dst, src); b(a, imm); }
+    else { op_rr(a, 0, 1, [0x69], dst, src); d32(a, imm); }
+}
+fn cqo(a) { b(a, 0x48); b(a, 0x99); }
+fn idiv_r(a, r: int) { op_rr(a, 0, 1, [0xF7], 7, r); }
+fn div_r(a, r: int) { op_rr(a, 0, 1, [0xF7], 6, r); }
+fn neg_r(a, r: int) { op_rr(a, 0, 1, [0xF7], 3, r); }
+fn not_r(a, r: int) { op_rr(a, 0, 1, [0xF7], 2, r); }
+fn test_rr(a, x: int, y: int) { op_rr(a, 0, 1, [0x85], y, x); }
+
+/// kind: 4 = shl, 5 = shr (logical), 7 = sar; count in CL
+fn shift_cl(a, kind: int, r: int) { op_rr(a, 0, 1, [0xD3], kind, r); }
+fn shift_i(a, kind: int, r: int, n: int) { op_rr(a, 0, 1, [0xC1], kind, r); b(a, n); }
+
+fn setcc(a, cc: int, r: int) { op_rr(a, 0, 0, [0x0F, 0x90 + cc], 0, r, r >= 4); }
+fn movzx8(a, dst: int, src: int) { op_rr(a, 0, 0, [0x0F, 0xB6], dst, src, src >= 4); }
+
+// ---------------------------------------------------------------- control flow
+fn new_label(a) -> int { a.labels.push(-1); return len(a.labels) - 1; }
+fn bind(a, l: int) { a.labels[l] = pos(a); }
+
+fn jmp(a, l: int) { b(a, 0xE9); a.fix.push({ pos: pos(a), l: l }); d32(a, 0); }
+fn jcc(a, cc: int, l: int) { b(a, 0x0F); b(a, 0x80 + cc); a.fix.push({ pos: pos(a), l: l }); d32(a, 0); }
+
+/// call a function defined in this module (patched when the module is laid out)
+fn call_local(a, name: string) { b(a, 0xE8); a.calls.push({ off: pos(a), name: name }); d32(a, 0); }
+/// call a function the module does not define (relocation)
+fn call_ext(a, name: string) { b(a, 0xE8); a.relocs.push({ off: pos(a), kind: "call_ext", sym: name, addend: -4 }); d32(a, 0); }
+
+fn ret(a) { b(a, 0xC3); }
+fn leave(a) { b(a, 0xC9); }
+
+/// lea dst, [rip + sym]  (ELF/COFF/Mach-O: direct PC-relative reference to a symbol of this module)
+fn lea_rip(a, dst: int, sym: string, addend: int) {
+    let at = op_rip(a, 0, 1, [0x8D], dst);
+    a.relocs.push({ off: at, kind: "rip_local", sym: sym, addend: addend - 4 });
+}
+/// mov dst, [rip + got(sym)]  (ELF: the symbol's GOT slot)
+fn mov_got(a, dst: int, sym: string) {
+    let at = op_rip(a, 0, 1, [0x8B], dst);
+    a.relocs.push({ off: at, kind: "rip_got", sym: sym, addend: -4 });
+}
+
+/// Resolve every label fixup. Call once, after the function body is complete.
+fn finish(a) {
+    for (f in a.fix) {
+        let target = a.labels[f.l];
+        if (target < 0) { throw { message: "internal: unbound label", line: 0, col: 0, kind: "compile" }; }
+        util.patch_i32(a.s, f.pos, target - (f.pos + 4));
+    }
+    a.fix = [];
+}
+
+// ---------------------------------------------------------------- SSE2 (scalar double / single)
+fn movsd_load(a, x: int, base: int, disp: int) { op_rm(a, 0xF2, 0, [0x0F, 0x10], x, base, disp); }
+fn movsd_store(a, base: int, disp: int, x: int) { op_rm(a, 0xF2, 0, [0x0F, 0x11], x, base, disp); }
+fn movss_load(a, x: int, base: int, disp: int) { op_rm(a, 0xF3, 0, [0x0F, 0x10], x, base, disp); }
+fn movss_store(a, base: int, disp: int, x: int) { op_rm(a, 0xF3, 0, [0x0F, 0x11], x, base, disp); }
+fn cvtss2sd(a, dst: int, src: int) { op_rr(a, 0xF3, 0, [0x0F, 0x5A], dst, src); }
+fn cvtsd2ss(a, dst: int, src: int) { op_rr(a, 0xF2, 0, [0x0F, 0x5A], dst, src); }
+fn movq_xr(a, x: int, r: int) { op_rr(a, 0x66, 1, [0x0F, 0x6E], x, r); }
+fn movq_rx(a, r: int, x: int) { op_rr(a, 0x66, 1, [0x0F, 0x7E], x, r); }
+fn movapd(a, dst: int, src: int) { if (dst != src) { op_rr(a, 0x66, 0, [0x0F, 0x28], dst, src); } }
+fn ucomisd(a, x: int, y: int) { op_rr(a, 0x66, 0, [0x0F, 0x2E], x, y); }
+fn cvtsi2sd(a, x: int, r: int) { op_rr(a, 0xF2, 1, [0x0F, 0x2A], x, r); }
+fn cvttsd2si(a, r: int, x: int) { op_rr(a, 0xF2, 1, [0x0F, 0x2C], r, x); }
+/// op: 0x58 add, 0x59 mul, 0x5C sub, 0x5E div, 0x51 sqrt
+fn sse_arith(a, op: int, dst: int, src: int) { op_rr(a, 0xF2, 0, [0x0F, op], dst, src); }
+
+// ---------------------------------------------------------------- extra control flow / addressing
+fn call_r(a, r: int) { op_rr(a, 0, 0, [0xFF], 2, r); }                       // call r
+fn call_label(a, l: int) { b(a, 0xE8); a.fix.push({ pos: pos(a), l: l }); d32(a, 0); }
+fn lea_label(a, dst: int, l: int) {                                           // lea dst, [rip + label]
+    let at = op_rip(a, 0, 1, [0x8D], dst);
+    a.fix.push({ pos: at, l: l });
+}
+fn jmp_mem(a, base: int, disp: int) { op_rm(a, 0, 0, [0xFF], 4, base, disp); }   // jmp [base+disp]
+fn call_mem(a, base: int, disp: int) { op_rm(a, 0, 0, [0xFF], 2, base, disp); }  // call [base+disp]
+fn ud2(a) { b(a, 0x0F); b(a, 0x0B); }
+fn syscall(a) { b(a, 0x0F); b(a, 0x05); }

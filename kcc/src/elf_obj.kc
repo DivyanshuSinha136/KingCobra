@@ -1,0 +1,146 @@
+// elf_obj.kc -- ELF64 x86-64 relocatable object writer (.o on Linux).
+// Author: Divyanshu Sinha (MIT License)
+import std.fbin;
+import "util.kc" as util;
+
+fn new_strtab() { let s = fbin.buffer(); fbin.write_u8(s, 0); return { s: s, map: {} }; }
+fn str_add(t, name: string) -> int {
+    if (name == "") { return 0; }
+    if (t.map.has(name)) { return t.map[name]; }
+    fbin.seek(t.s, 0, "end");
+    let off = fbin.tell(t.s);
+    util.write_cstr(t.s, name);
+    t.map[name] = off;
+    return off;
+}
+
+const R_X86_64_64 = 1;
+const R_X86_64_PC32 = 2;
+const R_X86_64_PLT32 = 4;
+const R_X86_64_REX_GOTPCRELX = 42;
+
+fn rela_type(kind: string) -> int {
+    if (kind == "call_ext") { return R_X86_64_PLT32; }
+    if (kind == "rip_local") { return R_X86_64_PC32; }
+    if (kind == "rip_got") { return R_X86_64_REX_GOTPCRELX; }
+    return R_X86_64_64;
+}
+
+/// Serialise `mod` as an ELF64 relocatable object and return it as a stream.
+fn build(mod) {
+    // ---- section list
+    let secs = [];       // { name, type, flags, data, size, link, info, align, entsize }
+    fn_add(secs, { name: "", type: 0, flags: 0, data: null, size: 0, link: 0, info: 0, align: 0, entsize: 0 });
+    var idx_text = fn_add(secs, { name: ".text", type: 1, flags: 6, data: mod.text, size: fbin.size(mod.text), link: 0, info: 0, align: 16, entsize: 0 });
+    var idx_ro = fn_add(secs, { name: ".rodata", type: 1, flags: 2, data: mod.rodata, size: fbin.size(mod.rodata), link: 0, info: 0, align: 16, entsize: 0 });
+    var idx_data = fn_add(secs, { name: ".data", type: 1, flags: 3, data: mod.data, size: fbin.size(mod.data), link: 0, info: 0, align: 16, entsize: 0 });
+    var idx_bss = fn_add(secs, { name: ".bss", type: 8, flags: 3, data: null, size: mod.bss, link: 0, info: 0, align: 16, entsize: 0 });
+    let secidx = { text: idx_text, rodata: idx_ro, data: idx_data, bss: idx_bss };
+
+    // ---- symbol table: locals first, then globals (defined, then undefined)
+    let strtab = new_strtab();
+    let syms = fbin.buffer();
+    let symidx = {};
+    var nsym = 0;
+    fn_sym(syms, 0, 0, 0, 0, 0, 0); nsym = 1;
+    for (s in mod.syms) {
+        if (!s.global) {
+            let info = ((0) << 4) | (s.kind == "func" ? 2 : 1);
+            fn_sym(syms, str_add(strtab, s.name), info, secidx[s.sec], s.off, s.size, 0);
+            symidx[s.name] = nsym; nsym = nsym + 1;
+        }
+    }
+    let first_global = nsym;
+    for (s in mod.syms) {
+        if (s.global) {
+            let info = (1 << 4) | (s.kind == "func" ? 2 : 1);
+            fn_sym(syms, str_add(strtab, s.name), info, secidx[s.sec], s.off, s.size, 0);
+            symidx[s.name] = nsym; nsym = nsym + 1;
+        }
+    }
+    for (u in mod.undef) {
+        if (!symidx.has(u)) {
+            fn_sym(syms, str_add(strtab, u), (1 << 4), 0, 0, 0, 0);
+            symidx[u] = nsym; nsym = nsym + 1;
+        }
+    }
+
+    // ---- relocations
+    var rela_text = fbin.buffer();
+    var rela_data = fbin.buffer();
+    var n_rt = 0;
+    var n_rd = 0;
+    for (r in mod.relocs) {
+        let target = (r.sec == "text") ? rela_text : rela_data;
+        fbin.write_u64(target, r.off);
+        fbin.write_u64(target, (symidx[r.sym] << 32) | rela_type(r.kind));
+        fbin.write_i64(target, r.addend);
+        if (r.sec == "text") { n_rt = n_rt + 1; } else { n_rd = n_rd + 1; }
+    }
+    let idx_symtab_placeholder = len(secs) + (n_rt > 0 ? 1 : 0) + (n_rd > 0 ? 1 : 0);
+    if (n_rt > 0) { fn_add(secs, { name: ".rela.text", type: 4, flags: 0x40, data: rela_text, size: n_rt * 24, link: idx_symtab_placeholder, info: idx_text, align: 8, entsize: 24 }); }
+    if (n_rd > 0) { fn_add(secs, { name: ".rela.data", type: 4, flags: 0x40, data: rela_data, size: n_rd * 24, link: idx_symtab_placeholder, info: idx_data, align: 8, entsize: 24 }); }
+    let idx_symtab = fn_add(secs, { name: ".symtab", type: 2, flags: 0, data: syms, size: nsym * 24, link: idx_symtab_placeholder + 1, info: first_global, align: 8, entsize: 24 });
+    let idx_strtab = fn_add(secs, { name: ".strtab", type: 3, flags: 0, data: strtab.s, size: fbin.size(strtab.s), link: 0, info: 0, align: 1, entsize: 0 });
+    fn_add(secs, { name: ".note.GNU-stack", type: 1, flags: 0, data: null, size: 0, link: 0, info: 0, align: 1, entsize: 0 });
+    let shstr = new_strtab();
+    for (s in secs) { s["name_off"] = str_add(shstr, s.name); }
+    let idx_shstr = fn_add(secs, { name: ".shstrtab", type: 3, flags: 0, data: shstr.s, size: 0, link: 0, info: 0, align: 1, entsize: 0, name_off: 0 });
+    secs[idx_shstr]["name_off"] = str_add(shstr, ".shstrtab");
+    secs[idx_shstr]["size"] = fbin.size(shstr.s);
+
+    // ---- layout
+    let out = fbin.buffer();
+    fbin.fill(out, 0, 64);
+    for (s in secs) {
+        s["offset"] = 0;
+        if (s.type == 0) { continue; }
+        if (s.type == 8) { s["offset"] = fbin.tell(out); continue; }
+        util.pad_to(out, s.align > 0 ? s.align : 1, 0);
+        fbin.seek(out, 0, "end");
+        s["offset"] = fbin.tell(out);
+        if (s.data != null && s.size > 0) { util.append_stream(out, s.data); }
+    }
+    util.pad_to(out, 8, 0);
+    fbin.seek(out, 0, "end");
+    let shoff = fbin.tell(out);
+    for (s in secs) {
+        fbin.write_u32(out, s.name_off);
+        fbin.write_u32(out, s.type);
+        fbin.write_u64(out, s.flags);
+        fbin.write_u64(out, 0);
+        fbin.write_u64(out, s.offset);
+        fbin.write_u64(out, s.size);
+        fbin.write_u32(out, s.link);
+        fbin.write_u32(out, s.info);
+        fbin.write_u64(out, s.align);
+        fbin.write_u64(out, s.entsize);
+    }
+    // header
+    fbin.seek(out, 0);
+    fbin.write_bytes(out, [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    fbin.write_u16(out, 1);            // ET_REL
+    fbin.write_u16(out, 62);           // EM_X86_64
+    fbin.write_u32(out, 1);
+    fbin.write_u64(out, 0);            // entry
+    fbin.write_u64(out, 0);            // phoff
+    fbin.write_u64(out, shoff);
+    fbin.write_u32(out, 0);            // flags
+    fbin.write_u16(out, 64);           // ehsize
+    fbin.write_u16(out, 0);            // phentsize
+    fbin.write_u16(out, 0);            // phnum
+    fbin.write_u16(out, 64);           // shentsize
+    fbin.write_u16(out, len(secs));
+    fbin.write_u16(out, idx_shstr);
+    return out;
+}
+
+fn fn_add(secs, s) { secs.push(s); return len(secs) - 1; }
+fn fn_sym(s, name: int, info: int, shndx: int, value: int, size: int, other: int) {
+    fbin.write_u32(s, name);
+    fbin.write_u8(s, info);
+    fbin.write_u8(s, other);
+    fbin.write_u16(s, shndx);
+    fbin.write_u64(s, value);
+    fbin.write_u64(s, size);
+}

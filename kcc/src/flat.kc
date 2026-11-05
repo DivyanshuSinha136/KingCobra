@@ -1,0 +1,154 @@
+// flat.kc -- the `kcos` target: link a module into a flat, freestanding x86-64 binary (no OS, no libc, no loader).
+// Author: Divyanshu Sinha (MIT License)
+//
+// Image layout (everything is position-fixed at `base`, so the bytes can be loaded to that physical address and entered at offset 0):
+//
+//   base+0      entry stub        cli; cld; mov rsp, <stack>; xor ebp, ebp; call kmain; halt loop
+//   base+32     interrupt stubs   256 slots of 16 bytes: [push 0] push <vector>; jmp isr_common   (symbol __kc_isr_base)
+//   +4096       isr_common        saves all registers + the SSE state, calls  fn kc_interrupt(frame: *u64), restores, iretq
+//   ...         .text  .rodata  .data  .bss (bss is stored as zeros, so the loader never has to clear anything)
+//
+// The program must define  `fn kmain()`  and  `fn kc_interrupt(frame: *u64)`.
+// frame[0..14] = r15 r14 r13 r12 r11 r10 r9 r8 rdi rsi rbp rbx rdx rcx rax, then [15]=vector [16]=error code
+//                [17]=rip [18]=cs [19]=rflags [20]=rsp [21]=ss  (the CPU's own interrupt frame)
+import std.fbin;
+import "util.kc" as util;
+
+const ENTRY_LEN = 32;
+const ISR_SLOTS = 256;
+const COMMON_ROOM = 256;
+const RT_OFFSET = 128;        // runtime functions start this far into the common area
+
+/// Vectors for which the CPU pushes an error code itself.
+fn has_error_code(v: int) -> bool {
+    return v == 8 || (v >= 10 && v <= 14) || v == 17 || v == 21 || v == 29 || v == 30;
+}
+
+fn rel32(s, at: int, target: int) {          // after a 4-byte field at address `at`
+    fbin.write_i32(s, target - (at + 4));
+}
+
+fn build(mod, base: int, stack_top: int, entry: string) {
+    let isr_base = base + ENTRY_LEN;
+    let common = isr_base + ISR_SLOTS * 16;
+    let text_base = util.align_up(common + COMMON_ROOM, 16);
+    let text_len = fbin.size(mod.text);
+    let ro_base = util.align_up(text_base + text_len, 16);
+    let ro_len = fbin.size(mod.rodata);
+    let data_base = util.align_up(ro_base + ro_len, 4096);
+    let data_len = fbin.size(mod.data);
+    let bss_base = util.align_up(data_base + data_len, 4096);
+    let end = bss_base + mod.bss;
+
+    // ---- symbol addresses
+    let addr = {};
+    var have_kmain = false;
+    var have_irq = false;
+    for (s in mod.syms) {
+        var b = text_base;
+        if (s.sec == "rodata") { b = ro_base; } else if (s.sec == "data") { b = data_base; } else if (s.sec == "bss") { b = bss_base; }
+        addr[s.name] = b + s.off;
+        if (s.name == entry && s.kind == "func") { have_kmain = true; }
+        if (s.name == "kc_interrupt" && s.kind == "func") { have_irq = true; }
+    }
+    if (!have_kmain) { throw { message: "a kcos kernel needs `fn " + entry + "()` (the entry point called after the stack is set up)", line: 0, col: 0, kind: "compile" }; }
+    if (!have_irq) { throw { message: "a kcos kernel needs `fn kc_interrupt(frame: *u64)` (called by every interrupt and exception stub)", line: 0, col: 0, kind: "compile" }; }
+    addr["__kc_isr_base"] = isr_base;
+    addr["kc_switch"] = common + RT_OFFSET;              // declare:  extern fn kc_switch(old_sp: *int, new_sp: int);
+    addr["kc_reload_cs"] = common + RT_OFFSET + 48;      // declare:  extern fn kc_reload_cs(selector: int);
+
+    // ---- relocations
+    for (r in mod.relocs) {
+        var sb = text_base;
+        var st = mod.text;
+        if (r.sec == "rodata") { sb = ro_base; st = mod.rodata; } else if (r.sec == "data") { sb = data_base; st = mod.data; }
+        if (!addr.has(r.sym)) { throw { message: "undefined symbol '" + r.sym + "' (a kcos kernel is freestanding: there are no libraries to import from)", line: 0, col: 0, kind: "compile" }; }
+        let S = addr[r.sym];
+        let P = sb + r.off;
+        if (r.kind == "rip_local" || r.kind == "call_ext" || r.kind == "rip_got") {
+            let v = S + r.addend - P;
+            if (v < -2147483648 || v > 2147483647) { throw { message: "relocation out of range for '" + r.sym + "'", line: 0, col: 0, kind: "compile" }; }
+            util.patch_i32(st, r.off, v);
+        } else if (r.kind == "abs64") {
+            util.patch_u64(st, r.off, S + r.addend);
+        } else {
+            throw { message: "internal: kcos linker cannot apply relocation kind '" + r.kind + "'", line: 0, col: 0, kind: "compile" };
+        }
+    }
+
+    // ---- stubs
+    let out = fbin.buffer();
+    fbin.write_bytes(out, [0xFA, 0xFC]);                                         // cli; cld
+    fbin.write_bytes(out, [0x48, 0xC7, 0xC4]); fbin.write_u32(out, stack_top);   // mov rsp, imm32
+    fbin.write_bytes(out, [0x31, 0xED]);                                         // xor ebp, ebp
+    fbin.write_u8(out, 0xE8); rel32(out, base + fbin.tell(out), addr[entry]);  // call kmain
+    fbin.write_bytes(out, [0xFA, 0xF4, 0xEB, 0xFC]);                             // cli; hlt; jmp -4
+    util.pad_to(out, ENTRY_LEN, 0xCC);
+    var v = 0;
+    while (v < ISR_SLOTS) {
+        let slot = fbin.tell(out);
+        if (!has_error_code(v)) { fbin.write_bytes(out, [0x6A, 0x00]); }         // push 0 (fake error code)
+        fbin.write_u8(out, 0x68); fbin.write_u32(out, v);                        // push imm32 (vector)
+        fbin.write_u8(out, 0xE9); rel32(out, base + fbin.tell(out), common);     // jmp isr_common
+        fbin.fill(out, 0xCC, slot + 16 - fbin.tell(out));
+        v = v + 1;
+    }
+    // isr_common
+    fbin.write_bytes(out, [0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57]);           // push rax rcx rdx rbx rbp rsi rdi
+    var r8 = 0x50;
+    while (r8 <= 0x57) { fbin.write_bytes(out, [0x41, r8]); r8 = r8 + 1; }       // push r8 .. r15
+    fbin.write_bytes(out, [0x48, 0x89, 0xE7]);                                   // mov rdi, rsp          (frame pointer argument)
+    fbin.write_bytes(out, [0x48, 0x89, 0xE5]);                                   // mov rbp, rsp
+    fbin.write_bytes(out, [0x48, 0x81, 0xEC, 0x00, 0x02, 0x00, 0x00]);           // sub rsp, 512
+    fbin.write_bytes(out, [0x48, 0x83, 0xE4, 0xF0]);                             // and rsp, -16
+    fbin.write_bytes(out, [0x0F, 0xAE, 0x04, 0x24]);                             // fxsave [rsp]
+    fbin.write_u8(out, 0xFC);                                                    // cld
+    fbin.write_u8(out, 0xE8); rel32(out, base + fbin.tell(out), addr["kc_interrupt"]);
+    fbin.write_bytes(out, [0x0F, 0xAE, 0x0C, 0x24]);                             // fxrstor [rsp]
+    fbin.write_bytes(out, [0x48, 0x89, 0xEC]);                                   // mov rsp, rbp
+    r8 = 0x5F;
+    while (r8 >= 0x58) { fbin.write_bytes(out, [0x41, r8]); r8 = r8 - 1; }       // pop r15 .. r8
+    fbin.write_bytes(out, [0x5F, 0x5E, 0x5D, 0x5B, 0x5A, 0x59, 0x58]);           // pop rdi rsi rbp rbx rdx rcx rax
+    fbin.write_bytes(out, [0x48, 0x83, 0xC4, 0x10]);                             // add rsp, 16           (vector + error code)
+    fbin.write_bytes(out, [0x48, 0xCF]);                                         // iretq
+    if (base + fbin.tell(out) > common + RT_OFFSET) { throw { message: "internal: kcos interrupt code overflows its room", line: 0, col: 0, kind: "compile" }; }
+    fbin.fill(out, 0xCC, common + RT_OFFSET - (base + fbin.tell(out)));
+    // kc_switch(rdi = &old_sp, rsi = new_sp): save callee-saved registers, swap stacks, restore, return into the other context
+    fbin.write_bytes(out, [0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);   // push rbp rbx r12 r13 r14 r15
+    fbin.write_bytes(out, [0x48, 0x89, 0x27]);                                               // mov [rdi], rsp
+    fbin.write_bytes(out, [0x48, 0x89, 0xF4]);                                               // mov rsp, rsi
+    fbin.write_bytes(out, [0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D]);   // pop r15 r14 r13 r12 rbx rbp
+    fbin.write_u8(out, 0xC3);                                                                // ret
+    fbin.fill(out, 0xCC, common + RT_OFFSET + 48 - (base + fbin.tell(out)));
+    // kc_reload_cs(rdi = selector): load CS through a far return, return address stays on top
+    fbin.write_bytes(out, [0x58, 0x57, 0x50, 0x48, 0xCB]);                                   // pop rax; push rdi; push rax; retfq
+    if (base + fbin.tell(out) > text_base) { throw { message: "internal: kcos interrupt code overflows its room", line: 0, col: 0, kind: "compile" }; }
+    fbin.fill(out, 0xCC, text_base - (base + fbin.tell(out)));
+    util.append_stream(out, mod.text);
+    fbin.fill(out, 0xCC, ro_base - (base + fbin.tell(out)));
+    util.append_stream(out, mod.rodata);
+    fbin.fill(out, 0, data_base - (base + fbin.tell(out)));
+    util.append_stream(out, mod.data);
+    fbin.fill(out, 0, bss_base - (base + fbin.tell(out)));
+    fbin.fill(out, 0, end - bss_base);                                           // bss stored as zeros
+    return { stream: out, addr: addr, base: base, end: end, text: text_base, rodata: ro_base, data: data_base, bss: bss_base };
+}
+
+fn hex(n: int) -> string {
+    let digits = "0123456789abcdef";
+    if (n == 0) { return "0x0"; }
+    var out = "";
+    var x = n;
+    while (x != 0) { out = digits[x & 15] + out; x = x >>> 4; }
+    return "0x" + out;
+}
+
+/// A readable symbol map (address, size, name), sorted by address.
+fn map_text(mod, info) -> string {
+    let rows = [];
+    for (s in mod.syms) { rows.push({ a: info.addr[s.name], n: s.name, k: s.kind, z: s.size }); }
+    rows.sort(fn(x, y) -> int { return x.a < y.a ? -1 : (x.a > y.a ? 1 : 0); });
+    var t = "kcos map\n  base  " + hex(info.base) + "\n  text  " + hex(info.text) + "\n  rodata " + hex(info.rodata) + "\n  data  " + hex(info.data) + "\n  bss   " + hex(info.bss) + "\n  end   " + hex(info.end) + "\n  isr   " + hex(info.addr["__kc_isr_base"]) + "\n\n";
+    for (r in rows) { if (r.k == "func" || r.k == "object") { t = t + hex(r.a) + " " + str(r.z) + " " + r.k + " " + r.n + "\n"; } }
+    return t;
+}

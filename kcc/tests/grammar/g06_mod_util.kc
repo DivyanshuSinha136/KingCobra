@@ -1,0 +1,4 @@
+var counter: int = 10;
+fn twice(x: int) -> int { return helper(x) * 2; }
+fn helper(x: int) -> int { return x + counter; }
+const LIMIT = 77;

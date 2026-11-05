@@ -1,0 +1,21 @@
+struct S1 { a: i32, b: i32 }
+struct S2 { x: float, y: float }
+struct S3 { a: int, d: float }
+struct S4 { a: int, b: int, c: int }
+struct S5 { a: u8 }
+struct S6 { d: float, a: int }
+extern fn c_s3(s: S3) -> S3;
+extern fn c_s4(s: S4, k: int) -> S4;
+extern fn c_s2(a: S2, b: S2) -> S2;
+fn k_s1(s: S1, k: int) -> S1 { return S1 { a: s.a + k, b: s.b * 2 }; }
+fn k_s2(a: S2, b: S2) -> S2 { return S2 { x: a.x + b.x, y: a.y * b.y }; }
+fn k_s3(s: S3, k: int) -> S3 { return S3 { a: s.a + k, d: s.d * 2.0 }; }
+fn k_s4(s: S4, k: int) -> S4 { var r: S4 = s; r.a += k; r.c = r.a + r.b; return r; }
+fn k_s5(s: S5) -> S5 { return S5 { a: s.a + 1 }; }
+fn k_s6(s: S6) -> S6 { return S6 { d: s.d + 0.5, a: s.a + 1 }; }
+fn k_many(a: S4, b: S4, c: S3, d: S2, e: S1, f: int, g: int, h: int, i: int, j: int, k: int, l: int) -> int {
+    return a.a + b.b + c.a + e.b + f + g + h + i + j + k + l;
+}
+fn k_via_c(s: S3) -> float { let t: S3 = c_s3(s); return t.d + t.a; }
+fn k_via_c4(s: S4) -> int { let t: S4 = c_s4(s, 10); return t.a + t.b + t.c; }
+fn k_via_c2(a: S2, b: S2) -> float { let t: S2 = c_s2(a, b); return t.x + t.y; }

@@ -1,0 +1,270 @@
+// hw.kc -- CPU tables and basic hardware: GDT/TSS, IDT, exceptions, PIC, PIT timer, PS/2 keyboard, RTC, PC speaker.
+// Author: Divyanshu Sinha (MIT License)
+
+// ================================================================= GDT + TSS
+// Same selector layout as the boot stage, so CS/SS need no reload:  0x08 code32, 0x10 data, 0x18 code64, 0x20 TSS
+var gdt: u64[6];
+var gdtr: u8[10];
+var tss: u8[104];
+var ist1_stack: u8[8192];
+
+fn gdt_init() {
+    gdt[0] = 0 as u64;
+    gdt[1] = 0x00CF9A000000FFFF as u64;
+    gdt[2] = 0x00CF92000000FFFF as u64;
+    gdt[3] = 0x00209A0000000000 as u64;
+    let tb = &tss[0] as int;
+    let limit = 103;
+    let lo = (limit & 0xFFFF) | ((tb & 0xFFFFFF) << 16) | (0x89 << 40) | (((limit >> 16) & 0xF) << 48) | (((tb >> 24) & 0xFF) << 56);
+    gdt[4] = lo as u64;
+    gdt[5] = (tb >> 32) as u64;
+    *((tb + 4) as *u64) = ((&ist1_stack[0] as int) + 8192) as u64;      // rsp0
+    *((tb + 36) as *u64) = ((&ist1_stack[0] as int) + 8192) as u64;     // ist1 (double fault)
+    *((tb + 102) as *u16) = 104 as u16;                                 // no I/O permission bitmap
+    *(&gdtr[0] as *u16) = (6 * 8 - 1) as u16;
+    *((&gdtr[0] as int + 2) as *u64) = (&gdt[0] as int) as u64;
+    lgdt(&gdtr[0]);
+    ltr(0x20);
+}
+
+// ================================================================= IDT
+var idt: u8[4096];
+var idtr: u8[10];
+
+fn idt_gate(n: int, handler: int, ist: int) {
+    let p = (&idt[0] as int) + n * 16;
+    *(p as *u16) = (handler & 0xFFFF) as u16;
+    *((p + 2) as *u16) = 0x18 as u16;                    // kernel 64-bit code
+    *((p + 4) as *u8) = ist as u8;
+    *((p + 5) as *u8) = 0x8E as u8;                      // present, ring 0, interrupt gate
+    *((p + 6) as *u16) = ((handler >> 16) & 0xFFFF) as u16;
+    *((p + 8) as *u32) = ((handler >> 32) & 0xFFFFFFFF) as u32;
+    *((p + 12) as *u32) = 0 as u32;
+}
+
+fn idt_init() {
+    var n = 0;
+    while (n < 256) { idt_gate(n, isr_stub(n), n == 8 ? 1 : 0); n++; }
+    *(&idtr[0] as *u16) = (4096 - 1) as u16;
+    *((&idtr[0] as int + 2) as *u64) = (&idt[0] as int) as u64;
+    lidt(&idtr[0]);
+}
+
+// ================================================================= PIC
+fn io_wait() { outb(0x80, 0); }
+
+fn pic_init() {
+    outb(0x20, 0x11); io_wait(); outb(0xA0, 0x11); io_wait();
+    outb(0x21, 0x20); io_wait(); outb(0xA1, 0x28); io_wait();      // vectors 0x20.. and 0x28..
+    outb(0x21, 0x04); io_wait(); outb(0xA1, 0x02); io_wait();
+    outb(0x21, 0x01); io_wait(); outb(0xA1, 0x01); io_wait();
+    outb(0x21, 0xFC);                                              // unmask IRQ0 (timer) and IRQ1 (keyboard)
+    outb(0xA1, 0xFF);
+}
+
+fn pic_eoi(irq: int) {
+    if (irq >= 8) { outb(0xA0, 0x20); }
+    outb(0x20, 0x20);
+}
+
+// ================================================================= PIT (100 Hz)
+const PIT_HZ = 100;
+var ticks = 0;
+
+fn pit_init() {
+    let div = 1193182 / PIT_HZ;
+    outb(0x43, 0x36);
+    outb(0x40, div & 0xFF);
+    outb(0x40, (div >> 8) & 0xFF);
+}
+
+fn pit_sleep_ms(ms: int) {
+    var n = ms / 10;
+    if (n < 1) { n = 1; }
+    let target = ticks + n;
+    while (ticks < target) { hlt(); }
+}
+
+// ================================================================= PC speaker
+fn speaker_on(freq: int) {
+    if (freq < 20) { return; }
+    let div = 1193182 / freq;
+    outb(0x43, 0xB6);
+    outb(0x42, div & 0xFF);
+    outb(0x42, (div >> 8) & 0xFF);
+    outb(0x61, inb(0x61) | 3);
+}
+fn speaker_off() { outb(0x61, inb(0x61) & 0xFC); }
+
+// ================================================================= PS/2 keyboard (scan code set 1, US layout)
+const KEY_UP = 0x101; const KEY_DOWN = 0x102; const KEY_LEFT = 0x103; const KEY_RIGHT = 0x104;
+const KEY_HOME = 0x105; const KEY_END = 0x106; const KEY_DEL = 0x107;
+
+var kb_map: u8[128];
+var kb_smap: u8[128];
+var kb_buf: int[256];
+var kb_head = 0;
+var kb_tail = 0;
+var kb_shift = false;
+var kb_caps = false;
+var kb_ctrl = false;
+var kb_e0 = false;
+
+fn kb_fill(code: int, keys: *u8, shifted: bool) {
+    var i = 0;
+    while (keys[i] != 0) {
+        if (shifted) { kb_smap[code + i] = keys[i]; } else { kb_map[code + i] = keys[i]; }
+        i++;
+    }
+}
+
+fn kb_init() {
+    kmemset(&kb_map[0], 0, 128);
+    kmemset(&kb_smap[0], 0, 128);
+    kb_fill(0x02, "1234567890-=", false);   kb_fill(0x02, "!@#$%^&*()_+", true);
+    kb_fill(0x10, "qwertyuiop[]", false);   kb_fill(0x10, "QWERTYUIOP{}", true);
+    kb_fill(0x1E, "asdfghjkl;'`", false);   kb_fill(0x1E, "ASDFGHJKL:\"~", true);
+    kb_fill(0x2B, "\\zxcvbnm,./", false);   kb_fill(0x2B, "|ZXCVBNM<>?", true);
+    kb_map[0x01] = 27; kb_smap[0x01] = 27;
+    kb_map[0x0E] = 8;  kb_smap[0x0E] = 8;
+    kb_map[0x0F] = 9;  kb_smap[0x0F] = 9;
+    kb_map[0x1C] = 10; kb_smap[0x1C] = 10;
+    kb_map[0x39] = ' '; kb_smap[0x39] = ' ';
+    while ((inb(0x64) & 1) != 0) { inb(0x60); }       // drain
+}
+
+fn kb_push(c: int) {
+    let next = (kb_head + 1) & 255;
+    if (next == kb_tail) { return; }
+    kb_buf[kb_head] = c;
+    kb_head = next;
+}
+
+fn kbd_irq() {
+    let sc = inb(0x60);
+    if (sc == 0xE0) { kb_e0 = true; return; }
+    let release = (sc & 0x80) != 0;
+    let code = sc & 0x7F;
+    if (kb_e0) {
+        kb_e0 = false;
+        if (release) { return; }
+        if (code == 0x48) { kb_push(KEY_UP); }
+        else if (code == 0x50) { kb_push(KEY_DOWN); }
+        else if (code == 0x4B) { kb_push(KEY_LEFT); }
+        else if (code == 0x4D) { kb_push(KEY_RIGHT); }
+        else if (code == 0x47) { kb_push(KEY_HOME); }
+        else if (code == 0x4F) { kb_push(KEY_END); }
+        else if (code == 0x53) { kb_push(KEY_DEL); }
+        return;
+    }
+    if (code == 0x2A || code == 0x36) { kb_shift = !release; return; }
+    if (code == 0x1D) { kb_ctrl = !release; return; }
+    if (release) { return; }
+    if (code == 0x3A) { kb_caps = !kb_caps; return; }
+    var ch = kb_map[code] as int;
+    if (ch == 0) { return; }
+    if (ch >= 'a' && ch <= 'z') {
+        if (kb_shift != kb_caps) { ch = ch - 32; }
+        if (kb_ctrl) { ch = ch & 0x1F; }
+    } else if (kb_shift) { ch = kb_smap[code] as int; }
+    kb_push(ch);
+}
+
+/// next key or -1
+fn kb_get() -> int {
+    if (kb_head == kb_tail) { return -1; }
+    let c = kb_buf[kb_tail];
+    kb_tail = (kb_tail + 1) & 255;
+    return c;
+}
+
+/// blocking input from the PS/2 keyboard or the serial port
+fn getc() -> int {
+    while (true) {
+        let c = kb_get();
+        if (c >= 0) { return c; }
+        if (ser_rx_ready()) {
+            let s = ser_getc();
+            if (s == 13) { return 10; }
+            if (s == 127) { return 8; }
+            return s;
+        }
+        hlt();
+    }
+    return 0;
+}
+
+// ================================================================= CMOS real-time clock
+fn cmos(reg: int) -> int { outb(0x70, reg); return inb(0x71); }
+
+/// out[0..5] = year month day hour minute second
+fn rtc_read(out: *int) {
+    while ((cmos(0x0A) & 0x80) != 0) { }
+    var sec = cmos(0x00); var min = cmos(0x02); var hour = cmos(0x04);
+    var day = cmos(0x07); var mon = cmos(0x08); var year = cmos(0x09);
+    let regb = cmos(0x0B);
+    if ((regb & 4) == 0) {                                   // BCD
+        sec = (sec & 15) + (sec >> 4) * 10; min = (min & 15) + (min >> 4) * 10;
+        hour = ((hour & 0x7F) & 15) + (((hour & 0x7F) >> 4) * 10) | (hour & 0x80);
+        day = (day & 15) + (day >> 4) * 10; mon = (mon & 15) + (mon >> 4) * 10; year = (year & 15) + (year >> 4) * 10;
+    }
+    if ((regb & 2) == 0 && (hour & 0x80) != 0) { hour = ((hour & 0x7F) + 12) % 24; }
+    out[0] = 2000 + year; out[1] = mon; out[2] = day; out[3] = hour; out[4] = min; out[5] = sec;
+}
+
+// ================================================================= exceptions and interrupt dispatch
+fn exc_name(v: int) -> *u8 {
+    if (v == 0) { return "#DE divide error"; }
+    if (v == 1) { return "#DB debug"; }
+    if (v == 2) { return "NMI"; }
+    if (v == 3) { return "#BP breakpoint"; }
+    if (v == 4) { return "#OF overflow"; }
+    if (v == 5) { return "#BR bound range"; }
+    if (v == 6) { return "#UD invalid opcode"; }
+    if (v == 7) { return "#NM device not available"; }
+    if (v == 8) { return "#DF double fault"; }
+    if (v == 10) { return "#TS invalid TSS"; }
+    if (v == 11) { return "#NP segment not present"; }
+    if (v == 12) { return "#SS stack fault"; }
+    if (v == 13) { return "#GP general protection"; }
+    if (v == 14) { return "#PF page fault"; }
+    if (v == 16) { return "#MF x87 FP"; }
+    if (v == 17) { return "#AC alignment check"; }
+    if (v == 18) { return "#MC machine check"; }
+    if (v == 19) { return "#XM SIMD FP"; }
+    return "reserved exception";
+}
+
+fn panic_reg(name: *u8, v: int) {
+    con_puts(name); con_puts(" "); con_puthex_w(v, 16);
+}
+
+fn kpanic(frame: *u64, vec: int) {
+    cli();
+    con_mirror = true;
+    con_setcolor(15, 4);
+    con_puts("\n*** KCOS KERNEL PANIC ***");
+    con_setcolor(7, 0);
+    con_puts("\n\n");
+    con_puts(exc_name(vec)); con_puts("  (vector "); con_putdec(vec); con_puts(", error code "); con_puthex(frame[16] as int); con_puts(")\n");
+    panic_reg("rip", frame[17] as int); con_puts("   "); panic_reg("cs ", frame[18] as int); con_puts("   "); panic_reg("rflags", frame[19] as int); con_puts("\n");
+    panic_reg("rsp", frame[20] as int); con_puts("   "); panic_reg("ss ", frame[21] as int); con_puts("   "); panic_reg("cr2   ", read_cr2()); con_puts("\n");
+    panic_reg("rax", frame[14] as int); con_puts("   "); panic_reg("rcx", frame[13] as int); con_puts("   "); panic_reg("rdx   ", frame[12] as int); con_puts("\n");
+    panic_reg("rbx", frame[11] as int); con_puts("   "); panic_reg("rbp", frame[10] as int); con_puts("   "); panic_reg("rsi   ", frame[9] as int); con_puts("\n");
+    panic_reg("rdi", frame[8] as int);  con_puts("   "); panic_reg("r8 ", frame[7] as int);  con_puts("   "); panic_reg("r9    ", frame[6] as int); con_puts("\n");
+    con_puts("\nSystem halted. Power-cycle or press the reset button.\n");
+    while (true) { hlt(); }
+}
+
+fn kc_interrupt(frame: *u64) {
+    let vec = frame[15] as int;
+    if (vec < 32) { kpanic(frame, vec); return; }
+    if (vec < 48) {
+        let irq = vec - 32;
+        if (irq == 0) { ticks++; }
+        else if (irq == 1) { kbd_irq(); }
+        pic_eoi(irq);
+        if (irq == 0 && sched_on && (ticks & 1) == 0) { schedule(); }     // preempt every 20 ms
+        return;
+    }
+}

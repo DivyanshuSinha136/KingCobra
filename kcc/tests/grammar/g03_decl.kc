@@ -1,0 +1,30 @@
+struct V { a: int, b: int, c: int }
+union Bits { i: u32, f: f32 }
+typedef int myint;
+type Grid = int[3];
+fn bump() -> int { static var calls = 100; calls += 1; return calls; }
+fn main() -> int {
+    let [p, q, r] = [1, 2, 3];
+    var arr: int[3] = [7, 8, 9];
+    let [x, _, z] = arr;
+    println(p, q, r, x, z);
+    var v: V = V { a: 5, b: 6, c: 7 };
+    let { a, c: cc } = v;
+    println(a, cc);
+    var w: V = v;
+    w.a = 99;
+    println(v.a, w.a, w.b);
+    var g: Grid = [1, 2, 3];
+    let m: myint = 41;
+    println(g[1], m + 1, sizeof(Bits), sizeof(V));
+    println(bump(), bump(), bump());
+    let a1 = 1, b1 = 2;
+    println(a1 + b1);
+    var big: int[100] = [7; 100];
+    var tot = 0;
+    for (e in big) { tot += e; }
+    println(tot);
+    var m2: int[2][3] = [[1, 2, 3], [4, 5, 6]];
+    println(m2[1][2], m2[0][1]);
+    return 0;
+}

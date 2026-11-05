@@ -1,0 +1,20 @@
+// hello.kc -- a complete program: kcc turns it into a native executable.
+//   kcc/kcc examples/hello.kc -o hello                 # Linux ELF   (run: ./hello)
+//   kcc/kcc examples/hello.kc -o hello.exe             # Windows PE32+
+//   kcc/kcc examples/hello.kc -o hello --target macos  # macOS Mach-O
+// `main` may take (argc, argv); its return value is the process exit code.
+extern fn puts(*u8) -> int from "libc.so.6";
+extern fn printf(*u8, ...) -> int from "libc.so.6";
+
+var counter: int = 40;
+let banner: *u8 = "hello from a kcc executable";
+
+fn fib(n: int) -> int { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+
+fn main(argc: int, argv: **u8) -> int {
+    puts(banner);
+    counter += 2;
+    printf("argc=%d fib(20)=%d counter=%d\n", argc, fib(20), counter);
+    if (argc > 1) { printf("argv[1]=%s\n", argv[1]); }
+    return 7;
+}

@@ -1,0 +1,8 @@
+// nolibc.kc -- an executable with no imports at all: on Linux it never loads libc and ends with the exit system call.
+//   kcc/kcc examples/nolibc.kc -o nolibc && ./nolibc one; echo $?      # exit code 32 (= 30 + argc)
+var table: int[4];
+
+fn main(argc: int, argv: **u8) -> int {
+    for (i in 0..4) { table[i] = i * 10; }
+    return table[3] + argc;
+}
