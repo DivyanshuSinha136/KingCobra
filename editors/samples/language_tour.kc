@@ -1,0 +1,64 @@
+// A tour of the language — every construct here is exercised by tests/lang_test.kc.
+// Run:  kingcobra examples/language_tour.kc      Test:  kingcobra test tests/lang_test.kc
+
+enum Shape { Circle, Square = 10, Triangle }
+
+struct Point { x: int, y: int }
+impl Point {
+    fn len2(self) -> int { return self.x * self.x + self.y * self.y; }
+    fn origin() -> Point { return Point { x: 0, y: 0 }; }
+}
+impl string { fn shout(self) -> string { return self.upper() + "!"; } }
+
+fn greet(name: string, greeting: string = "Hello") -> string { return f"{greeting}, {name}"; }
+fn total(first: int, ...rest: int) -> int { var t = first; for (x in rest) { t += x; } return t; }
+
+fn parse_age(text: string) -> int {
+    let n = int(text);
+    if (n < 0) { throw error("age cannot be negative"); }
+    return n;
+}
+
+fn main() {
+    // values, f-strings, ternary, ??
+    let who = "world";
+    print(f"hello {who}: {2 + 3} {5 > 3 ? "yes" : "no"} {null ?? "default"}");
+    print(greet("Ada"), greet("Bo", "Hi"), total(1, 2, 3), "hey".shout());
+
+    // collections: slicing, structural equality, destructuring, higher-order functions
+    let nums = [5, 3, 8, 1, 9];
+    let [first, second, ...rest] = nums;
+    print(nums[1..4], first, second, rest, [1, 2] == [1, 2], 3 in nums);
+    print(sorted(nums), nums.map(fn(x) -> int { return x * x; }).filter(fn(x) -> bool { return x > 10; }), nums.sum());
+    let person = { name: "ada", langs: ["c", "kc"] };
+    let { name, langs } = person;
+    print(name, langs, person.keys());
+
+    // types: structs, impl, enums, match
+    print(Point { x: 3, y: 4 }.len2(), Point.origin() == Point { x: 0, y: 0 });
+    for (label, value in Shape) {
+        let kind = match (value) { Shape.Circle => "round", Shape.Square | Shape.Triangle => "angular", _ => "?" };
+        print(label, value, kind);
+    }
+
+    // loops: labeled break/continue, two-variable for
+    outer: for (i in 0..4) {
+        for (j in 0..4) {
+            if (j == 2) { continue outer; }
+            if (i == 3) { break outer; }
+            print("pair", i, j);
+        }
+    }
+    for (i, ch in "kc") { print(i, ch); }
+
+    // errors: try/catch/throw, and defer that runs while an error unwinds
+    for (text in ["30", "-4"]) {
+        try { print("age", parse_age(text)); } catch (e) { print("rejected:", e.message); }
+    }
+    let before = mem_stats().regions_live;
+    try {
+        let scratch = alloc(64);
+        defer free(scratch);
+        throw "something went wrong";
+    } catch (e) { print("caught:", e, "| leaked blocks:", mem_stats().regions_live - before); }
+}

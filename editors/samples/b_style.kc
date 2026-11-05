@@ -1,0 +1,72 @@
+/* A program in the style of B (Ken Thompson's language that C grew out of): no types, `auto` and
+ * `extrn` declarations, vectors, character functions, putchar/printn, labels and goto, switch. */
+
+extrn putchar, printn;                        /* names that come from the runtime */
+
+/* gcd: Euclid's algorithm. Functions are written without `fn`, parameters have no types. */
+gcd(a, b) {
+    auto t;
+    while (b != 0) {
+        t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+/* print a string one character at a time, B style: char(s, i) is the i-th byte */
+puts2(s) {
+    auto i, n;
+    n = strlen(s);
+    for (i = 0; i < n; i++) putchar(char(s, i));
+    putchar(10);
+}
+
+/* sieve of Eratosthenes on a vector: `auto v[n]` is a vector of n+1 words, indices 0..n */
+sieve(n) {
+    auto v[100], i, j, count;
+    if (n > 100) n = 100;
+    for (i = 2; i <= n; i++) v[i] = 1;
+    for (i = 2; i * i <= n; i++) {
+        if (v[i]) {
+            for (j = i * i; j <= n; j += i) v[j] = 0;
+        }
+    }
+    count = 0;
+    for (i = 2; i <= n; i++) {
+        if (v[i]) {
+            printn(i, 10);
+            putchar(32);
+            count++;
+        }
+    }
+    putchar(10);
+    return count;
+}
+
+/* an octal / hex dump with printn(n, base) and a goto loop */
+dump(n) {
+    auto b;
+    b = 2;
+again:
+    printn(n, b);
+    putchar(b == 16 ? 10 : 32);
+    if (b == 2) b = 8; else if (b == 8) b = 16; else goto finished;
+    goto again;
+finished:
+    return 0;
+}
+
+main() {
+    auto s;
+    s = strdup("kingcobra");
+    lchar(s, 0, 'K');                         /* strings from strdup are writable */
+    puts2(s);
+    printn(gcd(1071, 462), 10);  putchar(10);
+    printf("%d primes up to 100\n", sieve(100));
+    dump(255);
+    switch (gcd(12, 18)) {
+        case 6: puts2("six"); break;
+        default: puts2("other");
+    }
+}
