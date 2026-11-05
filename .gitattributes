@@ -4,7 +4,7 @@
 *.in        text eol=lf
 *.c         text eol=lf
 *.h         text eol=lf
-*.kc        text eol=lf
+*.kc        text eol=lf linguist-language=Rust
 *.md        text eol=lf
 *.yml       text eol=lf
 *.yaml      text eol=lf
