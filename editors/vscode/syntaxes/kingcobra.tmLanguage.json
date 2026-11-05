@@ -1,0 +1,318 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "KingCobra",
+  "scopeName": "source.kingcobra",
+  "fileTypes": ["kc"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#preprocessor" },
+    { "include": "#declarations" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#std-module" },
+    { "include": "#builtins" },
+    { "include": "#constants" },
+    { "include": "#labels" },
+    { "include": "#function-call" },
+    { "include": "#member" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.kingcobra",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.kingcobra" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.kingcobra" } }
+        },
+        {
+          "name": "comment.line.double-slash.kingcobra",
+          "match": "(//).*$",
+          "captures": { "1": { "name": "punctuation.definition.comment.kingcobra" } }
+        }
+      ]
+    },
+
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.kingcobra",
+          "match": "^\\s*(#)\\s*(include|define|undef|ifdef|ifndef|if|elif|else|endif|pragma|error|warning)\\b",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.kingcobra" },
+            "2": { "name": "keyword.control.directive.kingcobra" }
+          }
+        }
+      ]
+    },
+
+    "declarations": {
+      "patterns": [
+        {
+          "comment": "fn name<T>(",
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.kingcobra" },
+            "2": { "name": "entity.name.function.kingcobra" }
+          }
+        },
+        {
+          "comment": "[packed] struct Name",
+          "match": "\\b(?:(packed)\\s+)?(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.kingcobra" },
+            "2": { "name": "storage.type.struct.kingcobra" },
+            "3": { "name": "entity.name.type.struct.kingcobra" }
+          }
+        },
+        {
+          "match": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\{)",
+          "captures": {
+            "1": { "name": "storage.type.enum.kingcobra" },
+            "2": { "name": "entity.name.type.enum.kingcobra" }
+          }
+        },
+        {
+          "match": "\\b(impl)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\{)",
+          "captures": {
+            "1": { "name": "storage.type.impl.kingcobra" },
+            "2": { "name": "entity.name.type.kingcobra" }
+          }
+        },
+        {
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?==)",
+          "captures": {
+            "1": { "name": "storage.type.alias.kingcobra" },
+            "2": { "name": "entity.name.type.alias.kingcobra" }
+          }
+        },
+        {
+          "comment": "import std.json as j;",
+          "match": "\\b(import)\\s+(std)\\.([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+          "captures": {
+            "1": { "name": "keyword.control.import.kingcobra" },
+            "2": { "name": "support.other.namespace.kingcobra" },
+            "3": { "name": "support.module.std.kingcobra" },
+            "4": { "name": "keyword.control.import.kingcobra" },
+            "5": { "name": "entity.name.namespace.kingcobra" }
+          }
+        },
+        {
+          "match": "\\b(let|var|const|static|auto)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.kingcobra" },
+            "2": { "name": "variable.other.definition.kingcobra" }
+          }
+        },
+        {
+          "comment": "param / field annotations  name: type",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(:)\\s*(?=[*A-Za-z_])",
+          "captures": {
+            "1": { "name": "variable.parameter.kingcobra" },
+            "2": { "name": "punctuation.separator.annotation.kingcobra" }
+          }
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.interpolated.fstring.kingcobra",
+          "begin": "\\bf(\")",
+          "end": "\"",
+          "beginCaptures": {
+            "0": { "name": "string.interpolated.fstring.kingcobra" },
+            "1": { "name": "punctuation.definition.string.begin.kingcobra" }
+          },
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.kingcobra" } },
+          "patterns": [
+            { "include": "#escapes" },
+            { "name": "constant.character.escape.brace.kingcobra", "match": "\\{\\{|\\}\\}" },
+            { "include": "#fstring-expr" }
+          ]
+        },
+        {
+          "name": "string.quoted.double.kingcobra",
+          "begin": "\"",
+          "end": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.kingcobra" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.kingcobra" } },
+          "patterns": [ { "include": "#escapes" } ]
+        },
+        {
+          "name": "string.quoted.single.char.kingcobra",
+          "match": "'(?:[^'\\\\\\n]|\\\\(?:[nrt0\\\\\"']|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]+\\}))'"
+        }
+      ]
+    },
+    "escapes": {
+      "name": "constant.character.escape.kingcobra",
+      "match": "\\\\(?:[nrt0\\\\\"']|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]+\\})"
+    },
+    "fstring-expr": {
+      "name": "meta.embedded.expression.kingcobra",
+      "begin": "\\{",
+      "end": "\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.kingcobra" } },
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.kingcobra" } },
+      "patterns": [
+        { "include": "#fstring-nested-braces" },
+        { "include": "#nested-string" },
+        { "include": "#numbers" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#builtins" },
+        { "include": "#constants" },
+        { "include": "#function-call" },
+        { "include": "#member" },
+        { "include": "#operators" }
+      ]
+    },
+    "fstring-nested-braces": {
+      "begin": "\\{",
+      "end": "\\}",
+      "patterns": [
+        { "include": "#fstring-nested-braces" },
+        { "include": "#nested-string" },
+        { "include": "#numbers" },
+        { "include": "#operators" }
+      ]
+    },
+    "nested-string": {
+      "name": "string.quoted.double.kingcobra",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [ { "include": "#escapes" } ]
+    },
+
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.hex.kingcobra", "match": "\\b0[xX][0-9A-Fa-f][0-9A-Fa-f_]*\\b" },
+        { "name": "constant.numeric.binary.kingcobra", "match": "\\b0[bB][01][01_]*\\b" },
+        { "name": "constant.numeric.octal.kingcobra", "match": "\\b0[oO][0-7][0-7_]*\\b" },
+        { "name": "constant.numeric.float.kingcobra", "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9]+)?\\b|\\b[0-9][0-9_]*[eE][+-]?[0-9]+\\b" },
+        { "name": "constant.numeric.integer.kingcobra", "match": "\\b[0-9][0-9_]*\\b" }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.conditional.kingcobra", "match": "\\b(if|else|match|switch|case|default)\\b" },
+        { "name": "keyword.control.loop.kingcobra", "match": "\\b(while|for|do|in|break|continue)\\b" },
+        { "name": "keyword.control.flow.kingcobra", "match": "\\b(return|goto|defer)\\b" },
+        { "name": "keyword.control.exception.kingcobra", "match": "\\b(try|catch|throw)\\b" },
+        { "name": "keyword.control.import.kingcobra", "match": "\\b(import|from|extern|extrn)\\b" },
+        { "name": "keyword.operator.cast.kingcobra", "match": "\\bas\\b" },
+        { "name": "keyword.operator.sizeof.kingcobra", "match": "\\b(sizeof|alignof|offsetof)\\b" },
+        { "name": "storage.modifier.kingcobra", "match": "\\b(unsafe|comptime|packed|static|union)\\b" },
+        { "name": "storage.type.kingcobra", "match": "\\b(let|var|const|fn|struct|enum|impl|type|typedef|auto)\\b" }
+      ]
+    },
+
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.kingcobra",
+          "match": "\\b(int|float|string|bool|void|any|u8|i8|u16|i16|u32|i32|u64|i64|usize|isize|f32|f64)\\b(?!\\s*\\()"
+        },
+        {
+          "comment": "PascalCase names are types",
+          "name": "entity.name.type.kingcobra",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b(?!\\s*\\()"
+        }
+      ]
+    },
+
+    "std-module": {
+      "comment": "std.json.parse -> module path",
+      "match": "\\b(std)(\\.)(acpi|ascii_screen|csv|fbin|game|gui|http|io|json|memory|mmio|mmu|music_note|network|nlp|nn|regx|rhex|system|tts|vector|pdf|logging|ini|bmp|zip|usb)\\b",
+      "captures": {
+        "1": { "name": "support.other.namespace.kingcobra" },
+        "2": { "name": "punctuation.accessor.kingcobra" },
+        "3": { "name": "support.module.std.kingcobra" }
+      }
+    },
+
+    "builtins": {
+      "name": "support.function.builtin.kingcobra",
+      "match": "\\b(print|println|len|str|int|float|typeof|push|range|clock|sqrt|input|assert|assert_eq|error|abs|min|max|clamp|idiv|ord|chr|map|filter|reduce|find|any|all|each|sum|sorted|zip|keys|values|items|has|free|free_deep|is_freed|mem_stats|mem_report|mem_quarantine|alloc|alloc_array|realloc|memcpy|memmove|memset|memcmp|buffer|buffer_from|ptr_from_addr|align_up|align_down|is_aligned|printf|sprintf|format|eprintf|puts|putchar|getchar|fflush|printn|putnumb|strlen|strcmp|strncmp|strcasecmp|strchr|strrchr|strstr|strcat|strdup|atoi|atol|atof|strtol|strtod|itoa|isdigit|isalpha|isalnum|isspace|isupper|islower|ispunct|isxdigit|isprint|iscntrl|isgraph|toupper|tolower|exit|abort|rand|srand|time|qsort|bsearch|floor|ceil|round|trunc|fabs|pow|fmod|hypot|atan2|sin|cos|tan|asin|acos|atan|exp|log|log2|log10|cbrt|char|lchar|getvec|rlsevec|help)(?=\\s*\\()"
+    },
+
+    "constants": {
+      "patterns": [
+        { "name": "constant.language.boolean.true.kingcobra", "match": "\\btrue\\b" },
+        { "name": "constant.language.boolean.false.kingcobra", "match": "\\bfalse\\b" },
+        { "name": "constant.language.null.kingcobra", "match": "\\bnull\\b" },
+        { "name": "variable.language.self.kingcobra", "match": "\\bself\\b" },
+        { "name": "constant.other.caps.kingcobra", "match": "\\b[A-Z][A-Z0-9_]{2,}\\b" },
+        { "name": "variable.language.wildcard.kingcobra", "match": "(?<![A-Za-z0-9_])_(?![A-Za-z0-9_])" }
+      ]
+    },
+
+    "labels": {
+      "comment": "outer: for (...)",
+      "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(:)(?=\\s*(?:for|while|do)\\b)",
+      "captures": {
+        "1": { "name": "entity.name.label.kingcobra" },
+        "2": { "name": "punctuation.separator.label.kingcobra" }
+      }
+    },
+
+    "function-call": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": { "1": { "name": "entity.name.function.call.kingcobra" } }
+    },
+
+    "member": {
+      "patterns": [
+        {
+          "comment": "obj.method(",
+          "match": "(\\.|->)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.kingcobra" },
+            "2": { "name": "entity.name.function.member.kingcobra" }
+          }
+        },
+        {
+          "match": "(\\.|->)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.kingcobra" },
+            "2": { "name": "variable.other.property.kingcobra" }
+          }
+        }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.arrow.kingcobra", "match": "=>|->" },
+        { "name": "keyword.operator.spread.kingcobra", "match": "\\.\\.\\.|\\.\\." },
+        { "name": "keyword.operator.coalesce.kingcobra", "match": "\\?\\?" },
+        { "name": "keyword.operator.assignment.compound.kingcobra", "match": "<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=" },
+        { "name": "keyword.operator.comparison.kingcobra", "match": "==|!=|<=|>=|<|>" },
+        { "name": "keyword.operator.logical.kingcobra", "match": "&&|\\|\\||!" },
+        { "name": "keyword.operator.bitwise.kingcobra", "match": ">>>|<<|>>|&|\\||\\^|~" },
+        { "name": "keyword.operator.increment.kingcobra", "match": "\\+\\+|--" },
+        { "name": "keyword.operator.assignment.kingcobra", "match": "=" },
+        { "name": "keyword.operator.arithmetic.kingcobra", "match": "\\+|-|\\*|/|%" },
+        { "name": "keyword.operator.ternary.kingcobra", "match": "\\?|:" }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.statement.kingcobra", "match": ";" },
+        { "name": "punctuation.separator.comma.kingcobra", "match": "," },
+        { "name": "punctuation.section.brackets.kingcobra", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.parens.kingcobra", "match": "[()]" },
+        { "name": "punctuation.section.braces.kingcobra", "match": "[{}]" }
+      ]
+    }
+  }
+}
